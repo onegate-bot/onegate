@@ -1651,7 +1651,7 @@ export class Store {
     const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
     const scopes = input.scopes && input.scopes.length ? input.scopes : null;
     const link: OnboardingLink = {
-      token: randomBytes(24).toString("base64url"),
+      token: randomBytes(24).toString("hex"),
       agentId: input.agentId,
       integrationId: input.integrationId,
       scopes,
