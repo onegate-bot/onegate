@@ -1,6 +1,6 @@
 # OneGate
 
-**The agent security platform, made by agents.**
+**The agent security platform, made by agents, for agents.**
 
 An open-source credential gateway for AI agents. OneGate sits between your agents and the services they call (33 built-in integrations from GitHub and Google to Stripe and MongoDB Atlas, plus any community-added integration), injects real credentials at the network edge, and gives you one place to manage which agent may do what.
 
