@@ -11,7 +11,7 @@ describe("onboarding links", () => {
   it("creates a link with an unguessable token and a 7 day default TTL", () => {
     const before = Date.now();
     const link = store.createOnboardingLink({ agentId: "ag_1", integrationId: "google" });
-    expect(link.token).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(link.token).toMatch(/^[a-f0-9]{48}$/);
     expect(link.agentId).toBe("ag_1");
     expect(link.integrationId).toBe("google");
     expect(link.usedAt).toBeNull();
