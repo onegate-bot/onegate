@@ -3,6 +3,12 @@
 export type Effect = "allow" | "deny";
 export type DefaultPolicy = "allow-all" | "deny-unmatched";
 export type RuleScope = "agent" | "project";
+/**
+ * How a connection-scoped rule relates to its `connectionId`:
+ *   - "only":   the rule participates only when the resolved connection IS connectionId.
+ *   - "except": the rule participates only when the resolved connection is NOT connectionId.
+ */
+export type ConnectionScope = "only" | "except";
 
 export interface Agent {
   id: string;
@@ -54,6 +60,21 @@ export interface Rule {
    * credential. Null = no lease.
    */
   leaseTtlSeconds?: number | null;
+  /**
+   * Connection scoping (optional). When set, this rule only participates in the
+   * policy decision depending on WHICH app connection the request resolved to,
+   * per `connectionScope`. Unset (the default) = the rule applies regardless of
+   * connection, exactly as before this feature.
+   *
+   * Enforced for app-connection integrations (e.g. a GitHub integration with
+   * several named connections), NOT for LLM routing. The canonical use is a
+   * DENY-`except` rule layered on top of an existing allow: "deny this path
+   * unless the request used connection X", pinning a repo/path to one
+   * connection. Connection-scoped rules RESTRICT; they do not grant on their own
+   * (a connection-scoped allow still needs the base policy to permit the call).
+   */
+  connectionId?: string | null;
+  connectionScope?: ConnectionScope;
 }
 
 export type ConnectionKind = "app" | "llm";

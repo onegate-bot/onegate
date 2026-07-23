@@ -787,6 +787,44 @@ export class GatewayProxy {
     }
     if (resolved) selectedConnection = resolved.connection;
 
+    // Phase-2 policy check: connection-scoped rules. The phase-1 evaluate() above
+    // ran before the connection was resolved, so any connection-scoped rule was
+    // held pending (verdict.needsConnection). Now that the connection is known,
+    // re-evaluate to let a connection-scoped deny fire (e.g. "deny this path
+    // unless the request used connection X"). No-op when no connection-scoped
+    // rule matched this request, so unrelated traffic is unaffected.
+    if (verdict.needsConnection) {
+      const finalVerdict = evaluate(agent, rules, {
+        integrationId: integration.id,
+        method,
+        path,
+        connectionId: selectedConnection?.id ?? null,
+      });
+      if (finalVerdict.effect === "deny") {
+        this.opts.store.audit({
+          agentId: agent.id,
+          agentName: agent.name,
+          integrationId: integration.id,
+          host,
+          method,
+          path,
+          decision: "deny",
+          ruleId: finalVerdict.ruleId,
+          status: 403,
+        });
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "onegate_policy_denied",
+            message: `Policy denies ${method} ${host}${path} for agent "${agent.name}" on the selected connection${
+              selectedConnection ? ` "${selectedConnection.name}"` : ""
+            }.`,
+          }),
+        );
+        return;
+      }
+    }
+
     // A selected app connection supplies a synthetic credential; otherwise the
     // legacy shared credential row.
     const credential = selectedConnection

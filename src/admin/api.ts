@@ -2014,9 +2014,24 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   app.get("/api/rules", (_req, res) => res.json(store.listRules()));
 
   app.post("/api/rules", (req, res) => {
-    const { scope, subjectId, integrationId, methods, pathGlob, effect, ttlSeconds } = req.body ?? {};
+    const { scope, subjectId, integrationId, methods, pathGlob, effect, ttlSeconds, connectionId, connectionScope } =
+      req.body ?? {};
     if (!scope || !subjectId || !integrationId || !effect) {
       res.status(400).json({ error: "scope, subjectId, integrationId and effect are required" });
+      return;
+    }
+    // Optional connection scoping: pins the rule to a specific app connection.
+    // connectionScope "only"|"except" is required when connectionId is given.
+    if (connectionScope != null && connectionScope !== "only" && connectionScope !== "except") {
+      res.status(400).json({ error: 'connectionScope must be "only" or "except"' });
+      return;
+    }
+    if (connectionScope != null && !connectionId) {
+      res.status(400).json({ error: "connectionScope requires connectionId" });
+      return;
+    }
+    if (connectionId && connectionScope == null) {
+      res.status(400).json({ error: "connectionId requires connectionScope" });
       return;
     }
     // Optional access lease on an allow rule: ttlSeconds>0 sets a time box that
@@ -2037,6 +2052,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         effect,
         expiresAt,
         leaseTtlSeconds: leaseTtl,
+        ...(connectionId ? { connectionId, connectionScope } : {}),
       }),
     );
   });
