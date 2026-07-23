@@ -207,7 +207,7 @@ describe("M2 admin mint of onboarding links", () => {
       integrationId: "github", // PAT, credential flow
     });
     expect(r.status).toBe(201);
-    expect(r.json.token).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(r.json.token).toMatch(/^[a-f0-9]{48}$/);
     expect(r.json.url).toContain(`/connect/github/${r.json.token}`);
   });
 
@@ -219,7 +219,7 @@ describe("M2 admin mint of onboarding links", () => {
       ttlDays: 3,
     });
     expect(r.status).toBe(201);
-    expect(r.json.token).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(r.json.token).toMatch(/^[a-f0-9]{48}$/);
     expect(r.json.url).toContain(`/connect/gitlab/${r.json.token}`);
     expect(new Date(r.json.expiresAt).getTime()).toBeGreaterThan(Date.now());
   });
