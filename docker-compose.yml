@@ -1,0 +1,17 @@
+services:
+  onegate:
+    build: .
+    # image: ghcr.io/onegate-bot/onegate:latest   # once published
+    container_name: onegate
+    restart: unless-stopped
+    ports:
+      - "8443:8443" # proxy (agents point HTTPS_PROXY here)
+      - "8080:8080" # admin UI + API + /ca.pem
+    volumes:
+      - onegate-data:/data
+    # environment:
+    #   ONEGATE_BIND: 0.0.0.0
+    #   ONEGATE_COMMUNITY_DIR: /data/integrations
+
+volumes:
+  onegate-data:

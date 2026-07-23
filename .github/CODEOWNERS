@@ -1,0 +1,10 @@
+# Default owners for everything in this repo.
+# Every pull request requests a review from the OneGate maintainers.
+*       @onegate-bot/maintainers
+
+# Security-sensitive surfaces get extra scrutiny.
+/src/ca.ts              @onegate-bot/maintainers
+/src/proxy/             @onegate-bot/maintainers
+/src/store/             @onegate-bot/maintainers
+/src/integrations/      @onegate-bot/maintainers
+/SECURITY.md            @onegate-bot/maintainers

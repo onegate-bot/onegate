@@ -1,0 +1,2 @@
+@awesome.me/webawesome 3.8.0 (dist-cdn flavor), pinned per Claw DS.
+Icons: Font Awesome 7.2.0 solid subset (see icons/solid/).

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 64" width="248" height="64" role="img" aria-label="OneGate">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <!-- badge -->
+  <rect x="0" y="0" width="64" height="64" rx="15" fill="url(#bg)"/>
+  <circle cx="32" cy="35" r="10" fill="#ffffff" opacity="0.28"/>
+  <path d="M19 49 L19 31 C19 21.4 24.8 16 32 16 C39.2 16 45 21.4 45 31 L45 49"
+        fill="none" stroke="#ffffff" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M13.5 49 L50.5 49" fill="none" stroke="#ffffff" stroke-width="5.2" stroke-linecap="round"/>
+  <circle cx="32" cy="35" r="4.6" fill="#ffffff"/>
+  <!-- wordmark -->
+  <text x="82" y="43" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="30" font-weight="700" letter-spacing="0.2" fill="#ffffff">One<tspan fill="#a5b4fc">Gate</tspan></text>
+</svg>

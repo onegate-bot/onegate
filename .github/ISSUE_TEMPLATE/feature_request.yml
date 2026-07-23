@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose an improvement or a new integration
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that OneGate currently cannot?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you imagine it working. For a new integration, name the vendor, the hosts involved, and the auth scheme (static token, OAuth refresh, etc).
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - New integration
+        - Proxy / policy engine
+        - Admin API / web UI
+        - CLI
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "a community integration drop-in file almost works, except ..."

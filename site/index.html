@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en" class="wa-cloak">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneGate, the credential gateway for AI agents</title>
+  <meta name="description" content="OneGate is a self-hosted credential gateway for AI agents. It injects real secrets at the network edge, enforces per-agent policy, and audits every request. Open source, MIT licensed.">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="icon" type="image/svg+xml" href="assets/svg/onegate-badge.svg">
+  <meta property="og:title" content="OneGate, the credential gateway for AI agents">
+  <meta property="og:description" content="A self-hosted HTTP proxy that injects credentials, enforces policy, and audits every request your agents make.">
+  <meta property="og:type" content="website">
+
+  <script>
+    // Apply the theme class before first paint. Manual choice wins, then OS preference.
+    (() => {
+      const stored = localStorage.getItem("onegate_theme");
+      const dark = stored === "dark" || (stored !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.classList.add(dark ? "wa-dark" : "wa-light");
+    })();
+  </script>
+
+  <link rel="stylesheet" href="vendor/webawesome/styles/webawesome.css">
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="vendor/webawesome/webawesome.loader.js" data-webawesome="vendor/webawesome"></script>
+</head>
+<body>
+
+  <!-- ------------------------------------------------------------ top bar -->
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="logo" href="#top" aria-label="OneGate home">
+        <img class="logo-light" src="assets/svg/onegate-lockup.svg" alt="OneGate">
+        <img class="logo-dark" src="assets/svg/onegate-lockup-white.svg" alt="OneGate" style="display:none">
+      </a>
+      <div class="top-actions">
+        <button id="theme-toggle" class="icon-btn theme-toggle" type="button" aria-label="Toggle dark mode">
+          <svg class="moon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          <svg class="sun" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4.5" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+        <a class="btn btn-ghost" href="https://github.com/onegate-bot/onegate">GitHub</a>
+        <a class="btn btn-primary" href="#quickstart">Quickstart</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <!-- ---------------------------------------------------------- hero -->
+    <section class="hero">
+      <div class="wrap">
+        <img class="hero-logo logo-light" src="assets/svg/onegate-lockup.svg" alt="OneGate">
+        <img class="hero-logo logo-dark" src="assets/svg/onegate-lockup-white.svg" alt="OneGate" style="display:none">
+        <h1>The credential gateway for AI agents</h1>
+        <p class="lede">OneGate sits between your AI agents and the internet. It injects real secrets at the network edge, so your agents work with every API without ever holding a key.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/onegate-bot/onegate">View on GitHub</a>
+          <a class="btn btn-ghost" href="#quickstart">Read the quickstart</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- what it is -->
+    <section class="alt" id="what">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>One gate for every request</h2>
+        </div>
+        <p class="lead">OneGate is a self-hosted HTTP CONNECT proxy. Point your agents at it with a standard <strong>HTTPS_PROXY</strong> setting and they send placeholder tokens instead of real keys. For the integration hosts you configure, OneGate terminates TLS, checks your policy, swaps the placeholder for the real credential, and records the request. Everything else passes through untouched. Your secrets never leave your box, and your agents never see them.</p>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- features -->
+    <section id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Built for running agents safely</h2>
+          <p>Everything you need to put agents in front of real APIs without handing them your secrets.</p>
+        </div>
+        <div class="grid">
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <h3>Credential injection</h3>
+            <p>Agents send a placeholder token. OneGate replaces it with the real secret at request time, so a raw key never lives in agent code, logs, or memory.</p>
+          </article>
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="17" r="2.4" stroke="currentColor" stroke-width="1.8"/></svg></span>
+            <h3>Per-agent policy engine</h3>
+            <p>New agents deny by default. Add allow rules scoped by integration, HTTP method, and path glob, per agent or per project. Deny beats allow beats default.</p>
+          </article>
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 4h14v16l-3-2-2 2-2-2-2 2-2-2-3 2z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 9h8M8 13h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>
+            <h3>Full audit log</h3>
+            <p>Every request is written down, allow or deny, with the agent, integration, method, path, status, and the LLM connection that was selected.</p>
+          </article>
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="6" cy="7" r="2.4" stroke="currentColor" stroke-width="1.8"/><circle cx="18" cy="7" r="2.4" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="18" r="2.4" stroke="currentColor" stroke-width="1.8"/><path d="M6 9.4v3a2 2 0 0 0 2 2h2M18 9.4v3a2 2 0 0 1-2 2h-2" stroke="currentColor" stroke-width="1.8"/></svg></span>
+            <h3>LLM connections and routing</h3>
+            <p>Register several keys per provider, then route with fallback or round-robin. OneGate spills over to the next connection automatically when one errors or runs out.</p>
+          </article>
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/></svg></span>
+            <h3>33+ integrations</h3>
+            <p>GitHub, Google, Slack, Stripe, Anthropic, OpenAI, Notion, Linear, and many more. OAuth providers are bring-your-own-client, and community integrations are a single dropped-in file.</p>
+          </article>
+
+          <article class="card">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 9 12 4l8 5v6l-8 5-8-5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M4 9l8 5 8-5M12 14v6" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></span>
+            <h3>Self-hosted and open source</h3>
+            <p>Your secrets stay on your machine. Zero native dependencies, runs from a single Node process or a Docker container, and MIT licensed.</p>
+          </article>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- how it works -->
+    <section class="alt" id="how">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>How it works</h2>
+          <p>No SDK and no code changes. Anything that honors proxy environment variables works.</p>
+        </div>
+
+        <div class="flow">
+          <div class="flow-node">
+            <span class="tag">Agent</span>
+            <h3>Sends a placeholder</h3>
+            <p>Your agent calls the API through OneGate with a placeholder token in place of the real key.</p>
+          </div>
+          <div class="flow-arrow"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="flow-node gate">
+            <span class="tag">OneGate</span>
+            <h3>Auth, policy, inject, audit</h3>
+            <p>Authenticates the agent, checks policy, swaps in the real credential, and records the decision.</p>
+          </div>
+          <div class="flow-arrow"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="flow-node">
+            <span class="tag">Vendor</span>
+            <h3>Receives the real request</h3>
+            <p>The vendor sees a normal authenticated call over a direct TLS connection from the gateway.</p>
+          </div>
+        </div>
+
+        <div class="steps">
+          <div class="step">
+            <span class="num">1</span>
+            <div>
+              <h3>Mint a root CA</h3>
+              <p><code>onegate init</code> creates a root certificate. You trust it once on each agent machine.</p>
+            </div>
+          </div>
+          <div class="step">
+            <span class="num">2</span>
+            <div>
+              <h3>Wire the proxy</h3>
+              <p>Set <code>HTTPS_PROXY</code> to the gateway with the agent token. No code changes required.</p>
+            </div>
+          </div>
+          <div class="step">
+            <span class="num">3</span>
+            <div>
+              <h3>Terminate only what you configure</h3>
+              <p>OneGate decrypts only the integration hosts you set up. Every other host is passed through untouched, with no decryption.</p>
+            </div>
+          </div>
+          <div class="step">
+            <span class="num">4</span>
+            <div>
+              <h3>Govern and watch</h3>
+              <p>Allow and deny per agent or project, scoped by method and path glob. Every decision lands in the audit log.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- quickstart -->
+    <section id="quickstart">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Quickstart</h2>
+          <p>Up and running with Docker in a couple of commands. From source needs Node 22.13 or newer.</p>
+        </div>
+
+        <div class="code">
+          <div class="code-head">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            <span class="label">shell</span>
+          </div>
+<pre><span class="c"># start the gateway</span>
+docker compose up -d
+docker logs onegate            <span class="c"># prints the one-time admin token</span>
+
+<span class="c"># open the web UI at http://localhost:8080, then register an agent</span>
+onegate agent add my-agent     <span class="c"># prints a one-time og_ token</span>
+
+<span class="c"># on the agent machine, wire the proxy and trust the root CA</span>
+<span class="k">export</span> HTTPS_PROXY=http://agent:og_xxxx@gateway-host:8443
+<span class="k">export</span> NODE_EXTRA_CA_CERTS=/path/to/rootCA.pem
+
+<span class="c"># the agent uses a placeholder, OneGate injects the real credential</span>
+curl https://api.github.com/user -H <span class="k">"Authorization: Bearer placeholder"</span></pre>
+        </div>
+        <p class="quickstart-note">New agents default to deny-unmatched, so add an allow rule in the UI or API before traffic flows. Full steps in the <a href="https://github.com/onegate-bot/onegate/blob/main/docs/DEPLOY.md">deployment guide</a>.</p>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- integrations -->
+    <section class="alt" id="integrations">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>33+ integrations, and counting</h2>
+          <p>Connect once at the gateway. Add your own in about thirty lines.</p>
+        </div>
+        <div class="chips">
+          <span class="chip">GitHub</span>
+          <span class="chip">Google</span>
+          <span class="chip">Slack</span>
+          <span class="chip">Stripe</span>
+          <span class="chip">Anthropic</span>
+          <span class="chip">OpenAI</span>
+          <span class="chip">Notion</span>
+          <span class="chip">Linear</span>
+          <span class="chip">Jira</span>
+          <span class="chip">GitLab</span>
+          <span class="chip">Vercel</span>
+          <span class="chip">Cloudflare</span>
+          <span class="chip">SendGrid</span>
+          <span class="chip">Supabase</span>
+          <span class="chip">MongoDB Atlas</span>
+          <span class="chip">and more</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- final cta -->
+    <section class="cta-band">
+      <div class="wrap">
+        <div class="card">
+          <h2>Put your agents behind one gate</h2>
+          <p>Self-host OneGate today. It is open source, MIT licensed, and runs anywhere Node or Docker does.</p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="https://github.com/onegate-bot/onegate">View on GitHub</a>
+            <a class="btn btn-ghost" href="https://github.com/onegate-bot/onegate/blob/main/docs/ARCHITECTURE.md">Read the architecture</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ------------------------------------------------------------ footer -->
+  <footer>
+    <div class="wrap footer-inner">
+      <img class="logo-light" src="assets/svg/onegate-lockup.svg" alt="OneGate">
+      <img class="logo-dark" src="assets/svg/onegate-lockup-white.svg" alt="OneGate" style="display:none">
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://github.com/onegate-bot/onegate">GitHub</a>
+        <a href="https://github.com/onegate-bot/onegate/tree/main/docs">Docs</a>
+        <a href="https://github.com/onegate-bot/onegate/blob/main/docs/INTEGRATIONS.md">Integrations</a>
+        <a href="https://github.com/onegate-bot/onegate/blob/main/LICENSE">License (MIT)</a>
+      </nav>
+      <p class="footer-fine">Self-hosted credential gateway for AI agents. MIT licensed.</p>
+    </div>
+  </footer>
+
+  <script>
+    // Theme toggle. Swaps the wa-dark / wa-light class and the logo variants,
+    // persisting the choice to the same localStorage key the admin UI uses.
+    (() => {
+      const root = document.documentElement;
+      const syncLogos = () => {
+        const dark = root.classList.contains("wa-dark");
+        document.querySelectorAll(".logo-light").forEach((el) => { el.style.display = dark ? "none" : ""; });
+        document.querySelectorAll(".logo-dark").forEach((el) => { el.style.display = dark ? "" : "none"; });
+      };
+      syncLogos();
+      const btn = document.getElementById("theme-toggle");
+      btn.addEventListener("click", () => {
+        const dark = !root.classList.contains("wa-dark");
+        root.classList.toggle("wa-dark", dark);
+        root.classList.toggle("wa-light", !dark);
+        localStorage.setItem("onegate_theme", dark ? "dark" : "light");
+        syncLogos();
+      });
+    })();
+  </script>
+
+</body>
+</html>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="OneGate">
+  <!-- glow node -->
+  <circle cx="32" cy="35" r="10" fill="#4f46e5" opacity="0.16"/>
+  <!-- gateway portal -->
+  <path d="M19 49 L19 31 C19 21.4 24.8 16 32 16 C39.2 16 45 21.4 45 31 L45 49"
+        fill="none" stroke="#4f46e5" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- threshold -->
+  <path d="M13.5 49 L50.5 49" fill="none" stroke="#4f46e5" stroke-width="5.5" stroke-linecap="round"/>
+  <!-- node core -->
+  <circle cx="32" cy="35" r="5" fill="#4f46e5"/>
+</svg>

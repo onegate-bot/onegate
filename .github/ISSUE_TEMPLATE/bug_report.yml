@@ -1,0 +1,55 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what happened instead.
+      placeholder: |
+        1. Started the gateway with ...
+        2. Sent a request through it with ...
+        3. Expected 200, got 502 onegate_inject_failed
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / audit entries
+      description: Gateway startup logs, the audit log row, or the error body. Redact tokens.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: OneGate version
+      placeholder: "0.1.0 (or commit sha)"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      description: OneGate requires Node >= 22.13 (node:sqlite).
+      placeholder: "22.15.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: How is it running
+      options:
+        - CLI (onegate start)
+        - Docker / docker compose
+        - Other (explain above)
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I redacted all tokens and credentials from this report
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md, not public issues)
+          required: true

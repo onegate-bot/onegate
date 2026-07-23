@@ -1,0 +1,42 @@
+/*
+ * OneGate landing page theme, layered on Web Awesome 3.8.0 tokens.
+ * Mirrors src/admin/ui/claw-theme.css so the marketing site belongs to the
+ * same brand family. Accent indigo #4f46e5, system font, medium radius.
+ * Dark mode is driven by .wa-dark / .wa-light on <html>.
+ */
+
+:root,
+.wa-light,
+.wa-dark {
+  /* Brand = Web Awesome indigo scale, anchored on the OneGate indigo. */
+  --wa-color-brand-95: var(--wa-color-indigo-95);
+  --wa-color-brand-90: var(--wa-color-indigo-90);
+  --wa-color-brand-80: var(--wa-color-indigo-80);
+  --wa-color-brand-70: var(--wa-color-indigo-70);
+  --wa-color-brand-60: var(--wa-color-indigo-60);
+  --wa-color-brand-50: #4f46e5;
+  --wa-color-brand-40: var(--wa-color-indigo-40);
+  --wa-color-brand-30: var(--wa-color-indigo-30);
+  --wa-color-brand-20: var(--wa-color-indigo-20);
+  --wa-color-brand-10: var(--wa-color-indigo-10);
+  --wa-color-brand-05: var(--wa-color-indigo-05);
+  --wa-color-brand: #4f46e5;
+  --wa-color-brand-on: var(--wa-color-indigo-on);
+
+  /* Typography: system font stack. */
+  --wa-font-family-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --wa-font-family-heading: var(--wa-font-family-body);
+  --wa-font-family-code: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  /* Shape: medium radius across the board. */
+  --wa-border-radius-scale: 1;
+
+  /* OneGate brand palette from brand/README.txt. */
+  --og-indigo: #4f46e5;
+  --og-indigo-light: #6366f1;
+  --og-indigo-deep: #4338ca;
+  --og-indigo-on-dark: #a5b4fc;
+  --og-ink: #1e1b2e;
+}

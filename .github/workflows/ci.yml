@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+      - name: Enable corepack (pinned pnpm)
+        run: corepack enable
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        run: pnpm test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t onegate:ci .
+
+  ui-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+      - name: Install Playwright (isolated, no lockfile changes)
+        run: |
+          mkdir -p /tmp/pw && cd /tmp/pw
+          npm init -y > /dev/null
+          npm i playwright@1.52.0
+          npx playwright install --with-deps chromium
+      - name: UI smoke (headless Chromium, mobile + desktop)
+        run: PW_DIR=/tmp/pw node scripts/ui-smoke.mjs
