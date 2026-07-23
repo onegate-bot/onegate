@@ -601,6 +601,87 @@ describe("app connections (multi-account, per-agent scope)", () => {
     expect(entry?.connectionId).toBeNull();
   });
 
+  it("leaves a connection-scoped rule inert while the feature flag is off", async () => {
+    // Same pin, flag OFF (default): every connection still reaches the path.
+    const pin = store.createRule({
+      scope: "agent",
+      subjectId: appAgentId,
+      integrationId: "appvendor",
+      methods: ["*"],
+      pathGlob: "/v1/flagoff/**",
+      effect: "deny",
+      connectionScope: "except",
+      connectionId: agentConnId,
+    });
+    try {
+      const r = await viaProxy({
+        token: appToken,
+        host: APP_HOST,
+        path: "/v1/flagoff/thing",
+        headers: { "x-onegate-connection": "vendor-shared" },
+      });
+      expect(r.status).toBe(200);
+      expect(lastSeen.auth).toBe("Bearer tenant-key");
+    } finally {
+      store.deleteRule(pin.id);
+    }
+  });
+
+  it("enforces a connection-scoped DENY-except across both eval phases", async () => {
+    // Ziv's model: keep the broad allow, then pin one path so only vendor-mine
+    // may reach it. Every OTHER connection is denied by a phase-2 re-eval that
+    // fires once the connection is resolved. Requires the feature flag on.
+    process.env.ONEGATE_CONNECTION_SCOPED_RULES = "1";
+    const pin = store.createRule({
+      scope: "agent",
+      subjectId: appAgentId,
+      integrationId: "appvendor",
+      methods: ["*"],
+      pathGlob: "/v1/pinned/**",
+      effect: "deny",
+      connectionScope: "except",
+      connectionId: agentConnId,
+    });
+    try {
+      // The target connection (vendor-mine) still reaches the pinned path.
+      const ok = await viaProxy({
+        token: appToken,
+        host: APP_HOST,
+        path: "/v1/pinned/thing",
+        headers: { "x-onegate-connection": "vendor-mine" },
+      });
+      expect(ok.status).toBe(200);
+      expect(lastSeen.auth).toBe("Bearer agent-key");
+
+      // A different connection (the tenant default) is blocked on the same path.
+      const blocked = await viaProxy({
+        token: appToken,
+        host: APP_HOST,
+        path: "/v1/pinned/thing",
+        headers: { "x-onegate-connection": "vendor-shared" },
+      });
+      expect(blocked.status).toBe(403);
+      expect(JSON.parse(blocked.body).error).toBe("onegate_policy_denied");
+      const entry = store
+        .listAudit({ limit: 50 })
+        .find((e) => e.decision === "deny" && e.path === "/v1/pinned/thing");
+      expect(entry?.ruleId).toBe(pin.id);
+
+      // The pin does not touch other paths: vendor-shared still works elsewhere.
+      const elsewhere = await viaProxy({
+        token: appToken,
+        host: APP_HOST,
+        path: "/v1/unpinned",
+        headers: { "x-onegate-connection": "vendor-shared" },
+      });
+      expect(elsewhere.status).toBe(200);
+      expect(lastSeen.auth).toBe("Bearer tenant-key");
+    } finally {
+      store.deleteRule(pin.id);
+      delete process.env.ONEGATE_CONNECTION_SCOPED_RULES;
+    }
+  });
+
   afterAll(() => {
     store.deleteConnection(tenantConnId);
     store.deleteConnection(agentConnId);

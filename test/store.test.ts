@@ -90,6 +90,42 @@ describe("rulesForAgent", () => {
     const rules = store.rulesForAgent(store.getAgent(agent.id)!);
     expect(rules.map((r) => r.integrationId).sort()).toEqual(["github", "gmail"]);
   });
+
+  it("round-trips connection scoping through createRule and listRules", () => {
+    const { agent } = store.createAgent("conn-scoped");
+    const created = store.createRule({
+      scope: "agent",
+      subjectId: agent.id,
+      integrationId: "github",
+      methods: ["*"],
+      pathGlob: "/repos/onegate-bot/onegate/**",
+      effect: "deny",
+      connectionId: "conn_kop",
+      connectionScope: "except",
+    });
+    expect(created.connectionId).toBe("conn_kop");
+    expect(created.connectionScope).toBe("except");
+    const [loaded] = store.listRules({ scope: "agent", subjectId: agent.id });
+    expect(loaded.connectionId).toBe("conn_kop");
+    expect(loaded.connectionScope).toBe("except");
+  });
+
+  it("leaves connection fields null/undefined on an ordinary rule", () => {
+    const { agent } = store.createAgent("plain-rule");
+    const created = store.createRule({
+      scope: "agent",
+      subjectId: agent.id,
+      integrationId: "github",
+      methods: ["GET"],
+      pathGlob: "/**",
+      effect: "allow",
+    });
+    expect(created.connectionId).toBeNull();
+    expect(created.connectionScope).toBeUndefined();
+    const [loaded] = store.listRules({ scope: "agent", subjectId: agent.id });
+    expect(loaded.connectionId).toBeNull();
+    expect(loaded.connectionScope).toBeUndefined();
+  });
 });
 
 describe("audit", () => {

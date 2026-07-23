@@ -15,6 +15,7 @@ import type {
   AuditEntry,
   Connection,
   ConnectionKind,
+  ConnectionScope,
   Credential,
   Decision,
   DefaultPolicy,
@@ -68,7 +69,9 @@ CREATE TABLE IF NOT EXISTS rules (
   effect TEXT NOT NULL CHECK (effect IN ('allow','deny')),
   created_at TEXT NOT NULL,
   expires_at TEXT,
-  lease_ttl_seconds INTEGER
+  lease_ttl_seconds INTEGER,
+  connection_id TEXT,
+  connection_scope TEXT CHECK (connection_scope IN ('only','except'))
 );
 CREATE INDEX IF NOT EXISTS idx_rules_subject ON rules(scope, subject_id);
 -- Time-boxed integrations: presence of a row marks the integration as
@@ -340,6 +343,8 @@ function rowToRule(r: Row): Rule {
     createdAt: r.created_at,
     expiresAt: r.expires_at ?? null,
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
+    connectionId: r.connection_id ?? null,
+    connectionScope: r.connection_scope ? (r.connection_scope as Rule["connectionScope"]) : undefined,
   };
 }
 
@@ -511,6 +516,16 @@ export class Store {
     if (!ruleCols.has("expires_at")) this.db.exec("ALTER TABLE rules ADD COLUMN expires_at TEXT");
     if (!ruleCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE rules ADD COLUMN lease_ttl_seconds INTEGER");
+    // Connection-scoping columns. NULL = the rule applies regardless of which
+    // connection a request resolved to (legacy behavior). Added after the lease
+    // columns so a legacy DB gets them via ALTER, never assumed present in a
+    // query before this point.
+    if (!ruleCols.has("connection_id"))
+      this.db.exec("ALTER TABLE rules ADD COLUMN connection_id TEXT");
+    if (!ruleCols.has("connection_scope"))
+      this.db.exec(
+        "ALTER TABLE rules ADD COLUMN connection_scope TEXT CHECK (connection_scope IN ('only','except'))",
+      );
     if (!connCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE connections ADD COLUMN lease_ttl_seconds INTEGER");
     const linkCols = new Set(
@@ -1504,6 +1519,10 @@ export class Store {
     expiresAt?: string | null;
     /** Lease duration (seconds) recorded so renewals can re-stamp expiresAt. */
     leaseTtlSeconds?: number | null;
+    /** Pin this rule to a specific app connection (with connectionScope). */
+    connectionId?: string | null;
+    /** "only" = applies for that connection, "except" = applies for all others. */
+    connectionScope?: ConnectionScope;
   }): Rule {
     const r: Rule = {
       id: newId("rl"),
@@ -1512,10 +1531,12 @@ export class Store {
       createdAt: now(),
       expiresAt: input.expiresAt ?? null,
       leaseTtlSeconds: input.leaseTtlSeconds ?? null,
+      connectionId: input.connectionId ?? null,
+      connectionScope: input.connectionScope,
     };
     this.db
       .prepare(
-        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         r.id,
@@ -1528,6 +1549,8 @@ export class Store {
         r.createdAt,
         r.expiresAt ?? null,
         r.leaseTtlSeconds ?? null,
+        r.connectionId ?? null,
+        r.connectionScope ?? null,
       );
     return r;
   }

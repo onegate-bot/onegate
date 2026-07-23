@@ -21,6 +21,8 @@ interface Rule {
   effect: string;
   expiresAt?: string | null;
   leaseTtlSeconds?: number | null;
+  connectionId?: string | null;
+  connectionScope?: "only" | "except";
 }
 
 /** Human summary of a rule's access lease for the LEASE column. */
@@ -39,7 +41,11 @@ async function list(ctx: CliContext): Promise<void> {
       console.log("no rules.");
       return;
     }
-    const withLease = rules.map((r) => ({ ...r, lease: leaseCell(r) }));
+    const withLease = rules.map((r) => ({
+      ...r,
+      lease: leaseCell(r),
+      connection: r.connectionScope ? `${r.connectionScope} ${r.connectionId}` : "-",
+    }));
     console.log(
       table(withLease as unknown as Array<Record<string, unknown>>, [
         ["ID", "id"],
@@ -49,6 +55,7 @@ async function list(ctx: CliContext): Promise<void> {
         ["METHODS", "methods"],
         ["PATH", "pathGlob"],
         ["EFFECT", "effect"],
+        ["CONNECTION", "connection"],
         ["LEASE", "lease"],
       ]),
     );
@@ -66,12 +73,24 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
       methods: { type: "string", default: "*" },
       path: { type: "string", default: "/**" },
       ttl: { type: "string" },
+      connection: { type: "string" },
+      "connection-scope": { type: "string" },
     },
   });
   if (!values.scope || !values.subject || !values.integration || !values.effect) {
     throw new Error(
-      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**] [--ttl <seconds|Nh>]",
+      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**] [--ttl <seconds|Nh>] [--connection <conn-id> --connection-scope only|except]",
     );
+  }
+  const connectionScope = values["connection-scope"] as string | undefined;
+  if (connectionScope != null && connectionScope !== "only" && connectionScope !== "except") {
+    throw new Error(`invalid --connection-scope "${connectionScope}" (use "only" or "except")`);
+  }
+  if (connectionScope != null && !values.connection) {
+    throw new Error("--connection-scope requires --connection <conn-id>");
+  }
+  if (values.connection && connectionScope == null) {
+    throw new Error("--connection requires --connection-scope only|except");
   }
   const methods = (values.methods as string)
     .split(",")
@@ -86,10 +105,11 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
     methods,
     pathGlob: values.path,
     ...(ttlSeconds != null ? { ttlSeconds } : {}),
+    ...(values.connection ? { connectionId: values.connection, connectionScope } : {}),
   })) as Rule;
   emit(rule, () =>
     console.log(
-      `Rule ${rule.id}: ${rule.effect} ${rule.scope}:${rule.subjectId} -> ${rule.integrationId} ${rule.methods.join(",")} ${rule.pathGlob}${rule.leaseTtlSeconds ? ` [lease ${leaseCell(rule)}]` : ""}`,
+      `Rule ${rule.id}: ${rule.effect} ${rule.scope}:${rule.subjectId} -> ${rule.integrationId} ${rule.methods.join(",")} ${rule.pathGlob}${rule.connectionScope ? ` [connection ${rule.connectionScope} ${rule.connectionId}]` : ""}${rule.leaseTtlSeconds ? ` [lease ${leaseCell(rule)}]` : ""}`,
     ),
   );
 }
