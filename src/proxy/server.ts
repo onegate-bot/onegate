@@ -19,7 +19,7 @@ import type { Duplex } from "node:stream";
 import type { Ca } from "../ca.js";
 import type { Store } from "../store/db.js";
 import { evaluate } from "../policy.js";
-import type { Agent, Connection, LlmStrategy, OwnerNotification } from "../types.js";
+import type { Agent, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
 import { connectFlowKind, type Integration, type Registry } from "../integrations/types.js";
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
 import { createUsageScanner, extractRequestModel, type TokenUsage } from "../llm/usage.js";
@@ -716,7 +716,23 @@ export class GatewayProxy {
     // with its own vendor token (the Gaty case) is unaffected.
     const llmRoute = this.resolveLlmRoute(agent, integration);
     if (llmRoute) {
-      await this.handleLlmRequest(req, res, ctx, verdict.ruleId, llmRoute);
+      // Phase-2 connection-scoped enforcement also applies here. The LLM path
+      // picks its own connection (round-robin/fallback) INSIDE handleLlmRequest,
+      // and may fail over to another connection mid-flight, so the re-evaluation
+      // is done per attempted connection there. We forward the rules and the
+      // phase-1 needsConnection flag so it can re-check the resolved connection
+      // against any connection-scoped rule before dispatching upstream. When no
+      // connection-scoped rule matched (needsConnection false) or the feature
+      // flag is off, this is a no-op and behavior is byte-identical to before.
+      await this.handleLlmRequest(
+        req,
+        res,
+        ctx,
+        verdict.ruleId,
+        llmRoute,
+        rules,
+        verdict.needsConnection ?? false,
+      );
       return;
     }
 
@@ -1010,12 +1026,53 @@ export class GatewayProxy {
     ctx: SocketCtx,
     ruleId: string | null,
     route: LlmRoute,
+    rules: Rule[] = [],
+    needsConnection: boolean = false,
   ): Promise<void> {
     const { agent, host, port, integration } = ctx;
     const method = (req.method ?? "GET").toUpperCase();
     const path = req.url ?? "/";
     const llm = integration.llm!;
     const ids = route.connections.map((c) => c.id);
+
+    // Phase-2 connection-scoped policy check for the LLM path. Phase-1 ran
+    // before any connection was resolved, so a connection-scoped rule was held
+    // pending (needsConnection). Now, for whichever connection this path is
+    // about to use, re-evaluate; a connection-scoped deny (e.g. "deny this LLM
+    // integration unless the request uses connection X") must fire here just as
+    // it does on the non-LLM path. Returns true when denied (and has already
+    // written the 403 + audited), so the caller must stop. When needsConnection
+    // is false (no connection-scoped rule matched) or the flag is off, this is a
+    // no-op and never denies.
+    const denyIfConnectionScoped = (conn: Connection): boolean => {
+      if (!needsConnection) return false;
+      const finalVerdict = evaluate(agent, rules, {
+        integrationId: integration.id,
+        method,
+        path,
+        connectionId: conn.id,
+      });
+      if (finalVerdict.effect !== "deny") return false;
+      this.opts.store.audit({
+        agentId: agent.id,
+        agentName: agent.name,
+        integrationId: integration.id,
+        host,
+        method,
+        path,
+        decision: "deny",
+        ruleId: finalVerdict.ruleId,
+        status: 403,
+      });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "onegate_policy_denied",
+          message: `Policy denies ${method} ${host}${path} for agent "${agent.name}" on the selected connection "${conn.name}".`,
+        }),
+      );
+      return true;
+    };
 
     let body: Buffer;
     try {
@@ -1165,6 +1222,10 @@ export class GatewayProxy {
     let conn = route.connections[index];
     let failover = false;
     for (;;) {
+      // Enforce connection-scoped policy for the connection this iteration will
+      // use — both the initially selected one and any failover target — before
+      // dispatching upstream. A denied connection never reaches the vendor.
+      if (denyIfConnectionScoped(conn)) return;
       let upRes: http.IncomingMessage;
       try {
         upRes = await attempt(conn);
