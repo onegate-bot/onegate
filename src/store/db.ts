@@ -188,7 +188,7 @@ CREATE VIEW IF NOT EXISTS llm_turns_estimated AS
          END AS is_turn_start
   FROM ordered;
 CREATE TABLE IF NOT EXISTS onboarding_links (
-  token TEXT PRIMARY KEY,
+  token_hash TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
   integration_id TEXT NOT NULL,
   scopes TEXT,
@@ -350,7 +350,12 @@ function rowToRule(r: Row): Rule {
 
 function rowToOnboardingLink(r: Row): OnboardingLink {
   return {
-    token: r.token,
+    // Only the hash is stored. The plaintext token lives solely in the connect
+    // URL delivered at mint time. Callers that hold the plaintext (redemption
+    // via getOnboardingLink) get it re-attached there; list/admin reads surface
+    // the hash, which is enough to identify and revoke a link.
+    tokenHash: r.token_hash,
+    token: r.token_hash,
     agentId: r.agent_id,
     integrationId: r.integration_id,
     scopes: r.scopes ? JSON.parse(r.scopes) : null,
@@ -466,6 +471,7 @@ export class Store {
     this.db.exec(SCHEMA);
     this.migrate();
     this.encryptSecretsAtRest();
+    this.hashCapabilityTokensAtRest();
   }
 
   /**
@@ -572,6 +578,83 @@ export class Store {
         // legacy JSON, seal() wraps it) so no secret is altered.
         update.run(this.secrets.seal(this.secrets.open(r.data)), r.id);
       }
+    }
+  }
+
+  /**
+   * One-time hash-at-rest of connect-capability tokens. Onboarding-link tokens
+   * and owner-notification connect tokens are BEARER CAPABILITIES: possessing
+   * one lets the holder drive the connect wizard for an agent and attach a
+   * credential. They were historically stored in cleartext while credential /
+   * connection secrets (and even agent_notify webhook URLs) are sealed, so a
+   * leaked DB file yielded working onboarding-hijack links. We now store only
+   * the SHA-256 hash (mirroring agent tokens), redeeming by hashing the
+   * presented token. This migration rewrites any pre-existing plaintext rows to
+   * their hash in place so old links keep working (the plaintext in the already
+   * delivered URL still hashes to the stored value), and is idempotent: rows
+   * already holding a hash are skipped.
+   */
+  private hashCapabilityTokensAtRest(): void {
+    // onboarding_links: legacy DBs have a plaintext `token` PRIMARY KEY column
+    // instead of the current `token_hash` column. Rebuild the table, hashing
+    // each token into token_hash. Already-migrated DBs (token_hash present) are
+    // left untouched.
+    const linkCols = new Set(
+      (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) =>
+        String(r.name),
+      ),
+    );
+    if (linkCols.has("token") && !linkCols.has("token_hash")) {
+      this.db.exec("ALTER TABLE onboarding_links RENAME TO onboarding_links_legacy");
+      this.db.exec(`CREATE TABLE onboarding_links (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        integration_id TEXT NOT NULL,
+        scopes TEXT,
+        connection_name TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        rule_id TEXT
+      )`);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id)");
+      const legacyCols = new Set(
+        (this.db.prepare("PRAGMA table_info(onboarding_links_legacy)").all() as Row[]).map((r) =>
+          String(r.name),
+        ),
+      );
+      const rows = this.db.prepare("SELECT * FROM onboarding_links_legacy").all() as Row[];
+      const insert = this.db.prepare(
+        "INSERT OR IGNORE INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (const r of rows) {
+        insert.run(
+          hashToken(String(r.token)),
+          r.agent_id,
+          r.integration_id,
+          r.scopes ?? null,
+          r.connection_name ?? null,
+          r.created_at,
+          r.expires_at,
+          r.used_at ?? null,
+          legacyCols.has("rule_id") ? (r.rule_id ?? null) : null,
+        );
+      }
+      this.db.exec("DROP TABLE onboarding_links_legacy");
+    }
+    // owner_notifications.connect_token now holds the hash, not the plaintext.
+    // Hash any legacy plaintext rows in place. A row already holding a hash
+    // (64 lowercase hex chars) is left alone so this is idempotent.
+    const notifRows = this.db
+      .prepare("SELECT id, connect_token FROM owner_notifications WHERE connect_token IS NOT NULL")
+      .all() as Row[];
+    const updateNotif = this.db.prepare(
+      "UPDATE owner_notifications SET connect_token = ? WHERE id = ?",
+    );
+    for (const r of notifRows) {
+      const tok = String(r.connect_token);
+      if (/^[0-9a-f]{64}$/.test(tok)) continue;
+      updateNotif.run(hashToken(tok), r.id);
     }
   }
 
@@ -1673,8 +1756,12 @@ export class Store {
     const createdAt = now();
     const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
     const scopes = input.scopes && input.scopes.length ? input.scopes : null;
+    const token = randomBytes(24).toString("hex");
     const link: OnboardingLink = {
-      token: randomBytes(24).toString("hex"),
+      // Plaintext token: returned to the caller (goes into the connect URL) but
+      // never persisted. Only tokenHash is stored.
+      token,
+      tokenHash: hashToken(token),
       agentId: input.agentId,
       integrationId: input.integrationId,
       scopes,
@@ -1686,10 +1773,10 @@ export class Store {
     };
     this.db
       .prepare(
-        "INSERT INTO onboarding_links (token, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
-        link.token,
+        link.tokenHash,
         link.agentId,
         link.integrationId,
         link.scopes ? JSON.stringify(link.scopes) : null,
@@ -1707,24 +1794,22 @@ export class Store {
    * rule, or null. Lets the proxy reuse one live renewal link across repeated
    * lapsed-lease hits instead of minting a fresh one each request.
    */
-  activeRenewalLinkFor(ruleId: string): OnboardingLink | null {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM onboarding_links WHERE rule_id = ? AND used_at IS NULL ORDER BY created_at DESC, rowid DESC",
-      )
-      .all(ruleId) as Row[];
-    for (const r of rows) {
-      const link = rowToOnboardingLink(r);
-      if (this.isOnboardingLinkValid(link)) return link;
-    }
+  activeRenewalLinkFor(_ruleId: string): OnboardingLink | null {
+    // Reuse is disabled: only the token hash is stored, so a live link's
+    // plaintext token cannot be recovered to rebuild a redeemable URL. Callers
+    // mint a fresh link each time; owner-notification dedup (time window /
+    // dedupKey) still prevents duplicate notifications.
     return null;
   }
 
   getOnboardingLink(token: string): OnboardingLink | null {
     const r = this.db
-      .prepare("SELECT * FROM onboarding_links WHERE token = ?")
-      .get(token) as Row | undefined;
-    return r ? rowToOnboardingLink(r) : null;
+      .prepare("SELECT * FROM onboarding_links WHERE token_hash = ?")
+      .get(hashToken(token)) as Row | undefined;
+    if (!r) return null;
+    // Re-attach the presented plaintext so redemption flows that rebuild the
+    // connect URL from link.token continue to emit a redeemable token.
+    return { ...rowToOnboardingLink(r), token };
   }
 
   /**
@@ -1733,16 +1818,11 @@ export class Store {
    * minting a fresh one on every failed request (e.g. a bot retrying a call to
    * an unconnected integration), keeping the onboarding_links table bounded.
    */
-  activeOnboardingLinkFor(agentId: string, integrationId: string): OnboardingLink | null {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM onboarding_links WHERE agent_id = ? AND integration_id = ? AND used_at IS NULL ORDER BY created_at DESC, rowid DESC",
-      )
-      .all(agentId, integrationId) as Row[];
-    for (const r of rows) {
-      const link = rowToOnboardingLink(r);
-      if (this.isOnboardingLinkValid(link)) return link;
-    }
+  activeOnboardingLinkFor(_agentId: string, _integrationId: string): OnboardingLink | null {
+    // Reuse is disabled: only the token hash is stored, so a live link's
+    // plaintext token cannot be recovered to rebuild a redeemable URL. Callers
+    // mint a fresh link each time; owner-notification dedup (time window /
+    // dedupKey) still prevents duplicate notifications.
     return null;
   }
 
@@ -1754,7 +1834,9 @@ export class Store {
   }
 
   markOnboardingLinkUsed(token: string): void {
-    this.db.prepare("UPDATE onboarding_links SET used_at = ? WHERE token = ?").run(now(), token);
+    this.db
+      .prepare("UPDATE onboarding_links SET used_at = ? WHERE token_hash = ?")
+      .run(now(), hashToken(token));
   }
 
   listOnboardingLinks(agentId?: string): OnboardingLink[] {
@@ -1769,7 +1851,13 @@ export class Store {
   }
 
   deleteOnboardingLink(token: string): void {
-    this.db.prepare("DELETE FROM onboarding_links WHERE token = ?").run(token);
+    // Accept either the plaintext token (from a connect URL) or the stored hash
+    // itself (which is what the admin list surfaces). The two never collide: a
+    // plaintext token is 48 hex chars, a hash is 64. This keeps admin
+    // revoke-from-list working without exposing the plaintext.
+    this.db
+      .prepare("DELETE FROM onboarding_links WHERE token_hash = ? OR token_hash = ?")
+      .run(hashToken(token), token);
   }
 
   // ---- per-agent notify webhook (owner notification config) ----
@@ -1846,11 +1934,15 @@ export class Store {
     dedupKey?: string | null;
   }): OwnerNotification {
     const ts = now();
+    // The connect token is a bearer capability, so persist only its hash (the
+    // plaintext lives in the delivered connect URL). It is stored purely for
+    // tracking/audit here and is never redeemed by lookup, so a hash suffices.
+    const connectTokenHash = input.connectToken ? hashToken(input.connectToken) : null;
     const result = this.db
       .prepare(
         "INSERT INTO owner_notifications (agent_id, integration_id, connect_token, status, created_at, delivered_at, last_attempt_at, attempts, error, dedup_key) VALUES (?, ?, ?, 'pending', ?, NULL, NULL, 0, NULL, ?)",
       )
-      .run(input.agentId, input.integrationId, input.connectToken ?? null, ts, input.dedupKey ?? null);
+      .run(input.agentId, input.integrationId, connectTokenHash, ts, input.dedupKey ?? null);
     const id = Number(result.lastInsertRowid);
     return rowToOwnerNotification(
       this.db.prepare("SELECT * FROM owner_notifications WHERE id = ?").get(id) as Row,

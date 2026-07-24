@@ -8,6 +8,7 @@
  */
 
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +17,8 @@ import { Store } from "../src/store/db.js";
 
 const requireBuiltin = createRequire(import.meta.url);
 const { DatabaseSync } = requireBuiltin("node:sqlite") as typeof import("node:sqlite");
+
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 let store: Store;
 
@@ -112,7 +115,8 @@ describe("enqueueOwnerNotification", () => {
     expect(row.id).toBeGreaterThan(0);
     expect(row.agentId).toBe("ag_1");
     expect(row.integrationId).toBe("github");
-    expect(row.connectToken).toBe("tok_abc");
+    // The connect token is a bearer capability, stored as its SHA-256 hash.
+    expect(row.connectToken).toBe(sha256("tok_abc"));
     expect(row.status).toBe("pending");
     expect(row.attempts).toBe(0);
     expect(row.deliveredAt).toBeNull();

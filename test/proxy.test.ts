@@ -348,10 +348,17 @@ describe("self-service connect_url on not-connected errors", () => {
     expect(body.connect_url).toMatch(/\/connect\/oauthvendor\/[A-Za-z0-9_-]+$/);
   });
 
-  it("reuses one live link across retries instead of minting a new one each time", async () => {
+  it("mints a fresh valid connect link on each retry (reuse disabled: hashed tokens are unrecoverable)", async () => {
     const a = await viaProxy({ token: agentToken, path: "/v1/thing", host: OAUTH_HOST });
     const b = await viaProxy({ token: agentToken, path: "/v1/thing", host: OAUTH_HOST });
-    expect(JSON.parse(a.body).connect_url).toBe(JSON.parse(b.body).connect_url);
+    const urlA = JSON.parse(a.body).connect_url as string;
+    const urlB = JSON.parse(b.body).connect_url as string;
+    // Since only the token hash is stored, a live link can no longer be turned
+    // back into a redeemable URL, so each retry mints a fresh link.
+    expect(urlA).not.toBe(urlB);
+    // Both links are well-formed and independently redeemable.
+    expect(urlA).toMatch(/\/connect\/oauthvendor\/[A-Za-z0-9_-]+$/);
+    expect(urlB).toMatch(/\/connect\/oauthvendor\/[A-Za-z0-9_-]+$/);
   });
 });
 
