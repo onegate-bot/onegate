@@ -275,6 +275,24 @@ const FRAGMENT_BRIDGE_PAGE = publicShell({
 export function createAdminApp(opts: AdminApiOptions): express.Express {
   const { store, registry, ca } = opts;
   const app = express();
+
+  // Security headers on every response. Registered before all routes and the
+  // static UI so it also covers the admin SPA and the public connect/oauth/renew
+  // pages. frame-ancestors 'none' + X-Frame-Options DENY are the anti-clickjacking
+  // control (prevents framing the one-tap /renew lease re-allow and the
+  // authenticated admin console). nosniff blocks content-type sniffing. The CSP
+  // is deliberately scoped to frame-ancestors/object-src/base-uri only, so it
+  // does not restrict the inline <script>/<style> the wizard and admin pages use.
+  app.use((_req, res, next) => {
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader(
+      "Content-Security-Policy",
+      "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+    );
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    next();
+  });
+
   app.use(express.json());
 
   const pendingOauth = new Map<string, OauthPending>();
