@@ -20,7 +20,7 @@ import tls from "node:tls";
 import { initCa } from "../src/ca.js";
 import { Store } from "../src/store/db.js";
 import { Registry } from "../src/integrations/types.js";
-import { GatewayProxy } from "../src/proxy/server.js";
+import { GatewayProxy, isValidConnectHost } from "../src/proxy/server.js";
 
 const VENDOR_HOST = "api.example-vendor.com";
 const SIGNER_HOST = "sign.example-vendor.com";
@@ -256,6 +256,30 @@ function viaProxy(opts: {
     connectReq.end();
   });
 }
+
+describe("CONNECT host validation (leaf-cert path traversal guard)", () => {
+  it("accepts well-formed DNS hostnames", () => {
+    expect(isValidConnectHost("api.github.com")).toBe(true);
+    expect(isValidConnectHost("gmail.googleapis.com")).toBe(true);
+    expect(isValidConnectHost("my-host.example-corp.co")).toBe(true);
+    expect(isValidConnectHost("API.Example.COM")).toBe(true);
+    expect(isValidConnectHost("localhost")).toBe(true);
+  });
+
+  it("rejects hosts with path separators or traversal sequences", () => {
+    expect(isValidConnectHost("../../../tmp/evil.amazonaws.com")).toBe(false);
+    expect(isValidConnectHost("..")).toBe(false);
+    expect(isValidConnectHost("foo/bar.amazonaws.com")).toBe(false);
+    expect(isValidConnectHost("foo\\bar.amazonaws.com")).toBe(false);
+  });
+
+  it("rejects hosts with control chars, whitespace, or empties", () => {
+    expect(isValidConnectHost("")).toBe(false);
+    expect(isValidConnectHost("host with space.com")).toBe(false);
+    expect(isValidConnectHost("host .com")).toBe(false);
+    expect(isValidConnectHost("host\n.com")).toBe(false);
+  });
+});
 
 describe("agent auth", () => {
   it("rejects CONNECT without a valid token (407)", async () => {
