@@ -49,6 +49,78 @@ export interface PolicyResult {
   needsConnection?: boolean;
 }
 
+/**
+ * Percent-decodes a string ONCE, treating any malformed escape (a `%` not
+ * followed by two hex digits) as a literal. Never throws.
+ *
+ * `decodeURIComponent` throws on malformed input, so we scan manually and only
+ * decode well-formed `%XX` triples. Exactly one decode pass is performed, so a
+ * legitimately double-encoded segment (`%252F`) decodes to `%2F`, NOT `/` — the
+ * agent's intended single decode is preserved and no extra semantics are
+ * introduced.
+ */
+function decodeOnce(input: string): string {
+  let out = "";
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === "%" && i + 2 < input.length) {
+      const hex = input.slice(i + 1, i + 3);
+      if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+        out += String.fromCharCode(parseInt(hex, 16));
+        i += 2;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Collapses `.`/`..` dot-segments and repeated slashes in an absolute path.
+ * A leading `..` can never escape above root (it is discarded). The result
+ * always starts with `/`.
+ */
+function collapsePath(path: string): string {
+  const leadingSlash = path.startsWith("/");
+  const segments = path.split("/");
+  const out: string[] = [];
+  for (const seg of segments) {
+    if (seg === "" || seg === ".") continue; // "" collapses repeated slashes
+    if (seg === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  // Preserve a single trailing slash if the input had one and there is content.
+  const trailingSlash = path.length > 1 && path.endsWith("/");
+  let result = (leadingSlash ? "/" : "") + out.join("/");
+  if (trailingSlash && out.length > 0 && !result.endsWith("/")) result += "/";
+  if (result === "") result = leadingSlash ? "/" : "";
+  return result;
+}
+
+/**
+ * Canonicalizes a request target so policy matching and upstream forwarding
+ * both use one unambiguous path.
+ *
+ * The path portion (everything before the first `?`) is percent-decoded once
+ * (malformation-safe), then its `.`/`..` dot-segments and duplicate slashes are
+ * collapsed. The query string is preserved verbatim and re-attached — only the
+ * path is normalized. This closes deny-glob evasion via equivalent-but-encoded
+ * paths (`%2Frepos%2F...`, `//repos/...`, `/repos/x/../onegate-bot/...`) by
+ * ensuring the matched request equals the request forwarded upstream.
+ */
+export function normalizeRequestPath(target: string): string {
+  const qIdx = target.indexOf("?");
+  const rawPath = qIdx === -1 ? target : target.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : target.slice(qIdx); // includes leading "?"
+  const decoded = decodeOnce(rawPath);
+  const canonical = collapsePath(decoded);
+  return canonical + query;
+}
+
 const globCache = new Map<string, RegExp>();
 
 /**
@@ -81,7 +153,10 @@ export function globToRegExp(glob: string): RegExp {
 export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   if (rule.integrationId !== "*" && rule.integrationId !== req.integrationId) return false;
   if (!rule.methods.includes("*") && !rule.methods.includes(req.method.toUpperCase())) return false;
-  const path = req.path.split("?")[0];
+  // Match against the canonical path portion. normalizeRequestPath is
+  // idempotent on an already-canonical path, so this is safe whether the caller
+  // (the proxy) pre-normalized or passed a raw target.
+  const path = normalizeRequestPath(req.path).split("?")[0];
   return globToRegExp(rule.pathGlob).test(path);
 }
 
