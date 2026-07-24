@@ -89,6 +89,102 @@ describe("secrets at rest (C2)", () => {
     expect(raw).not.toContain("sk_live_LEGACY");
   });
 
+  it("skips an undecryptable connection row in the list while returning good rows", () => {
+    const store = new Store(dbPath);
+    const good = store.createConnection({
+      kind: "app",
+      vendor: "slack",
+      name: "good",
+      data: { token: "xoxb-GOOD" },
+    });
+    const bad = store.createConnection({
+      kind: "app",
+      vendor: "slack",
+      name: "bad",
+      data: { token: "xoxb-WILL-CORRUPT" },
+    });
+    store.close();
+
+    // Corrupt the bad row's envelope directly on disk (simulates a row sealed
+    // under a rotated key or a truncated blob). The prefix keeps it "sealed" so
+    // the migration attempts to open it and box.open throws a bad GCM tag.
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE connections SET data = ? WHERE id = ?").run("enc.v1:garbage", bad.id);
+    db.close();
+
+    const reopened = new Store(dbPath);
+    const listed = reopened.listConnections({ kind: "app", vendor: "slack" });
+    const ids = listed.map((c) => c.id);
+    expect(ids).toContain(good.id);
+    expect(ids).not.toContain(bad.id);
+    expect(reopened.getConnection(good.id)?.data).toEqual({ token: "xoxb-GOOD" });
+    reopened.close();
+  });
+
+  it("skips an undecryptable credential row in the list while returning good rows", () => {
+    const store = new Store(dbPath);
+    const good = store.setCredential("github", "gh", { token: "ghp_GOOD" });
+    const bad = store.setCredential("stripe", "stripe", { key: "sk_live_WILL_CORRUPT" });
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE credentials SET data = ? WHERE id = ?").run("enc.v1:garbage", bad.id);
+    db.close();
+
+    const reopened = new Store(dbPath);
+    const listed = reopened.listCredentials();
+    const ids = listed.map((c) => c.id);
+    expect(ids).toContain(good.id);
+    expect(ids).not.toContain(bad.id);
+    reopened.close();
+  });
+
+  it("returns null (not throw) from the single-row getters for a corrupt row", () => {
+    const store = new Store(dbPath);
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "slack",
+      name: "c",
+      data: { token: "xoxb-x" },
+    });
+    const cred = store.setCredential("github", "gh", { token: "ghp_x" });
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE connections SET data = ? WHERE id = ?").run("enc.v1:garbage", conn.id);
+    db.prepare("UPDATE credentials SET data = ? WHERE id = ?").run("enc.v1:garbage", cred.id);
+    db.close();
+
+    const reopened = new Store(dbPath);
+    expect(reopened.getConnection(conn.id)).toBeNull();
+    expect(reopened.getCredential("github")).toBeNull();
+    reopened.close();
+  });
+
+  it("boots (does not throw) when a legacy plaintext row is unparseable", () => {
+    const store = new Store(dbPath);
+    const good = store.setCredential("github", "gh", { token: "ghp_GOOD" });
+    const bad = store.setCredential("stripe", "stripe", { key: "sk_live_x" });
+    store.close();
+
+    // Downgrade the bad row to legacy plaintext that is NOT valid JSON, so the
+    // constructor's at-rest migration (open -> seal) throws for that row.
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE credentials SET data = ? WHERE id = ?").run("this-is-not-json{", bad.id);
+    db.close();
+
+    // Construction must not throw despite the one unparseable legacy blob.
+    let reopened: Store | undefined;
+    expect(() => {
+      reopened = new Store(dbPath);
+    }).not.toThrow();
+    // The good row is still fully usable after boot.
+    expect(reopened!.getCredential("github")?.data).toEqual({ token: "ghp_GOOD" });
+    expect(good.id).toBeTruthy();
+    expect(bad.id).toBeTruthy();
+    reopened!.close();
+  });
+
   it("persists a usable key file next to the DB (0600)", () => {
     const store = new Store(dbPath);
     store.setCredential("github", "gh", { token: "ghp_x" });
