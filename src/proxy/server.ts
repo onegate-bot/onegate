@@ -644,6 +644,90 @@ export class GatewayProxy {
     return { url: `${base}/connect/${integration.id}/${link.token}`, expiresAt: link.expiresAt };
   }
 
+  /**
+   * Resolves the app connection for a request (x-onegate-connection header, else
+   * the agent's saved choice, else the tenant default), writing the appropriate
+   * error response itself when resolution fails.
+   *
+   * Returns a discriminated result:
+   *   - `{ sent: true }`  — an error response was already written (400
+   *     unknown_connection or 403 connection_not_granted); the caller must stop.
+   *   - `{ sent: false, connection }` — resolution succeeded; `connection` is the
+   *     selected connection, or `null` for the legacy single-credential path.
+   *
+   * Extracted so both the normal allow path and the deny-branch phase-2 recovery
+   * can resolve the connection identically without duplicating the logic.
+   */
+  private resolveConnectionForRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    agent: Agent,
+    integration: Integration,
+    host: string,
+    method: string,
+    path: string,
+  ): { sent: true } | { sent: false; connection: Connection | null } {
+    const headerValue = singleHeader(req.headers["x-onegate-connection"]);
+    const resolved = this.opts.store.resolveAppConnection(agent.id, integration.id, headerValue);
+    if (resolved && "error" in resolved) {
+      // Default-deny: either the named/selected connection does not exist
+      // (unknown_connection, 400) or it exists but is not granted to this agent
+      // or its project (connection_not_granted, 403). Never silently fall
+      // through to the legacy credential. Both outcomes are audited.
+      if (resolved.error === "unknown_connection") {
+        this.opts.store.audit({
+          agentId: agent.id,
+          agentName: agent.name,
+          integrationId: integration.id,
+          host,
+          method,
+          path,
+          decision: "unknown_connection",
+          status: 400,
+        });
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "onegate_unknown_connection",
+            message: `No app connection named or with id "${headerValue}" exists for integration "${integration.id}".`,
+          }),
+        );
+        return { sent: true };
+      }
+      // connection_not_granted
+      this.opts.store.audit({
+        agentId: agent.id,
+        agentName: agent.name,
+        integrationId: integration.id,
+        host,
+        method,
+        path,
+        decision: "connection_not_granted",
+        status: 403,
+      });
+      this.maybeNotifyOwner(agent, integration, "connection_not_granted");
+      const connect = this.connectUrlFor(agent, integration);
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "onegate_connection_not_granted",
+          message: connect
+            ? `No app connection for integration "${integration.id}" is granted to agent "${agent.name}". Open the connect_url to connect one, then retry.`
+            : `No app connection for integration "${integration.id}" is granted to agent "${agent.name}". Grant one in the OneGate admin UI.`,
+          ...(connect
+            ? {
+                connect_url: connect.url,
+                connect_expires_at: connect.expiresAt,
+                hint: "Show connect_url to your owner as a bare link. Opening it lets them connect this integration to you, then retry the request.",
+              }
+            : {}),
+        }),
+      );
+      return { sent: true };
+    }
+    return { sent: false, connection: resolved ? resolved.connection : null };
+  }
+
   private async onInnerRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const ctx = this.ctxBySocket.get(req.socket);
     if (!ctx) {
@@ -660,7 +744,33 @@ export class GatewayProxy {
 
     const rules = this.opts.store.rulesForAgent(agent);
     const verdict = evaluate(agent, rules, { integrationId: integration.id, method, path });
-    if (verdict.effect === "deny") {
+
+    // When phase-1 evaluated to DENY but a connection-scoped rule was held
+    // pending (verdict.needsConnection), the deny is not final: a
+    // connection-scoped ALLOW rule for the specific connection this request
+    // resolves to could still grant access. Resolve the connection now and
+    // re-run the policy (phase-2). Only if phase-2 STILL denies do we fall into
+    // the deny handler below. This is fail-safe: any resolution error emits its
+    // own deny response, and a phase-2 deny is honoured. When the flag is off,
+    // needsConnection is never set, so this block is inert and behaviour is
+    // unchanged. `preResolved` is threaded to the allow path so the connection
+    // is resolved exactly once.
+    let effectiveVerdict = verdict;
+    let preResolved: { resolved: true; connection: Connection | null } | null = null;
+    if (verdict.effect === "deny" && verdict.needsConnection) {
+      const r = this.resolveConnectionForRequest(req, res, agent, integration, host, method, path);
+      if (r.sent) return; // resolution failed and already denied (fail-safe)
+      preResolved = { resolved: true, connection: r.connection };
+      effectiveVerdict = evaluate(agent, rules, {
+        integrationId: integration.id,
+        method,
+        path,
+        connectionId: r.connection?.id ?? null,
+      });
+    }
+
+    if (effectiveVerdict.effect === "deny") {
+      const verdict = effectiveVerdict;
       this.opts.store.audit({
         agentId: agent.id,
         agentName: agent.name,
@@ -741,15 +851,16 @@ export class GatewayProxy {
       // picks its own connection (round-robin/fallback) INSIDE handleLlmRequest,
       // and may fail over to another connection mid-flight, so the re-evaluation
       // is done per attempted connection there. We forward the rules and the
-      // phase-1 needsConnection flag so it can re-check the resolved connection
-      // against any connection-scoped rule before dispatching upstream. When no
+      // PHASE-1 needsConnection flag (not the phase-2 one, which was already
+      // resolved against a non-LLM connection and would read false) so it can
+      // re-check each LLM connection it actually dispatches on. When no
       // connection-scoped rule matched (needsConnection false) or the feature
       // flag is off, this is a no-op and behavior is byte-identical to before.
       await this.handleLlmRequest(
         req,
         res,
         ctx,
-        verdict.ruleId,
+        effectiveVerdict.ruleId,
         llmRoute,
         rules,
         verdict.needsConnection ?? false,
@@ -763,102 +874,56 @@ export class GatewayProxy {
     // tenant-wide default. When NONE of these resolve (no app connections at
     // all and no saved config), this returns null and we fall through to the
     // legacy single-credential path below, byte-identical to before.
-    const headerValue = singleHeader(req.headers["x-onegate-connection"]);
-    let selectedConnection: Connection | null = null;
-    const resolved = this.opts.store.resolveAppConnection(agent.id, integration.id, headerValue);
-    if (resolved && "error" in resolved) {
-      // Default-deny: either the named/selected connection does not exist
-      // (unknown_connection, 400) or it exists but is not granted to this agent
-      // or its project (connection_not_granted, 403). Never silently fall
-      // through to the legacy credential. Both outcomes are audited.
-      if (resolved.error === "unknown_connection") {
-        this.opts.store.audit({
-          agentId: agent.id,
-          agentName: agent.name,
-          integrationId: integration.id,
-          host,
-          method,
-          path,
-          decision: "unknown_connection",
-          status: 400,
-        });
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "onegate_unknown_connection",
-            message: `No app connection named or with id "${headerValue}" exists for integration "${integration.id}".`,
-          }),
-        );
-        return;
-      }
-      // connection_not_granted
-      this.opts.store.audit({
-        agentId: agent.id,
-        agentName: agent.name,
-        integrationId: integration.id,
-        host,
-        method,
-        path,
-        decision: "connection_not_granted",
-        status: 403,
-      });
-      this.maybeNotifyOwner(agent, integration, "connection_not_granted");
-      const connect = this.connectUrlFor(agent, integration);
-      res.writeHead(403, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "onegate_connection_not_granted",
-          message: connect
-            ? `No app connection for integration "${integration.id}" is granted to agent "${agent.name}". Open the connect_url to connect one, then retry.`
-            : `No app connection for integration "${integration.id}" is granted to agent "${agent.name}". Grant one in the OneGate admin UI.`,
-          ...(connect
-            ? {
-                connect_url: connect.url,
-                connect_expires_at: connect.expiresAt,
-                hint: "Show connect_url to your owner as a bare link. Opening it lets them connect this integration to you, then retry the request.",
-              }
-            : {}),
-        }),
-      );
-      return;
-    }
-    if (resolved) selectedConnection = resolved.connection;
+    //
+    // If the deny-branch recovery above already resolved the connection (and
+    // re-ran the policy to an allow), reuse that result: resolving twice would
+    // duplicate audit rows and re-mint connect links.
+    let selectedConnection: Connection | null;
+    if (preResolved) {
+      selectedConnection = preResolved.connection;
+    } else {
+      const r = this.resolveConnectionForRequest(req, res, agent, integration, host, method, path);
+      if (r.sent) return;
+      selectedConnection = r.connection;
 
-    // Phase-2 policy check: connection-scoped rules. The phase-1 evaluate() above
-    // ran before the connection was resolved, so any connection-scoped rule was
-    // held pending (verdict.needsConnection). Now that the connection is known,
-    // re-evaluate to let a connection-scoped deny fire (e.g. "deny this path
-    // unless the request used connection X"). No-op when no connection-scoped
-    // rule matched this request, so unrelated traffic is unaffected.
-    if (verdict.needsConnection) {
-      const finalVerdict = evaluate(agent, rules, {
-        integrationId: integration.id,
-        method,
-        path,
-        connectionId: selectedConnection?.id ?? null,
-      });
-      if (finalVerdict.effect === "deny") {
-        this.opts.store.audit({
-          agentId: agent.id,
-          agentName: agent.name,
+      // Phase-2 policy check: connection-scoped rules. The phase-1 evaluate()
+      // above ran before the connection was resolved, so any connection-scoped
+      // rule was held pending (verdict.needsConnection). Now that the connection
+      // is known, re-evaluate to let a connection-scoped deny fire (e.g. "deny
+      // this path unless the request used connection X"). No-op when no
+      // connection-scoped rule matched this request, so unrelated traffic is
+      // unaffected. Skipped when preResolved, since the recovery path already
+      // ran phase-2 and only reaches here on an allow.
+      if (verdict.needsConnection) {
+        const finalVerdict = evaluate(agent, rules, {
           integrationId: integration.id,
-          host,
           method,
           path,
-          decision: "deny",
-          ruleId: finalVerdict.ruleId,
-          status: 403,
+          connectionId: selectedConnection?.id ?? null,
         });
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "onegate_policy_denied",
-            message: `Policy denies ${method} ${host}${path} for agent "${agent.name}" on the selected connection${
-              selectedConnection ? ` "${selectedConnection.name}"` : ""
-            }.`,
-          }),
-        );
-        return;
+        if (finalVerdict.effect === "deny") {
+          this.opts.store.audit({
+            agentId: agent.id,
+            agentName: agent.name,
+            integrationId: integration.id,
+            host,
+            method,
+            path,
+            decision: "deny",
+            ruleId: finalVerdict.ruleId,
+            status: 403,
+          });
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "onegate_policy_denied",
+              message: `Policy denies ${method} ${host}${path} for agent "${agent.name}" on the selected connection${
+                selectedConnection ? ` "${selectedConnection.name}"` : ""
+              }.`,
+            }),
+          );
+          return;
+        }
       }
     }
 
@@ -984,7 +1049,7 @@ export class GatewayProxy {
           method,
           path,
           decision: "allow",
-          ruleId: verdict.ruleId,
+          ruleId: effectiveVerdict.ruleId,
           status: upRes.statusCode ?? null,
           connectionId: selectedConnection?.id ?? null,
           connectionName: selectedConnection?.name ?? null,
