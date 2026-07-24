@@ -239,6 +239,19 @@ function now(): string {
 }
 
 /**
+ * Clamp a list `limit` to [1, max], defaulting to `def` when unset. Defends
+ * against a caller passing a negative, zero, or non-integer limit: SQLite treats
+ * `LIMIT -1` as "no limit", so an unclamped negative value would return the
+ * entire table (memory/latency DoS). Non-finite/non-integer values fall back to
+ * the default. The API layer rejects such values with a 400; this is
+ * defense-in-depth so the store never emits an unbounded query.
+ */
+function clampLimit(limit: number | undefined, def: number, max: number): number {
+  if (limit === undefined || !Number.isInteger(limit)) return def;
+  return Math.max(1, Math.min(limit, max));
+}
+
+/**
  * Integrations that are time-boxed out of the box, with their default access
  * lease (seconds). Seeded idempotently on boot (INSERT OR IGNORE), so an
  * operator can later change or clear a TTL without it being reset. Hetzner
@@ -1261,7 +1274,7 @@ export class Store {
   listLlmUsage(
     opts: { limit?: number; connectionId?: string; agentId?: string; since?: string; until?: string } = {},
   ): LlmUsageEvent[] {
-    const limit = Math.min(opts.limit ?? 200, 1000);
+    const limit = clampLimit(opts.limit, 200, 1000);
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (opts.connectionId) {
@@ -1891,7 +1904,7 @@ export class Store {
 
   /** Lists owner_notifications most-recent-first. */
   listOwnerNotifications(opts: { limit?: number; status?: OwnerNotificationStatus } = {}): OwnerNotification[] {
-    const limit = Math.min(opts.limit ?? 100, 500);
+    const limit = clampLimit(opts.limit, 100, 500);
     if (opts.status) {
       return (
         this.db
@@ -1948,7 +1961,7 @@ export class Store {
   }
 
   listAudit(opts: { limit?: number; agentId?: string } = {}): AuditEntry[] {
-    const limit = Math.min(opts.limit ?? 200, 1000);
+    const limit = clampLimit(opts.limit, 200, 1000);
     const rows = opts.agentId
       ? (this.db
           .prepare("SELECT * FROM audit WHERE agent_id = ? ORDER BY id DESC LIMIT ?")
