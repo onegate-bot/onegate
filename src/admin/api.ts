@@ -433,6 +433,14 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       return;
     }
 
+    // If the agent was deleted between starting consent and the callback, the
+    // connection we would persist has no owner to attach to. Reject cleanly
+    // instead of storing an orphaned credential.
+    if (pending.wizardAgentId && !store.getAgent(pending.wizardAgentId)) {
+      invalidLinkPage(res);
+      return;
+    }
+
     const isWizard = Boolean(pending.wizardToken && pending.wizardAgentId);
     const done = () => {
       if (isWizard) {
@@ -711,6 +719,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       invalidLinkPage(res);
       return;
     }
+    // Don't render the wizard for a link whose agent has been deleted.
+    if (!store.getAgent(link!.agentId)) {
+      invalidLinkPage(res);
+      return;
+    }
     const isOauth = kind === "oauth" && descriptorFor(integration);
     res.type("html").send(isOauth ? wizardPage(integration, link!) : credentialWizardPage(integration, link!));
   });
@@ -730,6 +743,12 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     }
     const link = store.getOnboardingLink(req.params.token);
     if (!store.isOnboardingLinkValid(link) || link!.integrationId !== integration.id) {
+      invalidLinkPage(res);
+      return;
+    }
+    // The link's agent may have been deleted after the link was minted; a
+    // credential connected now would be orphaned. Reject the redeem cleanly.
+    if (!store.getAgent(link!.agentId)) {
       invalidLinkPage(res);
       return;
     }
@@ -799,6 +818,12 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       }
       const link = store.getOnboardingLink(req.params.token);
       if (!store.isOnboardingLinkValid(link) || link!.integrationId !== integration.id) {
+        invalidLinkPage(res);
+        return;
+      }
+      // Reject a redeem whose agent was deleted after the link was minted;
+      // otherwise the connection + grant we create would be orphaned.
+      if (!store.getAgent(link!.agentId)) {
         invalidLinkPage(res);
         return;
       }

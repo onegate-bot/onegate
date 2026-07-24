@@ -298,6 +298,35 @@ describe("M3 public wizard page", () => {
     expect(page.status).toBe(410);
   });
 
+  it("rejects redeeming a link whose agent was deleted (410 on page, start and submit)", async () => {
+    // A throwaway agent + its onboarding links (one oauth, one credential).
+    const doomed = store.createAgent("doomed-agent").agent.id;
+    const oauthLink = await api("POST", "/api/onboarding-links", {
+      agentId: doomed,
+      integrationId: "gitlab",
+    });
+    const credLink = await api("POST", "/api/onboarding-links", {
+      agentId: doomed,
+      integrationId: "github",
+    });
+    // Both valid before the agent is gone.
+    expect((await get(`/connect/gitlab/${oauthLink.json.token}`)).status).toBe(200);
+
+    store.deleteAgent(doomed);
+
+    // Wizard page, oauth start and credential submit all refuse cleanly (410),
+    // so no orphaned connection/grant is ever created for a dead agent.
+    expect((await get(`/connect/gitlab/${oauthLink.json.token}`)).status).toBe(410);
+    const start = await postForm(`/connect/gitlab/${oauthLink.json.token}/start`, {
+      clientId: "cid",
+      clientSecret: "csecret",
+    });
+    expect(start.status).toBe(410);
+    expect(start.location).toBeUndefined();
+    const submit = await postForm(`/connect/github/${credLink.json.token}/submit`, { pat: "x" });
+    expect(submit.status).toBe(410);
+  });
+
   it("start with missing client id/secret returns a friendly 400, not a redirect", async () => {
     const mint = await api("POST", "/api/onboarding-links", {
       agentId,
