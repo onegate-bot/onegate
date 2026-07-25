@@ -156,6 +156,23 @@ describe("agents + projects CRUD", () => {
     expect((await api("DELETE", `/api/agents/${agentId}`)).status).toBe(204);
     expect((await api("DELETE", `/api/projects/${projectId}`)).status).toBe(204);
   });
+
+  // Delete answers 404 on an unknown id like its PATCH/rotate-token siblings,
+  // so a typo'd or already-deleted id is not reported as a success.
+  it("deleting an unknown agent is a 404, not a silent 204", async () => {
+    const r = await api("DELETE", "/api/agents/ag_does_not_exist");
+    expect(r.status).toBe(404);
+    expect(r.json.error).toBe("not_found");
+    // Same condition, same code as the siblings on this resource.
+    expect((await api("PATCH", "/api/agents/ag_does_not_exist", { name: "x" })).json.error).toBe("not_found");
+    expect((await api("POST", "/api/agents/ag_does_not_exist/rotate-token")).json.error).toBe("not_found");
+  });
+
+  it("a repeated delete of the same agent 404s the second time", async () => {
+    const agent = await api("POST", "/api/agents", { name: "ephemeral" });
+    expect((await api("DELETE", `/api/agents/${agent.json.id}`)).status).toBe(204);
+    expect((await api("DELETE", `/api/agents/${agent.json.id}`)).status).toBe(404);
+  });
 });
 
 describe("integrations + credentials + rules + audit", () => {
@@ -197,6 +214,15 @@ describe("integrations + credentials + rules + audit", () => {
     expect(r.json.methods).toEqual(["*"]);
     expect(r.json.pathGlob).toBe("/**");
     expect((await api("DELETE", `/api/rules/${r.json.id}`)).status).toBe(204);
+  });
+
+  // Matches the renew sibling on the same resource, which already answers
+  // 404 unknown_rule for a rule id that is not in the store.
+  it("deleting an unknown rule is a 404 unknown_rule", async () => {
+    const r = await api("DELETE", "/api/rules/rl_does_not_exist");
+    expect(r.status).toBe(404);
+    expect(r.json.error).toBe("unknown_rule");
+    expect((await api("POST", "/api/rules/rl_does_not_exist/renew")).json.error).toBe("unknown_rule");
   });
 
   it("exposes the audit log", async () => {

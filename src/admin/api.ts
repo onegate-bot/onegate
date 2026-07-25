@@ -983,6 +983,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   });
 
   app.delete("/api/agents/:id", (req, res) => {
+    if (!store.getAgent(req.params.id)) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
     store.deleteAgent(req.params.id);
     res.status(204).end();
   });
@@ -1528,21 +1532,23 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
    */
   app.delete("/api/connections/:id", (req, res) => {
     const cur = store.getConnection(req.params.id);
-    if (cur) {
-      if (cur.kind === "app") {
-        store.removeConnectionFromAppConfigs(cur.id);
-        // OAuth connections cache a live access token in settings keyed on the
-        // connection id. Purge it so a re-created connection never reuses it.
-        if (registry.get(cur.vendor)?.oauth) {
-          store.deleteSetting(`oauth_access_token:${cur.vendor}:${cur.id}`);
-        }
-      } else {
-        for (const agentId of store.removeConnectionFromLlmConfigs(cur.id)) {
-          store.clearLlmStrategyState(agentId);
-        }
-      }
-      store.deleteConnection(cur.id);
+    if (!cur) {
+      res.status(404).json({ error: "not_found" });
+      return;
     }
+    if (cur.kind === "app") {
+      store.removeConnectionFromAppConfigs(cur.id);
+      // OAuth connections cache a live access token in settings keyed on the
+      // connection id. Purge it so a re-created connection never reuses it.
+      if (registry.get(cur.vendor)?.oauth) {
+        store.deleteSetting(`oauth_access_token:${cur.vendor}:${cur.id}`);
+      }
+    } else {
+      for (const agentId of store.removeConnectionFromLlmConfigs(cur.id)) {
+        store.clearLlmStrategyState(agentId);
+      }
+    }
+    store.deleteConnection(cur.id);
     res.status(204).end();
   });
 
@@ -2071,6 +2077,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   });
 
   app.delete("/api/rules/:id", (req, res) => {
+    if (!store.getRule(req.params.id)) {
+      res.status(404).json({ error: "unknown_rule" });
+      return;
+    }
     store.deleteRule(req.params.id);
     res.status(204).end();
   });

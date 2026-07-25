@@ -259,8 +259,10 @@ describe("connections CRUD", () => {
     expect(state.cooldowns).toEqual({});
     // The deleted default moved to the remaining anthropic connection.
     expect(store.getConnection(primaryId)!.isDefault).toBe(true);
-    // Deleting a missing connection is a no-op 204.
-    expect((await api("DELETE", `/api/connections/${backupId}`)).status).toBe(204);
+    // Re-deleting the now-missing connection 404s like its PUT sibling does.
+    const again = await api("DELETE", `/api/connections/${backupId}`);
+    expect(again.status).toBe(404);
+    expect(again.json.error).toBe("not_found");
     store.deleteAgent(agent.id);
   });
 });
