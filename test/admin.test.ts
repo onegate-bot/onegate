@@ -326,6 +326,80 @@ describe("rule referential validation on create", () => {
   });
 });
 
+describe("rule enum validation on create", () => {
+  let agentId: string;
+  let projectId: string;
+
+  beforeAll(async () => {
+    agentId = (await api("POST", "/api/agents", { name: "enumbot" })).json.id;
+    projectId = (await api("POST", "/api/projects", { name: "enumproject" })).json.id;
+  });
+
+  // Unvalidated, an out-of-range scope fell through to the project branch of
+  // the referential lookup and answered a misleading 404 unknown_project.
+  it("rejects an out-of-range scope with a clean 400, not a project lookup", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "bogus",
+      subjectId: agentId,
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("invalid_scope");
+    expect(r.json.error).not.toBe("unknown_project");
+  });
+
+  // Unvalidated, an out-of-range effect reached the SQLite CHECK constraint and
+  // surfaced as a 500 with an HTML stack trace, leaking internals to the caller.
+  it("rejects an out-of-range effect with a clean 400, not a 500", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "github",
+      effect: "bogus",
+    });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("invalid_effect");
+    // The old failure mode was an HTML error page rather than a JSON body.
+    expect(r.text).not.toContain("<!DOCTYPE html>");
+  });
+
+  it("still accepts every valid scope and effect combination", async () => {
+    for (const [scope, subjectId] of [
+      ["agent", agentId],
+      ["project", projectId],
+    ] as const) {
+      for (const effect of ["allow", "deny"] as const) {
+        const r = await api("POST", "/api/rules", { scope, subjectId, integrationId: "github", effect });
+        expect(r.status).toBe(201);
+        expect(r.json.scope).toBe(scope);
+        expect(r.json.effect).toBe(effect);
+      }
+    }
+  });
+
+  it("keeps the required-field check ahead of the enum checks", async () => {
+    // A missing effect is "required", not "invalid": it must not be reported
+    // as invalid_effect, and a missing scope must not be reported as
+    // invalid_scope.
+    const noEffect = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "github",
+    });
+    expect(noEffect.status).toBe(400);
+    expect(noEffect.json.error).toBe("scope, subjectId, integrationId and effect are required");
+
+    const noScope = await api("POST", "/api/rules", {
+      subjectId: agentId,
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(noScope.status).toBe(400);
+    expect(noScope.json.error).toBe("scope, subjectId, integrationId and effect are required");
+  });
+});
+
 describe("generic oauth routes", () => {
   it("rejects oauth start for unknown and non-oauth integrations", async () => {
     expect((await api("POST", "/api/integrations/nope/oauth/start", { clientId: "x" })).status).toBe(404);
