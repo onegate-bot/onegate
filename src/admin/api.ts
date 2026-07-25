@@ -2020,6 +2020,18 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "scope, subjectId, integrationId and effect are required" });
       return;
     }
+    // Enum checks run before the referential ones below: those branch on scope
+    // to pick an agent vs project lookup, so an unvalidated scope would fall
+    // through to a misleading 404 instead of a clean 400. Without these an
+    // invalid value reaches the SQLite CHECK constraint and surfaces as a 500.
+    if (scope !== "agent" && scope !== "project") {
+      res.status(400).json({ error: "invalid_scope", message: 'scope must be "agent" or "project"' });
+      return;
+    }
+    if (effect !== "allow" && effect !== "deny") {
+      res.status(400).json({ error: "invalid_effect", message: 'effect must be "allow" or "deny"' });
+      return;
+    }
     // Optional connection scoping: pins the rule to a specific app connection.
     // connectionScope "only"|"except" is required when connectionId is given.
     if (connectionScope != null && connectionScope !== "only" && connectionScope !== "except") {
