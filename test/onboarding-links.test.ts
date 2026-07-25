@@ -1,5 +1,17 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { createHash } from "node:crypto";
 import { Store } from "../src/store/db.js";
+
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** Reads the raw stored onboarding_links row (bypasses hashing) for assertions. */
+function rawLinkRows(store: Store): Array<Record<string, unknown>> {
+  return (
+    store as unknown as { db: { prepare(sql: string): { all(): Array<Record<string, unknown>> } } }
+  ).db
+    .prepare("SELECT * FROM onboarding_links")
+    .all();
+}
 
 let store: Store;
 
@@ -76,8 +88,8 @@ describe("onboarding links", () => {
     const link = store.createOnboardingLink({ agentId: "ag_7", integrationId: "google", ttlDays: 7 });
     // Backdate expiry directly to simulate the clock moving past it.
     (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): void } } }).db
-      .prepare("UPDATE onboarding_links SET expires_at = ? WHERE token = ?")
-      .run(new Date(Date.now() - 1000).toISOString(), link.token);
+      .prepare("UPDATE onboarding_links SET expires_at = ? WHERE token_hash = ?")
+      .run(new Date(Date.now() - 1000).toISOString(), link.tokenHash);
     expect(store.isOnboardingLinkValid(store.getOnboardingLink(link.token))).toBe(false);
   });
 
@@ -90,8 +102,9 @@ describe("onboarding links", () => {
     const b = store.createOnboardingLink({ agentId: "ag_A", integrationId: "slack" });
     store.createOnboardingLink({ agentId: "ag_B", integrationId: "google" });
     const forA = store.listOnboardingLinks("ag_A");
-    expect(forA.map((l) => l.token)).toContain(a.token);
-    expect(forA.map((l) => l.token)).toContain(b.token);
+    // List reads surface the stored hash as `token` (plaintext is unrecoverable).
+    expect(forA.map((l) => l.token)).toContain(a.tokenHash);
+    expect(forA.map((l) => l.token)).toContain(b.tokenHash);
     expect(forA.every((l) => l.agentId === "ag_A")).toBe(true);
     expect(store.listOnboardingLinks().length).toBe(3);
   });
@@ -102,43 +115,110 @@ describe("onboarding links", () => {
     expect(store.getOnboardingLink(link.token)).toBeNull();
   });
 
-  describe("activeOnboardingLinkFor", () => {
-    it("returns null when no link exists", () => {
-      expect(store.activeOnboardingLinkFor("ag_x", "google")).toBeNull();
+  describe("link reuse is disabled (only the hash is stored)", () => {
+    // The plaintext token cannot be recovered from a stored hash, so a live
+    // link cannot be turned back into a redeemable URL. The active* helpers
+    // therefore return null and callers mint a fresh link; owner-notification
+    // dedup still prevents duplicate notifications.
+    it("activeOnboardingLinkFor always returns null even with a live link", () => {
+      store.createOnboardingLink({ agentId: "ag_a", integrationId: "google" });
+      expect(store.activeOnboardingLinkFor("ag_a", "google")).toBeNull();
     });
 
-    it("returns the newest valid link for the agent+integration", () => {
-      const older = store.createOnboardingLink({ agentId: "ag_a", integrationId: "google" });
-      const newer = store.createOnboardingLink({ agentId: "ag_a", integrationId: "google" });
-      const got = store.activeOnboardingLinkFor("ag_a", "google");
-      expect(got?.token).toBe(newer.token);
-      expect(got?.token).not.toBe(older.token);
+    it("activeRenewalLinkFor always returns null", () => {
+      store.createOnboardingLink({ agentId: "ag_a", integrationId: "google", ruleId: "rl_1" });
+      expect(store.activeRenewalLinkFor("rl_1")).toBeNull();
+    });
+  });
+
+  describe("connect-capability tokens are hashed at rest", () => {
+    it("stores only the SHA-256 hash, never the raw token", () => {
+      const link = store.createOnboardingLink({ agentId: "ag_h", integrationId: "google" });
+      const rows = rawLinkRows(store);
+      expect(rows.length).toBe(1);
+      const row = rows[0];
+      // The raw token must not appear in ANY stored column.
+      for (const v of Object.values(row)) {
+        expect(String(v ?? "")).not.toContain(link.token);
+      }
+      // The stored hash is the SHA-256 of the raw token.
+      expect(row.token_hash).toBe(sha256(link.token));
+      expect(link.tokenHash).toBe(sha256(link.token));
     });
 
-    it("scopes to the exact agent and integration", () => {
-      const mine = store.createOnboardingLink({ agentId: "ag_a", integrationId: "google" });
-      store.createOnboardingLink({ agentId: "ag_b", integrationId: "google" });
-      store.createOnboardingLink({ agentId: "ag_a", integrationId: "slack" });
-      expect(store.activeOnboardingLinkFor("ag_a", "google")?.token).toBe(mine.token);
+    it("redeems, marks-used and deletes by the raw token (hash match)", () => {
+      const link = store.createOnboardingLink({ agentId: "ag_i", integrationId: "jira" });
+      // Lookup by raw token still works.
+      const got = store.getOnboardingLink(link.token);
+      expect(got).not.toBeNull();
+      expect(got!.agentId).toBe("ag_i");
+      // The re-attached token on redemption is the presented plaintext, so
+      // downstream URL rebuilds stay redeemable.
+      expect(got!.token).toBe(link.token);
+      // Mark-used by raw token flips validity.
+      store.markOnboardingLinkUsed(link.token);
+      expect(store.isOnboardingLinkValid(store.getOnboardingLink(link.token))).toBe(false);
+      // Delete by raw token removes it.
+      store.deleteOnboardingLink(link.token);
+      expect(store.getOnboardingLink(link.token)).toBeNull();
     });
 
-    it("skips used and expired links", () => {
-      const used = store.createOnboardingLink({ agentId: "ag_c", integrationId: "google" });
-      store.markOnboardingLinkUsed(used.token);
-      expect(store.activeOnboardingLinkFor("ag_c", "google")).toBeNull();
-
-      const expired = store.createOnboardingLink({ agentId: "ag_d", integrationId: "google" });
-      (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): void } } }).db
-        .prepare("UPDATE onboarding_links SET expires_at = ? WHERE token = ?")
-        .run(new Date(Date.now() - 1000).toISOString(), expired.token);
-      expect(store.activeOnboardingLinkFor("ag_d", "google")).toBeNull();
+    it("also revokes when given the stored hash (admin list surfaces the hash)", () => {
+      const link = store.createOnboardingLink({ agentId: "ag_j", integrationId: "google" });
+      // The admin list exposes the hash as `token`; revoking by it must work.
+      const listed = store.listOnboardingLinks("ag_j")[0];
+      expect(listed.token).toBe(link.tokenHash);
+      store.deleteOnboardingLink(listed.token);
+      expect(store.getOnboardingLink(link.token)).toBeNull();
     });
 
-    it("falls through a used newest link to an older still-valid one", () => {
-      const older = store.createOnboardingLink({ agentId: "ag_e", integrationId: "google" });
-      const newer = store.createOnboardingLink({ agentId: "ag_e", integrationId: "google" });
-      store.markOnboardingLinkUsed(newer.token);
-      expect(store.activeOnboardingLinkFor("ag_e", "google")?.token).toBe(older.token);
+    it("migrates a pre-existing plaintext row so lookup by its token still works", () => {
+      // Simulate a legacy DB: a plaintext `token` PRIMARY KEY column with a
+      // cleartext token, no token_hash column.
+      const raw = (
+        store as unknown as { db: { exec(sql: string): void; prepare(sql: string): { run(...a: unknown[]): void } } }
+      ).db;
+      const legacyToken = "a".repeat(48);
+      raw.exec("DROP TABLE onboarding_links");
+      raw.exec(`CREATE TABLE onboarding_links (
+        token TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        integration_id TEXT NOT NULL,
+        scopes TEXT,
+        connection_name TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        rule_id TEXT
+      )`);
+      raw
+        .prepare(
+          "INSERT INTO onboarding_links (token, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          legacyToken,
+          "ag_legacy",
+          "google",
+          null,
+          null,
+          new Date().toISOString(),
+          new Date(Date.now() + 86_400_000).toISOString(),
+          null,
+          null,
+        );
+      // Re-open the DB path through a fresh Store to run the migration. Since
+      // the test store is :memory:, run the migration by reconstructing over
+      // the same handle via the private method.
+      (store as unknown as { hashCapabilityTokensAtRest(): void }).hashCapabilityTokensAtRest();
+      // The plaintext column is gone, replaced by the hash.
+      const rows = rawLinkRows(store);
+      expect(rows.length).toBe(1);
+      expect(rows[0].token).toBeUndefined();
+      expect(rows[0].token_hash).toBe(sha256(legacyToken));
+      // The old link (URL already delivered) still redeems by its plaintext.
+      const got = store.getOnboardingLink(legacyToken);
+      expect(got).not.toBeNull();
+      expect(got!.agentId).toBe("ag_legacy");
     });
   });
 });

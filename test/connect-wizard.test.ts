@@ -16,6 +16,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,8 @@ import { Store } from "../src/store/db.js";
 import { initCa } from "../src/ca.js";
 import { buildRegistry } from "../src/integrations/index.js";
 import { createAdminApp, ensureAdminToken } from "../src/admin/api.js";
+
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 let dir: string;
 let store: Store;
@@ -230,17 +233,21 @@ describe("M2 admin mint of onboarding links", () => {
       integrationId: "gitlab",
     });
     const token = mint.json.token;
+    // The list surfaces the stored hash as `token` (plaintext is unrecoverable).
+    const tokenHash = sha256(token);
     const list = await api("GET", `/api/onboarding-links?agentId=${agentId}`);
     expect(list.status).toBe(200);
-    const row = list.json.find((l: any) => l.token === token);
+    const row = list.json.find((l: any) => l.token === tokenHash);
     expect(row).toBeTruthy();
     expect(row.integrationId).toBe("gitlab");
     expect(row.valid).toBe(true);
 
+    // Revoke by the plaintext token (hash match); the admin route also accepts
+    // the surfaced hash.
     const del = await api("DELETE", `/api/onboarding-links/${token}`);
     expect(del.status).toBe(204);
     const after = await api("GET", `/api/onboarding-links?agentId=${agentId}`);
-    expect(after.json.find((l: any) => l.token === token)).toBeUndefined();
+    expect(after.json.find((l: any) => l.token === tokenHash)).toBeUndefined();
   });
 });
 
@@ -292,8 +299,8 @@ describe("M3 public wizard page", () => {
       integrationId: "gitlab",
     });
     (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): void } } }).db
-      .prepare("UPDATE onboarding_links SET expires_at = ? WHERE token = ?")
-      .run(new Date(Date.now() - 1000).toISOString(), mint.json.token);
+      .prepare("UPDATE onboarding_links SET expires_at = ? WHERE token_hash = ?")
+      .run(new Date(Date.now() - 1000).toISOString(), sha256(mint.json.token));
     const page = await get(`/connect/gitlab/${mint.json.token}`);
     expect(page.status).toBe(410);
   });

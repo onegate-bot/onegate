@@ -214,7 +214,7 @@ describe("renewal links + per-lapse dedup", () => {
     store = new Store(":memory:");
   });
 
-  it("a renewal link carries the rule id and is reused while live", () => {
+  it("a renewal link carries the rule id (reuse disabled: only the hash is stored)", () => {
     const { agent } = store.createAgent("bot");
     const r = store.createRule({
       scope: "agent",
@@ -231,7 +231,9 @@ describe("renewal links + per-lapse dedup", () => {
       ruleId: r.id,
     });
     expect(link.ruleId).toBe(r.id);
-    expect(store.activeRenewalLinkFor(r.id)?.token).toBe(link.token);
+    // Reuse is disabled since the plaintext token is no longer recoverable;
+    // callers mint a fresh renewal link each time instead.
+    expect(store.activeRenewalLinkFor(r.id)).toBeNull();
   });
 
   it("owner notifications dedup per lapse via dedupKey", () => {

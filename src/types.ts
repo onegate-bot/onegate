@@ -211,8 +211,15 @@ export interface LlmUsageEvent {
  * connection, grant and allow rule. Single-use, expiring, unguessable.
  */
 export interface OnboardingLink {
-  /** Unguessable token, randomBytes(24).toString("base64url"). */
+  /**
+   * Unguessable token, randomBytes(24) hex. This is a bearer capability. Only
+   * its hash is persisted (see tokenHash); the plaintext is present here only
+   * at mint time and on redemption (when the caller presents it), never read
+   * back from storage. On list/admin reads this field holds the hash.
+   */
   token: string;
+  /** SHA-256 of the token, the value actually stored in the DB. */
+  tokenHash: string;
   /** The single agent the connection will be granted to. */
   agentId: string;
   /** The single integration (google | slack | jira | ...). */
@@ -284,7 +291,11 @@ export interface OwnerNotification {
   id: number;
   agentId: string;
   integrationId: string;
-  /** The onboarding link token that was minted for this notification, if any. */
+  /**
+   * SHA-256 hash of the onboarding link token minted for this notification, if
+   * any. Stored hashed (the token is a bearer capability); kept only for
+   * tracking/audit and never redeemed by lookup. Null when no link was minted.
+   */
   connectToken: string | null;
   status: OwnerNotificationStatus;
   createdAt: string;
