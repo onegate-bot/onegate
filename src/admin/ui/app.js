@@ -1475,8 +1475,24 @@ async function renderAgents(root) {
     const connById = (id) => llmConnections.find((c) => c.id === id);
     // Drop ids of connections that no longer exist, the server rejects them.
     let order = (llmCfg?.connectionIds ?? []).filter((id) => connById(id));
+    const savedVendorStrategies = llmCfg?.vendorStrategies ?? {};
+    // Distinct vendors present in the current order (source for the per-vendor
+    // strategy overrides). Recomputed on each render.
+    const orderVendors = () => {
+      const seen = [];
+      for (const id of order) {
+        const v = connById(id)?.vendor;
+        if (v && !seen.includes(v)) seen.push(v);
+      }
+      return seen;
+    };
     const initial = llmCfg
-      ? JSON.stringify({ enabled: llmCfg.enabled, strategy: llmCfg.strategy, connectionIds: order })
+      ? JSON.stringify({
+          enabled: llmCfg.enabled,
+          strategy: llmCfg.strategy,
+          vendorStrategies: savedVendorStrategies,
+          connectionIds: order,
+        })
       : null;
 
     const llmSectionHtml = !agent
@@ -1506,6 +1522,7 @@ async function renderAgents(root) {
           </div>
           ${llmConnections.length ? "" : `<p class="hint">No LLM connections exist yet. Create one on the Connections page first.</p>`}
         </div>
+        <div class="field" id="llm-vendor-strategies"></div>
       </div>`;
 
     // Per-agent app accounts: for each app integration this agent can use,
@@ -1638,6 +1655,37 @@ async function renderAgents(root) {
           drawOrder();
         });
       });
+      drawVendorStrategies();
+    }
+
+    // Per-vendor strategy overrides. One select per distinct vendor in the
+    // order. "Default" (no override) inherits the global strategy above. The
+    // current picks are preserved across re-renders by reading the live
+    // selects before rebuilding.
+    function drawVendorStrategies() {
+      const box = $("#llm-vendor-strategies", modal);
+      if (!box) return;
+      const current = {};
+      for (const sel of $$("[data-vendor-strategy]", box)) {
+        if (sel.value) current[sel.dataset.vendorStrategy] = sel.value;
+      }
+      const vendors = orderVendors();
+      if (!vendors.length) {
+        box.innerHTML = "";
+        return;
+      }
+      box.innerHTML = `
+        <span class="field-label">Per-vendor strategy</span>
+        <p class="hint">Override the strategy for a specific vendor. Default inherits the strategy above.</p>
+        ${vendors
+          .map((vendor) => {
+            const selected = current[vendor] ?? savedVendorStrategies[vendor] ?? "";
+            return `<wa-select class="field" data-vendor-strategy="${esc(vendor)}"
+                       label="${esc(vendor)} strategy" value="${esc(selected)}">
+                      ${selectOptions(LLM_STRATEGIES, { selected, none: "Default (inherit global)" })}
+                    </wa-select>`;
+          })
+          .join("")}`;
     }
 
     if (agent) {
@@ -1677,9 +1725,14 @@ async function renderAgents(root) {
     /** Routing config from the form, or null when it matches the saved one. */
     function readLlmConfig() {
       if (!agent) return null;
+      const vendorStrategies = {};
+      for (const sel of $$("[data-vendor-strategy]", modal)) {
+        if (sel.value) vendorStrategies[sel.dataset.vendorStrategy] = sel.value;
+      }
       const next = {
         enabled: Boolean($("#llm-enabled", modal).checked),
         strategy: $("#llm-strategy", modal).value || "fallback",
+        vendorStrategies,
         connectionIds: [...order],
       };
       return JSON.stringify(next) === initial ? null : next;

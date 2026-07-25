@@ -993,7 +993,7 @@ export class GatewayProxy {
       if (conn && conn.kind === "llm" && conn.vendor === vendor) connections.push(conn);
     }
     if (connections.length === 0) return null;
-    return { vendor, strategy: cfg.strategy, connections };
+    return { vendor, strategy: cfg.vendorStrategies?.[vendor] ?? cfg.strategy, connections };
   }
 
   /**

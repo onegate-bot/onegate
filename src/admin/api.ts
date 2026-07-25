@@ -12,7 +12,7 @@ import { timingSafeEqual, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Store, hashToken } from "../store/db.js";
-import type { Connection, OnboardingLink } from "../types.js";
+import type { Connection, OnboardingLink, LlmStrategy } from "../types.js";
 import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry } from "../integrations/types.js";
 import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
@@ -1643,7 +1643,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(404).json({ error: "not_found" });
       return;
     }
-    const { enabled, strategy, connectionIds } = req.body ?? {};
+    const { enabled, strategy, vendorStrategies, connectionIds } = req.body ?? {};
     if (typeof enabled !== "boolean") {
       res.status(400).json({ error: "invalid_enabled", message: "enabled must be a boolean" });
       return;
@@ -1651,6 +1651,38 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     if (strategy !== "fallback" && strategy !== "round-robin") {
       res.status(400).json({ error: "invalid_strategy", message: 'strategy must be "fallback" or "round-robin"' });
       return;
+    }
+    let vendorStrategiesClean: Record<string, LlmStrategy> | undefined;
+    if (vendorStrategies !== undefined && vendorStrategies !== null) {
+      if (
+        typeof vendorStrategies !== "object" ||
+        Array.isArray(vendorStrategies)
+      ) {
+        res.status(400).json({
+          error: "invalid_vendor_strategies",
+          message: "vendorStrategies must be an object mapping vendor to strategy",
+        });
+        return;
+      }
+      for (const [vendor, s] of Object.entries(vendorStrategies)) {
+        if (typeof vendor !== "string" || vendor.length === 0) {
+          res.status(400).json({
+            error: "invalid_vendor_strategies",
+            message: "vendorStrategies keys must be non-empty vendor names",
+          });
+          return;
+        }
+        if (s !== "fallback" && s !== "round-robin") {
+          res.status(400).json({
+            error: "invalid_vendor_strategies",
+            message: `vendorStrategies["${vendor}"] must be "fallback" or "round-robin"`,
+          });
+          return;
+        }
+      }
+      if (Object.keys(vendorStrategies).length > 0) {
+        vendorStrategiesClean = vendorStrategies as Record<string, LlmStrategy>;
+      }
     }
     if (!Array.isArray(connectionIds) || connectionIds.some((id) => typeof id !== "string")) {
       res.status(400).json({ error: "invalid_connection_ids", message: "connectionIds must be an array of strings" });
@@ -1670,7 +1702,12 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         return;
       }
     }
-    const cfg = store.setAgentLlmConfig(agent.id, { enabled, strategy, connectionIds });
+    const cfg = store.setAgentLlmConfig(agent.id, {
+      enabled,
+      strategy,
+      vendorStrategies: vendorStrategiesClean,
+      connectionIds,
+    });
     store.clearLlmStrategyState(agent.id);
     res.json(cfg);
   });

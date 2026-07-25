@@ -391,6 +391,44 @@ describe("per-agent LLM config", () => {
     expect(unknown.json.error).toBe("unknown_connection");
   });
 
+  it("validates vendorStrategies", async () => {
+    const base = { enabled: true, strategy: "fallback", connectionIds: [connId] };
+    const bad = await api("PUT", `/api/agents/${agentId}/llm`, {
+      ...base,
+      vendorStrategies: { openai: "bogus" },
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.json.error).toBe("invalid_vendor_strategies");
+    expect(
+      (await api("PUT", `/api/agents/${agentId}/llm`, { ...base, vendorStrategies: ["openai"] })).status,
+    ).toBe(400);
+    expect(
+      (await api("PUT", `/api/agents/${agentId}/llm`, { ...base, vendorStrategies: "openai" })).status,
+    ).toBe(400);
+    expect(
+      (await api("PUT", `/api/agents/${agentId}/llm`, { ...base, vendorStrategies: { "": "fallback" } })).status,
+    ).toBe(400);
+  });
+
+  it("round-trips vendorStrategies, and an empty map is dropped", async () => {
+    const base = { enabled: true, strategy: "fallback", connectionIds: [connId] };
+    const set = await api("PUT", `/api/agents/${agentId}/llm`, {
+      ...base,
+      vendorStrategies: { anthropic: "round-robin" },
+    });
+    expect(set.status).toBe(200);
+    expect(set.json.vendorStrategies).toEqual({ anthropic: "round-robin" });
+    expect((await api("GET", `/api/agents/${agentId}/llm`)).json.vendorStrategies).toEqual({
+      anthropic: "round-robin",
+    });
+    // An empty map means "no overrides" and is stored as absent.
+    const cleared = await api("PUT", `/api/agents/${agentId}/llm`, { ...base, vendorStrategies: {} });
+    expect(cleared.status).toBe(200);
+    expect(cleared.json.vendorStrategies).toBeUndefined();
+    // Omitting the field entirely also clears it.
+    expect((await api("PUT", `/api/agents/${agentId}/llm`, base)).json.vendorStrategies).toBeUndefined();
+  });
+
   it("sets the config and resets the agent's strategy state", async () => {
     store.setLlmStrategyState(agentId, "gemini", {
       activeIndex: 2,

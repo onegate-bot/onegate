@@ -245,6 +245,67 @@ describe("agent llm config", () => {
     expect(cfg2.connectionIds).toEqual(["conn_b"]);
   });
 
+  it("round-trips vendorStrategies, and omits it when unset", () => {
+    const { agent } = store.createAgent("llm-vendor-agent");
+    // No vendorStrategies -> undefined on read.
+    const bare = store.setAgentLlmConfig(agent.id, {
+      enabled: true,
+      strategy: "fallback",
+      connectionIds: ["conn_a"],
+    });
+    expect(bare.vendorStrategies).toBeUndefined();
+    expect(store.getAgentLlmConfig(agent.id)!.vendorStrategies).toBeUndefined();
+    // With a per-vendor override -> persisted and read back.
+    const withVs = store.setAgentLlmConfig(agent.id, {
+      enabled: true,
+      strategy: "fallback",
+      vendorStrategies: { anthropic: "round-robin", openai: "fallback" },
+      connectionIds: ["conn_a", "conn_b"],
+    });
+    expect(withVs.vendorStrategies).toEqual({
+      anthropic: "round-robin",
+      openai: "fallback",
+    });
+    expect(store.getAgentLlmConfig(agent.id)!.vendorStrategies).toEqual({
+      anthropic: "round-robin",
+      openai: "fallback",
+    });
+    // Clearing the map (undefined) drops it again.
+    const cleared = store.setAgentLlmConfig(agent.id, {
+      enabled: true,
+      strategy: "fallback",
+      connectionIds: ["conn_a"],
+    });
+    expect(cleared.vendorStrategies).toBeUndefined();
+  });
+
+  it("migrates an old agent_llm_config lacking vendor_strategies", () => {
+    // Simulate a pre-LR2 database: table without the vendor_strategies column.
+    const legacy = new Store(":memory:");
+    const raw = (legacy as unknown as { db: import("node:sqlite").DatabaseSync }).db;
+    raw.exec("DROP TABLE agent_llm_config");
+    raw.exec(
+      `CREATE TABLE agent_llm_config (
+         agent_id TEXT PRIMARY KEY,
+         enabled INTEGER NOT NULL DEFAULT 0,
+         strategy TEXT NOT NULL DEFAULT 'fallback' CHECK (strategy IN ('fallback','round-robin')),
+         connection_ids TEXT NOT NULL DEFAULT '[]',
+         updated_at TEXT NOT NULL
+       )`,
+    );
+    raw
+      .prepare(
+        "INSERT INTO agent_llm_config (agent_id, enabled, strategy, connection_ids, updated_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("ag_legacy", 1, "round-robin", JSON.stringify(["conn_x"]), new Date().toISOString());
+    // Re-run migration (idempotent ALTER adds the nullable column).
+    (legacy as unknown as { migrate: () => void }).migrate();
+    const cfg = legacy.getAgentLlmConfig("ag_legacy")!;
+    expect(cfg.strategy).toBe("round-robin");
+    expect(cfg.connectionIds).toEqual(["conn_x"]);
+    expect(cfg.vendorStrategies).toBeUndefined();
+  });
+
   it("deleteAgentLlmConfig also clears strategy state", () => {
     const { agent } = store.createAgent("llm-agent-2");
     store.setAgentLlmConfig(agent.id, { enabled: true, strategy: "fallback", connectionIds: [] });
