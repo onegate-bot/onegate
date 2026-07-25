@@ -158,6 +158,12 @@ export interface AgentLlmConfig {
   agentId: string;
   enabled: boolean;
   strategy: LlmStrategy;
+  /**
+   * Optional per-vendor strategy override map. Keyed by LLM vendor name.
+   * Effective strategy for a vendor = vendorStrategies[vendor] ?? strategy.
+   * Absent = every vendor uses the global strategy (backward-compatible).
+   */
+  vendorStrategies?: Record<string, LlmStrategy>;
   /** Ordered connection ids. Order is the fallback order. */
   connectionIds: string[];
   updatedAt: string;

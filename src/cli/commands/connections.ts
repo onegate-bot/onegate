@@ -11,6 +11,7 @@
  *   onegate connections revoke --id <conn> (--agent <id> | --project <id>)
  *   onegate agents llm get <agentId>
  *   onegate agents llm set <agentId> --enabled --strategy <s> --connections id1,id2
+ *                                    [--vendor-strategy anthropic=round-robin]...
  *   onegate agents llm clear <agentId>
  *   onegate agents apps get <agentId>
  *   onegate agents apps set <agentId> <integrationId> --connection <id>
@@ -420,8 +421,26 @@ interface LlmConfig {
   agentId: string;
   enabled: boolean;
   strategy: string;
+  vendorStrategies?: Record<string, string>;
   connectionIds: string[];
   updatedAt: string | null;
+}
+
+/** Parse repeatable `--vendor-strategy vendor=strategy` flags into a map. */
+function parseVendorStrategies(raw: string[]): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  for (const item of raw) {
+    const eq = item.indexOf("=");
+    if (eq <= 0) throw new Error(`--vendor-strategy must be "vendor=strategy", got "${item}"`);
+    const vendor = item.slice(0, eq).trim();
+    const strategy = item.slice(eq + 1).trim();
+    if (!vendor) throw new Error(`--vendor-strategy is missing a vendor name in "${item}"`);
+    if (strategy !== "fallback" && strategy !== "round-robin") {
+      throw new Error(`--vendor-strategy for "${vendor}" must be "fallback" or "round-robin"`);
+    }
+    out[vendor] = strategy;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 async function llmGet(ctx: CliContext, agentId: string): Promise<void> {
@@ -431,19 +450,30 @@ async function llmGet(ctx: CliContext, agentId: string): Promise<void> {
     console.log(`agent:       ${cfg.agentId}`);
     console.log(`enabled:     ${cfg.enabled}`);
     console.log(`strategy:    ${cfg.strategy}`);
+    const vs = cfg.vendorStrategies ?? {};
+    const vsKeys = Object.keys(vs);
+    console.log(
+      `per-vendor:  ${vsKeys.length ? vsKeys.map((v) => `${v}=${vs[v]}`).join(", ") : "- (all vendors use the strategy above)"}`,
+    );
     console.log(`connections: ${cfg.connectionIds.length ? cfg.connectionIds.join(", ") : "-"}`);
     console.log(`updated:     ${cfg.updatedAt ?? "-"}`);
   });
 }
 
 async function llmSet(ctx: CliContext, agentId: string, args: string[]): Promise<void> {
-  if (!agentId) throw new Error("usage: onegate agents llm set <agentId> --strategy <s> --connections id1,id2 [--enabled|--disabled]");
+  if (!agentId)
+    throw new Error(
+      "usage: onegate agents llm set <agentId> --strategy <s> --connections id1,id2 [--vendor-strategy vendor=s]... [--enabled|--disabled]",
+    );
   const { values } = parseArgs({
     args,
     options: {
       enabled: { type: "boolean" },
       disabled: { type: "boolean" },
       strategy: { type: "string", default: "fallback" },
+      // Repeatable per-vendor override. Omitting it clears any existing
+      // overrides, matching how --connections replaces the whole list.
+      "vendor-strategy": { type: "string", multiple: true, default: [] },
       connections: { type: "string", default: "" },
     },
   });
@@ -456,16 +486,24 @@ async function llmSet(ctx: CliContext, agentId: string, args: string[]): Promise
     .filter(Boolean);
   // Default to enabled when neither flag is given (the common case for "set").
   const enabled = values.disabled === true ? false : values.enabled !== false;
+  const vendorStrategies = parseVendorStrategies(values["vendor-strategy"] as string[]);
   const cfg = (await ctx.client().put(`/api/agents/${encodeURIComponent(agentId)}/llm`, {
     enabled,
     strategy: values.strategy,
+    vendorStrategies,
     connectionIds,
   })) as LlmConfig;
-  emit(cfg, () =>
+  emit(cfg, () => {
+    const vs = cfg.vendorStrategies ?? {};
+    const vsText = Object.keys(vs).length
+      ? ` per-vendor=[${Object.keys(vs)
+          .map((v) => `${v}=${vs[v]}`)
+          .join(", ")}]`
+      : "";
     console.log(
-      `LLM routing for ${cfg.agentId}: enabled=${cfg.enabled} strategy=${cfg.strategy} connections=[${cfg.connectionIds.join(", ")}]`,
-    ),
-  );
+      `LLM routing for ${cfg.agentId}: enabled=${cfg.enabled} strategy=${cfg.strategy}${vsText} connections=[${cfg.connectionIds.join(", ")}]`,
+    );
+  });
 }
 
 async function llmClear(ctx: CliContext, agentId: string): Promise<void> {

@@ -365,3 +365,60 @@ describe("round-robin routing", () => {
     expect(entry.llmStrategy).toBe("round-robin");
   });
 });
+
+describe("per-vendor strategy override", () => {
+  it("a vendor override wins over the global strategy", async () => {
+    reset();
+    store.updateConnection(connA.id, { data: { apiKey: "key-good" } });
+    const vs = store.createAgent("vendor-override-agent", { defaultPolicy: "deny-unmatched" });
+    store.createRule({
+      scope: "agent",
+      subjectId: vs.agent.id,
+      integrationId: VENDOR,
+      methods: ["*"],
+      pathGlob: "/**",
+      effect: "allow",
+    });
+    // Global strategy is fallback, but this vendor is pinned to round-robin.
+    store.setAgentLlmConfig(vs.agent.id, {
+      enabled: true,
+      strategy: "fallback",
+      vendorStrategies: { [VENDOR]: "round-robin" },
+      connectionIds: [connA.id, connB.id],
+    });
+    for (let i = 0; i < 4; i++) {
+      const r = await viaProxy({ token: vs.token, body: "{}" });
+      expect(r.status).toBe(200);
+    }
+    expect(seenKeys).toEqual(["key-good", "key-b", "key-good", "key-b"]);
+    expect(store.listAudit({ limit: 3 })[0].llmStrategy).toBe("round-robin");
+  });
+
+  it("an override for another vendor leaves this vendor on the global strategy", async () => {
+    reset();
+    store.updateConnection(connA.id, { data: { apiKey: "key-good" } });
+    const other = store.createAgent("other-vendor-override-agent", { defaultPolicy: "deny-unmatched" });
+    store.createRule({
+      scope: "agent",
+      subjectId: other.agent.id,
+      integrationId: VENDOR,
+      methods: ["*"],
+      pathGlob: "/**",
+      effect: "allow",
+    });
+    // The override names a vendor this request never touches, so the global
+    // fallback strategy still applies here.
+    store.setAgentLlmConfig(other.agent.id, {
+      enabled: true,
+      strategy: "fallback",
+      vendorStrategies: { someothervendor: "round-robin" },
+      connectionIds: [connA.id, connB.id],
+    });
+    for (let i = 0; i < 3; i++) {
+      const r = await viaProxy({ token: other.token, body: "{}" });
+      expect(r.status).toBe(200);
+    }
+    expect(seenKeys).toEqual(["key-good", "key-good", "key-good"]);
+    expect(store.listAudit({ limit: 3 })[0].llmStrategy).toBe("fallback");
+  });
+});

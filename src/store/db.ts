@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS agent_llm_config (
   agent_id TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL DEFAULT 0,
   strategy TEXT NOT NULL DEFAULT 'fallback' CHECK (strategy IN ('fallback','round-robin')),
+  vendor_strategies TEXT,
   connection_ids TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL
 );
@@ -401,6 +402,9 @@ function rowToAgentLlmConfig(r: Row): AgentLlmConfig {
     agentId: r.agent_id,
     enabled: r.enabled === 1,
     strategy: r.strategy as LlmStrategy,
+    ...(r.vendor_strategies != null
+      ? { vendorStrategies: JSON.parse(r.vendor_strategies) as Record<string, LlmStrategy> }
+      : {}),
     connectionIds: JSON.parse(r.connection_ids),
     updatedAt: r.updated_at,
   };
@@ -539,6 +543,13 @@ export class Store {
     );
     if (!notifyCols.has("dedup_key"))
       this.db.exec("ALTER TABLE owner_notifications ADD COLUMN dedup_key TEXT");
+    const llmCfgCols = new Set(
+      (this.db.prepare("PRAGMA table_info(agent_llm_config)").all() as Row[]).map((r) =>
+        String(r.name),
+      ),
+    );
+    if (!llmCfgCols.has("vendor_strategies"))
+      this.db.exec("ALTER TABLE agent_llm_config ADD COLUMN vendor_strategies TEXT");
     // The dedup index is created here (not in the upfront schema DDL) so it
     // never references dedup_key before the ALTER TABLE above has added it on a
     // pre-time-boxing database.
@@ -1132,6 +1143,7 @@ export class Store {
       this.setAgentLlmConfig(cfg.agentId, {
         enabled: cfg.enabled,
         strategy: cfg.strategy,
+        vendorStrategies: cfg.vendorStrategies,
         connectionIds: cfg.connectionIds.filter((id) => id !== connectionId),
       });
       affected.push(cfg.agentId);
@@ -1148,15 +1160,28 @@ export class Store {
 
   setAgentLlmConfig(
     agentId: string,
-    config: { enabled: boolean; strategy: LlmStrategy; connectionIds: string[] },
+    config: {
+      enabled: boolean;
+      strategy: LlmStrategy;
+      vendorStrategies?: Record<string, LlmStrategy>;
+      connectionIds: string[];
+    },
   ): AgentLlmConfig {
     this.db
       .prepare(
-        `INSERT INTO agent_llm_config (agent_id, enabled, strategy, connection_ids, updated_at) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO agent_llm_config (agent_id, enabled, strategy, vendor_strategies, connection_ids, updated_at) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(agent_id) DO UPDATE SET enabled = excluded.enabled, strategy = excluded.strategy,
+           vendor_strategies = excluded.vendor_strategies,
            connection_ids = excluded.connection_ids, updated_at = excluded.updated_at`,
       )
-      .run(agentId, config.enabled ? 1 : 0, config.strategy, JSON.stringify(config.connectionIds), now());
+      .run(
+        agentId,
+        config.enabled ? 1 : 0,
+        config.strategy,
+        config.vendorStrategies ? JSON.stringify(config.vendorStrategies) : null,
+        JSON.stringify(config.connectionIds),
+        now(),
+      );
     return this.getAgentLlmConfig(agentId)!;
   }
 
