@@ -2086,7 +2086,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(404).json({ error: scope === "agent" ? "unknown_agent" : "unknown_project" });
       return;
     }
-    if (!registry.get(String(integrationId))) {
+    // "*" is the documented wildcard meaning "every integration" (ruleMatches in
+    // policy.ts short-circuits on it), so it is a legitimate value, not a typo.
+    if (String(integrationId) !== "*" && !registry.get(String(integrationId))) {
       res.status(400).json({ error: "unknown_integration", message: `unknown integration "${integrationId}"` });
       return;
     }
