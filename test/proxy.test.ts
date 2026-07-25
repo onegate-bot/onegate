@@ -713,6 +713,96 @@ describe("app connections (multi-account, per-agent scope)", () => {
     }
   });
 
+  describe("connection-scoped ALLOW-only rule on a deny-by-default agent", () => {
+    // A dedicated agent with NO broad allow: its default policy (deny-unmatched)
+    // governs every appvendor path. The only appvendor rule is a connection-
+    // scoped ALLOW pinned to vendor-mine. This is the config the fix targets:
+    // in phase-1 the connection is unresolved, so the scoped allow is held
+    // pending and the verdict falls through to default DENY with needsConnection
+    // set. Before the fix the proxy 403'd right there, never resolving the
+    // connection, so the scoped allow was functionally dead. The fix defers the
+    // deny, resolves the connection, and re-runs the policy.
+    let scopedToken: string;
+    let scopedAgentId: string;
+    let scopedRule: { id: string };
+
+    beforeAll(() => {
+      const a = store.createAgent("scoped-allow-agent", { defaultPolicy: "deny-unmatched" });
+      scopedToken = a.token;
+      scopedAgentId = a.agent.id;
+      // Grant both existing appvendor connections so selection has candidates,
+      // but do NOT add any broad allow rule.
+      store.grantConnection(tenantConnId, "agent", scopedAgentId);
+      store.grantConnection(agentConnId, "agent", scopedAgentId);
+      scopedRule = store.createRule({
+        scope: "agent",
+        subjectId: scopedAgentId,
+        integrationId: "appvendor",
+        methods: ["*"],
+        pathGlob: "/**",
+        effect: "allow",
+        connectionScope: "only",
+        connectionId: agentConnId,
+      });
+    });
+
+    afterAll(() => {
+      store.deleteRule(scopedRule.id);
+      store.deleteAgent(scopedAgentId);
+    });
+
+    it("(a) allows the matching connection (previously wrongly denied)", async () => {
+      process.env.ONEGATE_CONNECTION_SCOPED_RULES = "1";
+      try {
+        const ok = await viaProxy({
+          token: scopedToken,
+          host: APP_HOST,
+          path: "/v1/scoped/thing",
+          headers: { "x-onegate-connection": "vendor-mine" },
+        });
+        expect(ok.status).toBe(200);
+        expect(lastSeen.auth).toBe("Bearer agent-key");
+        const allowEntry = store
+          .listAudit({ limit: 50 })
+          .find((e) => e.decision === "allow" && e.path === "/v1/scoped/thing");
+        expect(allowEntry?.ruleId).toBe(scopedRule.id);
+        expect(allowEntry?.connectionId).toBe(agentConnId);
+      } finally {
+        delete process.env.ONEGATE_CONNECTION_SCOPED_RULES;
+      }
+    });
+
+    it("(b) still denies a non-matching connection", async () => {
+      process.env.ONEGATE_CONNECTION_SCOPED_RULES = "1";
+      try {
+        const blocked = await viaProxy({
+          token: scopedToken,
+          host: APP_HOST,
+          path: "/v1/scoped/thing",
+          headers: { "x-onegate-connection": "vendor-shared" },
+        });
+        expect(blocked.status).toBe(403);
+        expect(JSON.parse(blocked.body).error).toBe("onegate_policy_denied");
+      } finally {
+        delete process.env.ONEGATE_CONNECTION_SCOPED_RULES;
+      }
+    });
+
+    it("(c) with the flag OFF, the scoped allow is inert so even the matching connection is denied", async () => {
+      // Flag OFF (default): the scoped rule sits out the decision entirely, so
+      // the deny-by-default path is still denied. Behaviour is unchanged from
+      // before the feature existed.
+      const r = await viaProxy({
+        token: scopedToken,
+        host: APP_HOST,
+        path: "/v1/scoped/thing",
+        headers: { "x-onegate-connection": "vendor-mine" },
+      });
+      expect(r.status).toBe(403);
+      expect(JSON.parse(r.body).error).toBe("onegate_policy_denied");
+    });
+  });
+
   afterAll(() => {
     store.deleteConnection(tenantConnId);
     store.deleteConnection(agentConnId);
