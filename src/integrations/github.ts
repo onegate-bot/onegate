@@ -17,6 +17,21 @@ export const github: Integration = {
   hosts: ["api.github.com", "uploads.github.com", "github.com", "codeload.github.com"],
   category: "Developer",
   credentialFields: [{ key: "pat", label: "Personal access token", secret: true }],
+  connect: {
+    method: "api_key",
+    hint: "A GitHub personal access token. A classic token with the repo scope, or a fine-grained token with Contents, Issues, Pull requests and Metadata, both work.",
+  },
+  connectGuide: {
+    consoleUrl: "https://github.com/settings/tokens",
+    steps: [
+      "Open GitHub token settings at https://github.com/settings/tokens (Settings, then Developer settings, then Personal access tokens).",
+      "Pick a token type. A classic token is simplest: click Generate new token (classic). For tighter scoping choose Fine-grained tokens instead.",
+      "Classic token: tick the repo scope, which covers code, issues, pull requests and releases on private repositories. Add read:org for organization data, and workflow only if the agent edits GitHub Actions files.",
+      "Fine-grained token: under Repository access pick the repositories the agent should reach, then under Permissions grant Contents (read and write), Issues, Pull requests and Metadata.",
+      "Set an expiration, click Generate token, and copy the value. GitHub shows it only once.",
+      "Paste the token into the field below and click Connect GitHub.",
+    ],
+  },
   llmHelp: {
     credentialType:
       "A GitHub personal access token (PAT). Either a fine-grained token or a classic token works. OneGate sends it as a Bearer token to the REST API and as Basic auth (user x-access-token) for git over HTTPS and archive downloads.",

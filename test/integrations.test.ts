@@ -94,6 +94,17 @@ describe("github integration", () => {
   it("throws when the credential is missing the pat", () => {
     expect(() => github.inject(ctxFor("api.github.com", cred({}), store))).toThrow(/pat/);
   });
+
+  it("declares an api_key connect method so the wizard renders a token field", () => {
+    expect(github.connect?.method).toBe("api_key");
+    expect(github.connect?.hint).toMatch(/personal access token/i);
+  });
+
+  it("ships an on-page connect guide pointing at the GitHub token console", () => {
+    expect(github.connectGuide?.consoleUrl).toBe("https://github.com/settings/tokens");
+    expect(github.connectGuide?.steps.length).toBeGreaterThanOrEqual(4);
+    expect(github.connectGuide?.steps.join("\n")).toMatch(/classic/i);
+  });
 });
 
 describe("google integration", () => {
