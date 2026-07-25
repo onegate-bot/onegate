@@ -211,6 +211,18 @@ describe("app connection CRUD", () => {
     expect(store.getConnection(mineId)).toBeNull();
     expect(store.getAgentAppConfig(agentId, "github")).toBeNull();
   });
+
+  // Delete answers 404 on an unknown id like the PUT and grant siblings on
+  // this resource, so a typo'd id is not reported as a successful disconnect.
+  it("deleting an unknown connection is a 404, not a silent 204", async () => {
+    const r = await api("DELETE", "/api/connections/conn_does_not_exist");
+    expect(r.status).toBe(404);
+    expect(r.json.error).toBe("not_found");
+    // Same condition, same code as the sibling update route.
+    expect((await api("PUT", "/api/connections/conn_does_not_exist", { name: "x" })).json.error).toBe(
+      "not_found",
+    );
+  });
 });
 
 describe("per-agent app account selection", () => {
