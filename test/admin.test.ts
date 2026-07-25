@@ -458,3 +458,27 @@ describe("google oauth connect flow", () => {
     expect(cb.status).toBe(502);
   });
 });
+
+// Regression for issue #7: the /api/audit route passed ?limit straight to the
+// store. A negative or non-integer value reached SQLite (LIMIT -1 = no limit)
+// and could dump the entire audit table. The route must reject bad limits with
+// a 400, and a valid limit must still work.
+describe("audit limit validation (issue #7)", () => {
+  it("rejects negative, zero, and non-integer limits with 400", async () => {
+    expect((await api("GET", "/api/audit?limit=-1")).status).toBe(400);
+    expect((await api("GET", "/api/audit?limit=0")).status).toBe(400);
+    expect((await api("GET", "/api/audit?limit=abc")).status).toBe(400);
+    expect((await api("GET", "/api/audit?limit=2.5")).status).toBe(400);
+  });
+
+  it("accepts a valid limit and a huge (clamped) limit", async () => {
+    store.audit({ host: "audit-limit-test.com", decision: "passthrough" });
+    const ok = await api("GET", "/api/audit?limit=5");
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.json)).toBe(true);
+    // A large limit is accepted (store clamps to the max) and never errors.
+    const huge = await api("GET", "/api/audit?limit=10000000");
+    expect(huge.status).toBe(200);
+    expect(Array.isArray(huge.json)).toBe(true);
+  });
+});

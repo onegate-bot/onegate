@@ -139,6 +139,54 @@ describe("audit", () => {
   });
 });
 
+// Regression for issue #7: an unclamped negative/zero limit reaches SQLite,
+// where LIMIT -1 means "no limit" and returns the entire table (DoS). The store
+// must clamp the lower bound so a bad limit never produces an unbounded query.
+describe("list limit clamping (issue #7)", () => {
+  const seedAudit = (n: number) => {
+    for (let i = 0; i < n; i++) store.audit({ host: `h${i}.com`, decision: "passthrough" });
+  };
+  const seedUsage = (n: number) => {
+    for (let i = 0; i < n; i++) store.recordLlmUsage({ connectionId: `conn_${i}` });
+  };
+  const seedNotifs = (n: number) => {
+    for (let i = 0; i < n; i++)
+      store.enqueueOwnerNotification({ agentId: `ag_${i}`, integrationId: "github", connectToken: null });
+  };
+
+  it("listAudit: negative, zero, and non-integer limits never return an unbounded set", () => {
+    seedAudit(5);
+    // Negative would be LIMIT -1 (no limit) if unclamped; must clamp to >= 1.
+    expect(store.listAudit({ limit: -1 })).toHaveLength(1);
+    expect(store.listAudit({ limit: 0 })).toHaveLength(1);
+    // Non-integer falls back to the default (200), still bounded.
+    expect(store.listAudit({ limit: Number("abc") })).toHaveLength(5);
+    expect(store.listAudit({ limit: 2.5 })).toHaveLength(5);
+    // A huge limit is capped at the max and never errors.
+    expect(store.listAudit({ limit: 10_000_000 })).toHaveLength(5);
+    // A normal limit still works.
+    expect(store.listAudit({ limit: 2 })).toHaveLength(2);
+  });
+
+  it("listLlmUsage: bad limits are clamped, normal limit works", () => {
+    seedUsage(5);
+    expect(store.listLlmUsage({ limit: -1 })).toHaveLength(1);
+    expect(store.listLlmUsage({ limit: 0 })).toHaveLength(1);
+    expect(store.listLlmUsage({ limit: Number("abc") })).toHaveLength(5);
+    expect(store.listLlmUsage({ limit: 10_000_000 })).toHaveLength(5);
+    expect(store.listLlmUsage({ limit: 2 })).toHaveLength(2);
+  });
+
+  it("listOwnerNotifications: bad limits are clamped, normal limit works", () => {
+    seedNotifs(5);
+    expect(store.listOwnerNotifications({ limit: -1 })).toHaveLength(1);
+    expect(store.listOwnerNotifications({ limit: 0 })).toHaveLength(1);
+    expect(store.listOwnerNotifications({ limit: Number("abc") })).toHaveLength(5);
+    expect(store.listOwnerNotifications({ limit: 10_000_000 })).toHaveLength(5);
+    expect(store.listOwnerNotifications({ limit: 2 })).toHaveLength(2);
+  });
+});
+
 describe("connections", () => {
   it("allows many connections per llm vendor", () => {
     store.createConnection({ kind: "llm", vendor: "anthropic", name: "prod", data: { apiKey: "k1" } });

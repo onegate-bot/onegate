@@ -2199,8 +2199,16 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   // ---- audit ----
 
   app.get("/api/audit", (req, res) => {
+    let limit: number | undefined;
+    if (req.query.limit !== undefined) {
+      limit = Number(req.query.limit);
+      if (!Number.isInteger(limit) || limit < 1) {
+        res.status(400).json({ error: "invalid_limit" });
+        return;
+      }
+    }
     const rows = store.listAudit({
-      limit: req.query.limit ? Number(req.query.limit) : undefined,
+      limit,
       agentId: req.query.agentId ? String(req.query.agentId) : undefined,
     });
     // Resolve each LLM-routed row's connection id to the connection's CURRENT
