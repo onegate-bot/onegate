@@ -207,6 +207,125 @@ describe("integrations + credentials + rules + audit", () => {
   });
 });
 
+describe("rule referential validation on create", () => {
+  let agentId: string;
+  let projectId: string;
+  let connId: string;
+
+  beforeAll(async () => {
+    agentId = (await api("POST", "/api/agents", { name: "refbot" })).json.id;
+    projectId = (await api("POST", "/api/projects", { name: "refproject" })).json.id;
+    connId = store.createConnection({
+      kind: "app",
+      vendor: "github",
+      name: "github-ref",
+      data: { token: "ghp_ref" },
+    }).id;
+  });
+
+  it("rejects an agent-scoped rule whose subject does not exist", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: "ag_nope",
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(r.status).toBe(404);
+    expect(r.json.error).toBe("unknown_agent");
+  });
+
+  it("rejects a project-scoped rule whose subject does not exist", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "project",
+      subjectId: "pr_nope",
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(r.status).toBe(404);
+    expect(r.json.error).toBe("unknown_project");
+  });
+
+  it("rejects a rule naming an unregistered integration", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "not_a_real_integration",
+      effect: "allow",
+    });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("unknown_integration");
+  });
+
+  // The dangerous case: a typo'd connection on a deny/except pin silently
+  // becomes a blanket deny, because the exception can never match.
+  it("rejects a connection-scoped rule whose connection does not exist", async () => {
+    for (const connectionScope of ["only", "except"]) {
+      const r = await api("POST", "/api/rules", {
+        scope: "agent",
+        subjectId: agentId,
+        integrationId: "github",
+        effect: "deny",
+        connectionId: "conn_nope",
+        connectionScope,
+      });
+      expect(r.status).toBe(404);
+      expect(r.json.error).toBe("unknown_connection");
+    }
+  });
+
+  it("still creates rules for both scopes when the subject exists", async () => {
+    const a = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(a.status).toBe(201);
+    expect(a.json.subjectId).toBe(agentId);
+
+    const p = await api("POST", "/api/rules", {
+      scope: "project",
+      subjectId: projectId,
+      integrationId: "github",
+      effect: "allow",
+    });
+    expect(p.status).toBe(201);
+    expect(p.json.subjectId).toBe(projectId);
+  });
+
+  it("still creates connection-scoped rules with a valid connection", async () => {
+    for (const connectionScope of ["only", "except"]) {
+      const r = await api("POST", "/api/rules", {
+        scope: "agent",
+        subjectId: agentId,
+        integrationId: "github",
+        effect: "deny",
+        pathGlob: "/repos/onegate-bot/onegate/**",
+        connectionId: connId,
+        connectionScope,
+      });
+      expect(r.status).toBe(201);
+      expect(r.json.connectionId).toBe(connId);
+      expect(r.json.connectionScope).toBe(connectionScope);
+    }
+  });
+
+  it("keeps the existing required-field and connectionScope checks ahead of it", async () => {
+    // Missing required fields still 400 before any lookup runs.
+    expect((await api("POST", "/api/rules", { scope: "agent", subjectId: agentId })).status).toBe(400);
+    // connectionId without connectionScope still 400, not a connection lookup.
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "github",
+      effect: "allow",
+      connectionId: connId,
+    });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("connectionId requires connectionScope");
+  });
+});
+
 describe("generic oauth routes", () => {
   it("rejects oauth start for unknown and non-oauth integrations", async () => {
     expect((await api("POST", "/api/integrations/nope/oauth/start", { clientId: "x" })).status).toBe(404);

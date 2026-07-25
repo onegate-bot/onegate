@@ -2034,6 +2034,23 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "connectionId requires connectionScope" });
       return;
     }
+    // Referential checks on create only: a rule naming an entity that does not
+    // exist is always an operator typo, and a mistyped connection on a scoped
+    // rule fails silently (an "except" exception that can never match turns the
+    // rule into a blanket deny). Existing rows are never re-validated.
+    const subject = scope === "agent" ? store.getAgent(String(subjectId)) : store.getProject(String(subjectId));
+    if (!subject) {
+      res.status(404).json({ error: scope === "agent" ? "unknown_agent" : "unknown_project" });
+      return;
+    }
+    if (!registry.get(String(integrationId))) {
+      res.status(400).json({ error: "unknown_integration", message: `unknown integration "${integrationId}"` });
+      return;
+    }
+    if (connectionId && !store.getConnection(String(connectionId))) {
+      res.status(404).json({ error: "unknown_connection", message: `unknown connection "${connectionId}"` });
+      return;
+    }
     // Optional access lease on an allow rule: ttlSeconds>0 sets a time box that
     // expires at now+ttl; 0/null = no lease. Only meaningful on allow rules.
     let expiresAt: string | null = null;
