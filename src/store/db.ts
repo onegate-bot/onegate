@@ -376,23 +376,44 @@ function rowToOnboardingLink(r: Row): OnboardingLink {
   };
 }
 
-function rowToCredential(r: Row, box: SecretBox): Credential {
+/**
+ * Isolates a single undecryptable secret row. A row sealed under a rotated or
+ * different key, or a truncated/corrupt envelope, makes `box.open` throw (bad
+ * GCM tag or JSON.parse). Without isolation one such row would take down the
+ * whole `rowTo*` map path (and thus the vendor's connection list and all proxy
+ * resolution for it), or block boot from `encryptSecretsAtRest`. We log the row
+ * id (never the ciphertext or any secret material) and let the caller skip it.
+ */
+function safeOpen(box: SecretBox, data: string, rowId: string): Record<string, string> | null {
+  try {
+    return box.open(data);
+  } catch {
+    console.warn(`onegate: skipping undecryptable secret row id=${rowId} (bad key or corrupt envelope)`);
+    return null;
+  }
+}
+
+function rowToCredential(r: Row, box: SecretBox): Credential | null {
+  const data = safeOpen(box, r.data, r.id);
+  if (data === null) return null;
   return {
     id: r.id,
     integrationId: r.integration_id,
     name: r.name,
-    data: box.open(r.data),
+    data,
     createdAt: r.created_at,
   };
 }
 
-function rowToConnection(r: Row, box: SecretBox): Connection {
+function rowToConnection(r: Row, box: SecretBox): Connection | null {
+  const data = safeOpen(box, r.data, r.id);
+  if (data === null) return null;
   return {
     id: r.id,
     kind: r.kind as ConnectionKind,
     vendor: r.vendor,
     name: r.name,
-    data: box.open(r.data),
+    data,
     ownerAgentId: r.owner_agent_id ?? null,
     isDefault: r.is_default === 1,
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
@@ -618,8 +639,17 @@ export class Store {
       for (const r of rows) {
         if (typeof r.data !== "string" || this.secrets.isSealed(r.data)) continue;
         // Re-seal the existing plaintext value verbatim (open() parses the
-        // legacy JSON, seal() wraps it) so no secret is altered.
-        update.run(this.secrets.seal(this.secrets.open(r.data)), r.id);
+        // legacy JSON, seal() wraps it) so no secret is altered. Isolate a
+        // single unparseable legacy blob: skip it and leave the row as-is so
+        // one corrupt row cannot block boot (the row is later skipped by the
+        // rowTo* mappers too). Never log the row's data.
+        try {
+          update.run(this.secrets.seal(this.secrets.open(r.data)), r.id);
+        } catch {
+          console.warn(
+            `onegate: skipping unparseable legacy secret row id=${r.id} in ${table} during at-rest migration`,
+          );
+        }
       }
     }
   }
@@ -795,9 +825,9 @@ export class Store {
   }
 
   listCredentials(): Credential[] {
-    return (this.db.prepare("SELECT * FROM credentials ORDER BY integration_id").all() as Row[]).map(
-      (r) => rowToCredential(r, this.secrets),
-    );
+    return (this.db.prepare("SELECT * FROM credentials ORDER BY integration_id").all() as Row[])
+      .map((r) => rowToCredential(r, this.secrets))
+      .filter((c): c is Credential => c !== null);
   }
 
   deleteCredential(integrationId: string): void {
@@ -883,7 +913,9 @@ export class Store {
       }
     }
     const sql = `SELECT * FROM connections${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at, rowid`;
-    return (this.db.prepare(sql).all(...params) as Row[]).map((r) => rowToConnection(r, this.secrets));
+    return (this.db.prepare(sql).all(...params) as Row[])
+      .map((r) => rowToConnection(r, this.secrets))
+      .filter((c): c is Connection => c !== null);
   }
 
   /**
@@ -906,7 +938,9 @@ export class Store {
       params.push(vendor);
     }
     const sql = `SELECT DISTINCT c.* FROM connections c JOIN connection_grants g ON g.connection_id = c.id WHERE c.kind = 'app' AND (${subjectClause})${vendorClause} ORDER BY c.created_at, c.rowid`;
-    return (this.db.prepare(sql).all(...params) as Row[]).map((r) => rowToConnection(r, this.secrets));
+    return (this.db.prepare(sql).all(...params) as Row[])
+      .map((r) => rowToConnection(r, this.secrets))
+      .filter((c): c is Connection => c !== null);
   }
 
   // ---- connection grants (default-deny authorization) ----
