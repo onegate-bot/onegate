@@ -68,9 +68,25 @@ export const jira: Integration = {
     };
   },
   inject(ctx: InjectionContext): void {
-    const { email, apiToken } = ctx.credential.data;
+    const { email, apiToken, siteUrl } = ctx.credential.data;
     if (!email || !apiToken) {
       throw new Error('Jira credential needs both "email" and "apiToken" fields');
+    }
+    // An Atlassian classic API token is account-global and any *.atlassian.net
+    // subdomain is an attacker-registrable self-service tenant. When the
+    // operator recorded which site the credential belongs to (siteUrl), bind
+    // the Basic-auth injection to that host so a request aimed at a different
+    // tenant cannot borrow these credentials. api.atlassian.com is a fixed
+    // claimed host (OAuth/Confluence path, never Basic auth), so leave it
+    // unbound. Credentials with no siteUrl keep the prior behavior.
+    const normalizedSite = siteUrl ? normalizeSiteUrl(siteUrl) : null;
+    if (normalizedSite && ctx.host.toLowerCase() !== "api.atlassian.com") {
+      const boundHost = new URL(normalizedSite).host;
+      if (ctx.host.toLowerCase() !== boundHost.toLowerCase()) {
+        throw new Error(
+          `Jira credential is bound to ${boundHost}, refusing to authenticate ${ctx.host}`,
+        );
+      }
     }
     const basic = Buffer.from(`${email}:${apiToken}`).toString("base64");
     ctx.headers.authorization = `Basic ${basic}`;
