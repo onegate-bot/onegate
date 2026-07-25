@@ -18,7 +18,7 @@ import tls from "node:tls";
 import type { Duplex } from "node:stream";
 import type { Ca } from "../ca.js";
 import type { Store } from "../store/db.js";
-import { evaluate } from "../policy.js";
+import { evaluate, normalizeRequestPath } from "../policy.js";
 import type { Agent, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
 import { connectFlowKind, type Integration, type Registry } from "../integrations/types.js";
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
@@ -656,7 +656,12 @@ export class GatewayProxy {
     }
     const { agent, host, port, integration } = ctx;
     const method = (req.method ?? "GET").toUpperCase();
-    const path = req.url ?? "/";
+    // Canonicalize the request target ONCE: percent-decode, collapse dot-segments
+    // and duplicate slashes (query preserved). Policy matching, audit AND the
+    // upstream forward all use this single canonical form, so a deny glob cannot
+    // be evaded with an equivalent-but-encoded path (%2F, //, /../) that the
+    // vendor would still honor. See normalizeRequestPath.
+    const path = normalizeRequestPath(req.url ?? "/");
 
     const rules = this.opts.store.rulesForAgent(agent);
     const verdict = evaluate(agent, rules, { integrationId: integration.id, method, path });
@@ -1052,7 +1057,9 @@ export class GatewayProxy {
   ): Promise<void> {
     const { agent, host, port, integration } = ctx;
     const method = (req.method ?? "GET").toUpperCase();
-    const path = req.url ?? "/";
+    // Forward the canonical path (matching the one policy evaluated in
+    // onInnerRequest) so the executed LLM request equals the matched request.
+    const path = normalizeRequestPath(req.url ?? "/");
     const llm = integration.llm!;
     const ids = route.connections.map((c) => c.id);
 
