@@ -486,6 +486,31 @@ export class Store {
   }
 
   /**
+   * Runs `fn` inside a single SQLite transaction (IMMEDIATE, so the write lock
+   * is taken up front). Commits if `fn` returns normally, rolls back and
+   * rethrows on any error, so a multi-statement mutation is all-or-nothing.
+   * node:sqlite has no better-sqlite3-style `db.transaction()` helper, so this
+   * wraps the BEGIN/COMMIT/ROLLBACK exec calls. Not reentrant (SQLite has no
+   * nested transactions) - never call `tx` from inside another `tx`.
+   */
+  private tx<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // A ROLLBACK can fail if no transaction is open (e.g. it was already
+        // aborted by SQLite). Swallow it so the original error propagates.
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Idempotent column additions for databases created before the LLM
    * routing feature. CREATE TABLE IF NOT EXISTS does not alter existing
    * tables, so the audit table's LLM columns are added here when missing.
@@ -719,16 +744,33 @@ export class Store {
   }
 
   deleteAgent(id: string): void {
-    this.db.prepare("DELETE FROM rules WHERE scope = 'agent' AND subject_id = ?").run(id);
-    this.db.prepare("DELETE FROM agent_llm_config WHERE agent_id = ?").run(id);
-    this.db.prepare("DELETE FROM llm_strategy_state WHERE agent_id = ?").run(id);
-    this.db.prepare("DELETE FROM agent_app_config WHERE agent_id = ?").run(id);
-    // App connections bound to this agent are no longer reachable, drop them.
-    this.db.prepare("DELETE FROM connections WHERE kind = 'app' AND owner_agent_id = ?").run(id);
-    // Drop grants that named this agent as their subject (cascade handles the
-    // connection-side; this clears the agent-subject side).
-    this.db.prepare("DELETE FROM connection_grants WHERE scope = 'agent' AND subject_id = ?").run(id);
-    this.db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+    // All-or-nothing: an interrupted delete must never leave the DB in a state
+    // where the credential/authz-bearing rows disagree (e.g. rules/grants gone
+    // while the agent token still authenticates = fail-open, or the agent row
+    // gone while onboarding links / notifications dangle as orphans). The whole
+    // cascade runs inside one transaction.
+    this.tx(() => {
+      // Remove the authz-bearing rows (token via the agents row, plus rules and
+      // grants) together with the rest of the agent's footprint.
+      this.db.prepare("DELETE FROM rules WHERE scope = 'agent' AND subject_id = ?").run(id);
+      this.db.prepare("DELETE FROM agent_llm_config WHERE agent_id = ?").run(id);
+      this.db.prepare("DELETE FROM llm_strategy_state WHERE agent_id = ?").run(id);
+      this.db.prepare("DELETE FROM agent_app_config WHERE agent_id = ?").run(id);
+      // App connections bound to this agent are no longer reachable, drop them.
+      this.db.prepare("DELETE FROM connections WHERE kind = 'app' AND owner_agent_id = ?").run(id);
+      // Drop grants that named this agent as their subject (cascade handles the
+      // connection-side; this clears the agent-subject side).
+      this.db
+        .prepare("DELETE FROM connection_grants WHERE scope = 'agent' AND subject_id = ?")
+        .run(id);
+      // Onboarding links and owner notifications reference the agent by id but
+      // have no FK cascade, so clear them here to avoid orphans (a leftover
+      // onboarding link would otherwise still be redeemable for a dead agent).
+      this.db.prepare("DELETE FROM onboarding_links WHERE agent_id = ?").run(id);
+      this.db.prepare("DELETE FROM owner_notifications WHERE agent_id = ?").run(id);
+      // agent_notify has an ON DELETE CASCADE FK, so it clears with the row.
+      this.db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+    });
   }
 
   // ---- credentials ----
@@ -983,19 +1025,24 @@ export class Store {
   deleteConnection(id: string): void {
     const cur = this.getConnection(id);
     if (!cur) return;
-    this.db.prepare("DELETE FROM connections WHERE id = ?").run(id);
-    if (cur.isDefault) {
-      const next = this.listConnections({
-        kind: cur.kind,
-        vendor: cur.vendor,
-        ownerAgentId: cur.ownerAgentId,
-      })[0];
-      if (next) {
-        this.db
-          .prepare("UPDATE connections SET is_default = 1, updated_at = ? WHERE id = ?")
-          .run(now(), next.id);
+    // Deleting a connection and promoting the next default must be atomic: an
+    // interrupt between the two would leave a vendor with no default connection
+    // (or, with grants cascaded off, in a half-torn state). Run both together.
+    this.tx(() => {
+      this.db.prepare("DELETE FROM connections WHERE id = ?").run(id);
+      if (cur.isDefault) {
+        const next = this.listConnections({
+          kind: cur.kind,
+          vendor: cur.vendor,
+          ownerAgentId: cur.ownerAgentId,
+        })[0];
+        if (next) {
+          this.db
+            .prepare("UPDATE connections SET is_default = 1, updated_at = ? WHERE id = ?")
+            .run(now(), next.id);
+        }
       }
-    }
+    });
   }
 
   private clearDefaultConnection(

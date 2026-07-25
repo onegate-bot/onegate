@@ -55,6 +55,73 @@ describe("agents", () => {
     store.deleteAgent(agent.id);
     expect(store.listRules({ scope: "agent", subjectId: agent.id })).toHaveLength(0);
   });
+
+  it("deleteAgent removes token AND rules together (no fail-open partial state)", () => {
+    const { agent, token } = store.createAgent("del-atomic");
+    store.createRule({
+      scope: "agent",
+      subjectId: agent.id,
+      integrationId: "github",
+      methods: ["GET"],
+      pathGlob: "/**",
+      effect: "allow",
+    });
+    // Sanity: both present before delete.
+    expect(store.getAgentByToken(token)?.id).toBe(agent.id);
+    expect(store.listRules({ scope: "agent", subjectId: agent.id })).toHaveLength(1);
+
+    store.deleteAgent(agent.id);
+
+    // The credential (token) must be gone the moment the rules are gone, so a
+    // dangling token can never authenticate with its authz stripped.
+    expect(store.getAgent(agent.id)).toBeNull();
+    expect(store.getAgentByToken(token)).toBeNull();
+    expect(store.listRules({ scope: "agent", subjectId: agent.id })).toHaveLength(0);
+  });
+
+  it("deleteAgent clears grants, app connections, notify and onboarding links (no orphans)", () => {
+    const { agent } = store.createAgent("del-cascade");
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "github",
+      name: "gh",
+      data: { token: "x" },
+      ownerAgentId: agent.id,
+    });
+    store.grantConnection(conn.id, "agent", agent.id);
+    store.setAgentNotify(agent.id, "https://example.com/hook");
+    const link = store.createOnboardingLink({ agentId: agent.id, integrationId: "github" });
+    store.enqueueOwnerNotification({
+      agentId: agent.id,
+      integrationId: "github",
+      connectToken: link.token,
+    });
+
+    store.deleteAgent(agent.id);
+
+    // App connection owned by the agent is dropped, its grants gone with it.
+    expect(store.getConnection(conn.id)).toBeNull();
+    expect(store.listGrantsForConnection(conn.id)).toHaveLength(0);
+    // Notify webhook (FK cascade) cleared.
+    expect(store.getAgentNotify(agent.id)).toBeNull();
+    // Owner notifications cleared (no FK, deleted explicitly in the tx).
+    expect(store.listOwnerNotifications().filter((n) => n.agentId === agent.id)).toHaveLength(0);
+  });
+
+  it("an onboarding link for a deleted agent is no longer redeemable (410/invalid)", () => {
+    const { agent } = store.createAgent("del-link");
+    const link = store.createOnboardingLink({ agentId: agent.id, integrationId: "github" });
+    // Valid while the agent exists.
+    expect(store.isOnboardingLinkValid(store.getOnboardingLink(link.token))).toBe(true);
+
+    store.deleteAgent(agent.id);
+
+    // The link row is removed with the agent, so a redeem finds nothing to
+    // redeem: getOnboardingLink is null and validity is false. The public
+    // redeem routes render invalidLinkPage (HTTP 410) for this.
+    expect(store.getOnboardingLink(link.token)).toBeNull();
+    expect(store.isOnboardingLinkValid(store.getOnboardingLink(link.token))).toBe(false);
+  });
 });
 
 describe("credentials", () => {
