@@ -13,12 +13,13 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: ["src/admin/ui/**"],
       // A floor, not a target. Set below the current numbers so ordinary
-      // changes pass, but a meaningful slide fails the build.
+      // changes pass, but a meaningful slide fails the build. Raised from
+      // 85/85/90/80 once the CLI command modules were covered.
       thresholds: {
-        lines: 85,
-        statements: 85,
-        functions: 90,
-        branches: 80,
+        lines: 92,
+        statements: 92,
+        functions: 97,
+        branches: 86,
       },
     },
   },
