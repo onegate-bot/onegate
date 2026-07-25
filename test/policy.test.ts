@@ -39,6 +39,16 @@ describe("globToRegExp", () => {
     expect(globToRegExp("/a.b/c").test("/a.b/c")).toBe(true);
     expect(globToRegExp("/a.b/c").test("/aXb/c")).toBe(false);
   });
+
+  it("trailing /** also matches the bare prefix", () => {
+    const g = globToRegExp("/repos/x/y/**");
+    expect(g.test("/repos/x/y")).toBe(true);
+    expect(g.test("/repos/x/y/")).toBe(true);
+    expect(g.test("/repos/x/y/z")).toBe(true);
+    // Must not over-match sibling prefixes that merely share the same start.
+    expect(g.test("/repos/x/yy")).toBe(false);
+    expect(g.test("/repos/x/ything")).toBe(false);
+  });
 });
 
 describe("ruleMatches", () => {

@@ -54,15 +54,25 @@ const globCache = new Map<string, RegExp>();
 /**
  * Converts a path glob to a regex. `**` matches anything including `/`,
  * `*` matches anything except `/`. Matching is anchored.
+ *
+ * A trailing `/**` is special-cased so that `/x/**` matches both the bare
+ * prefix `/x` and any sub-path `/x/...` (regex `^/x(/.*)?$`). This lets a
+ * single rule cover a resource and everything beneath it. `**` anywhere else
+ * (including a mid-path `/**`) keeps the plain "matches anything" behavior.
  */
 export function globToRegExp(glob: string): RegExp {
   let re = globCache.get(glob);
   if (re) return re;
-  const escaped = glob
+  // Detect a trailing `/**` on an otherwise glob-free prefix segment so we can
+  // make the trailing `/...` optional (covers the bare prefix too).
+  const trailing = glob.endsWith("/**");
+  const base = trailing ? glob.slice(0, -3) : glob;
+  const escapedBase = base
     .replace(/[.+^${}()|[\]\\?]/g, "\\$&")
     .replace(/\*\*/g, "\0")
     .replace(/\*/g, "[^/]*")
     .replace(/\0/g, ".*");
+  const escaped = trailing ? `${escapedBase}(/.*)?` : escapedBase;
   re = new RegExp(`^${escaped}$`);
   globCache.set(glob, re);
   return re;
