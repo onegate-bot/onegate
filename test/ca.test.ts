@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
 import forge from "node-forge";
-import { initCa, loadCa, caExists, caPaths, Ca } from "../src/ca.js";
+import { initCa, loadCa, caExists, caPaths, Ca, hostCacheKey } from "../src/ca.js";
+import { readdirSync } from "node:fs";
 
 let dir: string;
 let ca: Ca;
@@ -105,6 +106,58 @@ describe("leafFor", () => {
     });
     server.close();
     expect(verified).toBe(true);
+  });
+});
+
+describe("leafFor host sanitization (path traversal + cache)", () => {
+  it("hostCacheKey neutralizes path separators and traversal sequences", () => {
+    const key = hostCacheKey("../../../tmp/evil.amazonaws.com");
+    expect(key).not.toContain("/");
+    expect(key).not.toContain("..");
+    expect(key).toMatch(/^[a-z0-9._-]+$/);
+  });
+
+  it("a traversal host writes only inside certsDir, never escaping it", () => {
+    const traversalDir = mkdtempSync(join(tmpdir(), "onegate-trav-"));
+    try {
+      const localCa = initCa(traversalDir, "Traversal CA");
+      const certsDir = caPaths(traversalDir).certsDir;
+      // Snapshot files elsewhere in the data dir before the crafted mint.
+      const beforeDataDir = readdirSync(traversalDir).sort();
+      localCa.leafFor("../../../tmp/evil.amazonaws.com");
+      // No new files leaked into the data dir (parent of certsDir) or above.
+      const afterDataDir = readdirSync(traversalDir).sort();
+      expect(afterDataDir).toEqual(beforeDataDir);
+      // Every file the mint created lives inside certsDir with a safe name.
+      const written = readdirSync(certsDir);
+      expect(written.length).toBeGreaterThan(0);
+      for (const name of written) {
+        expect(name).not.toContain("/");
+        expect(name).not.toContain("..");
+        expect(name).toMatch(/^[a-z0-9._-]+\.(crt|key)$/);
+      }
+    } finally {
+      rmSync(traversalDir, { recursive: true, force: true });
+    }
+  });
+
+  it("case-insensitive host returns the same cached leaf (one keygen)", () => {
+    const a = ca.leafFor("API.Example.Com");
+    const b = ca.leafFor("api.example.com");
+    expect(a.cert).toBe(b.cert);
+    expect(a.key).toBe(b.key);
+    // Only one on-disk leaf pair for the collapsed key.
+    const certsDir = caPaths(dir).certsDir;
+    const files = readdirSync(certsDir).filter((f) => f.startsWith("api.example.com"));
+    expect(files.sort()).toEqual(["api.example.com.crt", "api.example.com.key"]);
+  });
+
+  it("a normal host still mints a valid leaf signed by the root", () => {
+    const leaf = ca.leafFor("normal.example.org");
+    const cert = forge.pki.certificateFromPem(leaf.cert);
+    const root = forge.pki.certificateFromPem(ca.rootPem);
+    expect(root.verify(cert)).toBe(true);
+    expect(cert.subject.getField("CN").value).toBe("normal.example.org");
   });
 });
 

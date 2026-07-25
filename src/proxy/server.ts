@@ -138,6 +138,24 @@ function parseProxyAuth(header: string | undefined): string | null {
   return null;
 }
 
+/**
+ * Validates the host parsed from a CONNECT authority before it is used for
+ * integration resolution or leaf-cert minting. A well-formed DNS host contains
+ * only letters, digits, dots and hyphens; anything else (path separators, `..`,
+ * control chars, whitespace) is rejected. This blocks a crafted CONNECT host
+ * such as `../../../tmp/evil.amazonaws.com` from reaching `ca.leafFor`, where it
+ * would otherwise write a cert + private key outside the certs directory. The
+ * sanitization in `Ca.leafFor` is the backstop; this is the front door.
+ *
+ * Beyond the charset, we reject any host that is or contains a bare `..`
+ * traversal token (e.g. `..` or `a..b`), which the charset alone would admit.
+ */
+export function isValidConnectHost(host: string): boolean {
+  if (!/^[a-z0-9.-]+$/i.test(host)) return false;
+  if (host.includes("..")) return false;
+  return true;
+}
+
 export class GatewayProxy {
   private server: http.Server;
   /** Inner HTTP parser for MITM'd TLS sockets. */
@@ -207,7 +225,10 @@ export class GatewayProxy {
   private onConnect(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
     const [host, portStr] = (req.url ?? "").split(":");
     const port = Number(portStr) || 443;
-    if (!host) {
+    // Reject an empty or malformed host up front. Without a strict charset guard
+    // a crafted host containing `/` or `..` flows into ca.leafFor and writes a
+    // cert + private key to an arbitrary path (leaf-cert path traversal).
+    if (!host || !isValidConnectHost(host)) {
       socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
       return;
     }

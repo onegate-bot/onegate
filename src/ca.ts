@@ -23,6 +23,28 @@ export interface LeafCert {
   key: string;
 }
 
+/**
+ * Derives a filesystem-safe, path-traversal-proof key from a host used as both
+ * the in-memory cache key and the on-disk leaf filename. Lowercasing collapses
+ * case variants (so `API.GitHub.com` and `api.github.com` share one leaf, not
+ * two, avoiding redundant keygen and disk bloat), and replacing every character
+ * outside `[a-z0-9._-]` neutralizes `/`, `\`, `..`, and any other separator so
+ * `join(certsDir, ...)` can never escape certsDir. The upstream CONNECT-host
+ * guard already rejects malformed hosts; this is defense in depth so a leaf
+ * path is safe regardless of caller.
+ */
+export function hostCacheKey(host: string): string {
+  return host
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "_")
+    // Collapse any run of dots so no `..` traversal token survives in the
+    // filename even after separators are neutralized.
+    .replace(/\.{2,}/g, ".")
+    // A key that is only dots (e.g. from a "." or ".." host) would name the
+    // current/parent directory; fall back to a fixed safe token.
+    .replace(/^\.+$/, "_");
+}
+
 function randomSerial(): string {
   // Positive, 16-byte serial. First hex digit forced < 8 so the integer is positive.
   const bytes = forge.util.bytesToHex(forge.random.getBytesSync(16));
@@ -77,24 +99,32 @@ export class Ca {
    * `googleapis.com` subdomain lookups when the proxy normalizes hosts.
    */
   leafFor(host: string): LeafCert {
-    const cached = this.cache.get(host);
+    // Normalize + sanitize the host before it touches any Map key or disk path.
+    // `key` is lowercased so case variants share one leaf; the filesystem name
+    // additionally strips path separators so a crafted host can never escape
+    // certsDir (defense in depth behind the CONNECT-host guard in the proxy).
+    const key = hostCacheKey(host);
+    const cached = this.cache.get(key);
     if (cached) return cached;
 
-    const diskCert = join(this.certsDir, `${host}.crt`);
-    const diskKey = join(this.certsDir, `${host}.key`);
+    const diskCert = join(this.certsDir, `${key}.crt`);
+    const diskKey = join(this.certsDir, `${key}.key`);
     if (existsSync(diskCert) && existsSync(diskKey)) {
       const fromDisk = this.loadValidLeaf(diskCert, diskKey);
       if (fromDisk) {
-        this.cache.set(host, fromDisk);
+        this.cache.set(key, fromDisk);
         return fromDisk;
       }
     }
 
-    const leaf = this.mintLeaf(host);
+    // Mint against the lowercased host so the cert Subject/SAN is the canonical
+    // hostname (TLS SNI matching is case-insensitive), independent of the
+    // sanitized on-disk filename.
+    const leaf = this.mintLeaf(host.toLowerCase());
     writeFileSync(diskCert, leaf.cert);
     writeFileSync(diskKey, leaf.key);
     chmodSync(diskKey, 0o600);
-    this.cache.set(host, leaf);
+    this.cache.set(key, leaf);
     return leaf;
   }
 
