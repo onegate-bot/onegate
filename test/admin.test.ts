@@ -282,6 +282,19 @@ describe("rule referential validation on create", () => {
     expect(r.json.error).toBe("unknown_integration");
   });
 
+  // "*" means "every integration" and is matched specially by ruleMatches, so
+  // the unregistered-integration check above must not treat it as a typo.
+  it("accepts the wildcard integration", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "*",
+      effect: "allow",
+    });
+    expect(r.status).toBe(201);
+    expect(r.json.integrationId).toBe("*");
+  });
+
   // The dangerous case: a typo'd connection on a deny/except pin silently
   // becomes a blanket deny, because the exception can never match.
   it("rejects a connection-scoped rule whose connection does not exist", async () => {
