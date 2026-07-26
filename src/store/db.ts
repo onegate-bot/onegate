@@ -683,9 +683,28 @@ export class Store {
         String(r.name),
       ),
     );
-    if (linkCols.has("token") && !linkCols.has("token_hash")) {
-      this.db.exec("ALTER TABLE onboarding_links RENAME TO onboarding_links_legacy");
-      this.db.exec(`CREATE TABLE onboarding_links (
+    // The rebuild is resumable in two directions. The normal trigger is a
+    // legacy-shaped table (plaintext `token`, no `token_hash`). The second
+    // trigger covers a database left half-migrated by an older, non
+    // transactional build of this migration: it could be killed after the
+    // RENAME, leaving an orphaned `onboarding_links_legacy` table still holding
+    // the plaintext tokens this migration exists to eliminate, while the new
+    // `onboarding_links` table no longer has a `token` column so the old guard
+    // could never fire again. Keying off the surviving legacy table as well
+    // means such a database is finished (and the plaintext dropped) on the next
+    // open instead of leaking forever.
+    const legacyTableExists = (): boolean =>
+      this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get("onboarding_links_legacy") !== undefined;
+    if ((linkCols.has("token") && !linkCols.has("token_hash")) || legacyTableExists()) {
+      // All-or-nothing: without a transaction a crash mid-rebuild loses the
+      // un-copied rows AND strands the plaintext legacy table (see above).
+      this.tx(() => {
+        if (!legacyTableExists()) {
+          this.db.exec("ALTER TABLE onboarding_links RENAME TO onboarding_links_legacy");
+        }
+        this.db.exec(`CREATE TABLE IF NOT EXISTS onboarding_links (
         token_hash TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
         integration_id TEXT NOT NULL,
@@ -696,30 +715,33 @@ export class Store {
         used_at TEXT,
         rule_id TEXT
       )`);
-      this.db.exec("CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id)");
-      const legacyCols = new Set(
-        (this.db.prepare("PRAGMA table_info(onboarding_links_legacy)").all() as Row[]).map((r) =>
-          String(r.name),
-        ),
-      );
-      const rows = this.db.prepare("SELECT * FROM onboarding_links_legacy").all() as Row[];
-      const insert = this.db.prepare(
-        "INSERT OR IGNORE INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      );
-      for (const r of rows) {
-        insert.run(
-          hashToken(String(r.token)),
-          r.agent_id,
-          r.integration_id,
-          r.scopes ?? null,
-          r.connection_name ?? null,
-          r.created_at,
-          r.expires_at,
-          r.used_at ?? null,
-          legacyCols.has("rule_id") ? (r.rule_id ?? null) : null,
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id)",
         );
-      }
-      this.db.exec("DROP TABLE onboarding_links_legacy");
+        const legacyCols = new Set(
+          (this.db.prepare("PRAGMA table_info(onboarding_links_legacy)").all() as Row[]).map((r) =>
+            String(r.name),
+          ),
+        );
+        const rows = this.db.prepare("SELECT * FROM onboarding_links_legacy").all() as Row[];
+        const insert = this.db.prepare(
+          "INSERT OR IGNORE INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        );
+        for (const r of rows) {
+          insert.run(
+            hashToken(String(r.token)),
+            r.agent_id,
+            r.integration_id,
+            r.scopes ?? null,
+            r.connection_name ?? null,
+            r.created_at,
+            r.expires_at,
+            r.used_at ?? null,
+            legacyCols.has("rule_id") ? (r.rule_id ?? null) : null,
+          );
+        }
+        this.db.exec("DROP TABLE onboarding_links_legacy");
+      });
     }
     // owner_notifications.connect_token now holds the hash, not the plaintext.
     // Hash any legacy plaintext rows in place. A row already holding a hash
