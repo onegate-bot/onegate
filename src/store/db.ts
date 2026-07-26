@@ -1952,10 +1952,37 @@ export class Store {
     return new Date(link.expiresAt).getTime() > Date.now();
   }
 
+  /**
+   * Atomically claims a link as used. Returns true iff THIS call is the one
+   * that flipped it from unused to used, false if it was already used (or does
+   * not exist / expired).
+   *
+   * The `used_at IS NULL` predicate is what makes single-use real: validity is
+   * checked separately (isOnboardingLinkValid) and, in the OAuth flow, an async
+   * provider round-trip sits between that check and the redemption. Without the
+   * predicate two concurrent redemptions of the same bearer link both pass the
+   * check and both wire up a connection + grant + allow rule. Callers MUST treat
+   * a false return as "already used" and abort the redemption.
+   *
+   * The expiry bound is enforced in SQL too so a link cannot be claimed after it
+   * lapses even if a caller skipped the validity check.
+   */
+  claimOnboardingLink(token: string): boolean {
+    const res = this.db
+      .prepare(
+        "UPDATE onboarding_links SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+      )
+      .run(now(), hashToken(token), now());
+    return Number(res.changes) > 0;
+  }
+
+  /**
+   * @deprecated Use {@link claimOnboardingLink}, which reports whether the claim
+   * actually succeeded. Kept so external callers keep compiling; it silently
+   * ignores a lost race, which is exactly the bug claimOnboardingLink fixes.
+   */
   markOnboardingLinkUsed(token: string): void {
-    this.db
-      .prepare("UPDATE onboarding_links SET used_at = ? WHERE token_hash = ?")
-      .run(now(), hashToken(token));
+    this.claimOnboardingLink(token);
   }
 
   listOnboardingLinks(agentId?: string): OnboardingLink[] {
