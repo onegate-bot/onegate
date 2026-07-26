@@ -4,6 +4,8 @@
  * section per view → router & boot.
  */
 
+import { beginGeneration, currentGeneration, isCurrentGeneration } from "./render-generation.js";
+
 const TOKEN_KEY = "onegate_admin_token";
 const VIEWS = ["dashboard", "agents", "projects", "integrations", "connections", "rules", "audit", "usage"];
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"];
@@ -1329,6 +1331,7 @@ function openAppConnectionModal({ vendors, agents, vendor, connection, onSaved, 
 // ---------------------------------------------------------------- view: dashboard
 
 async function renderDashboard(root) {
+  const gen = currentGeneration();
   const [health, agents, projects, integrations, rules, audit] = await Promise.all([
     fetch("/api/health").then((r) => r.json()),
     api("/api/agents"),
@@ -1346,6 +1349,7 @@ async function renderDashboard(root) {
   ];
   const caEnv = "NODE_EXTRA_CA_CERTS=./onegate-ca.pem";
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Dashboard</h1>
@@ -1399,9 +1403,11 @@ async function renderDashboard(root) {
 // ---------------------------------------------------------------- view: agents
 
 async function renderAgents(root) {
+  const gen = currentGeneration();
   const [agents, projects] = await Promise.all([api("/api/agents"), api("/api/projects")]);
   const projectName = (id) => projects.find((p) => p.id === id)?.name ?? null;
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Agents</h1>
@@ -1952,9 +1958,11 @@ function showConnectLink(agent, integrationId, link) {
 // ---------------------------------------------------------------- view: projects
 
 async function renderProjects(root) {
+  const gen = currentGeneration();
   const [projects, agents] = await Promise.all([api("/api/projects"), api("/api/agents")]);
   const agentCount = (id) => agents.filter((a) => a.projectId === id).length;
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Projects</h1>
@@ -2079,6 +2087,7 @@ function iconHtml(i) {
 }
 
 async function renderIntegrations(root) {
+  const gen = currentGeneration();
   const [integrations, agents] = await Promise.all([api("/api/integrations"), api("/api/agents")]);
   await loadBrandIcons(integrations.map((i) => i.id));
 
@@ -2110,6 +2119,7 @@ async function renderIntegrations(root) {
   }
   const totalConns = integrations.reduce((n, i) => n + connCountOf(i), 0);
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Integrations</h1>
@@ -2409,6 +2419,7 @@ async function renderIntegrations(root) {
 // ---------------------------------------------------------------- view: connections
 
 async function renderConnections(root) {
+  const gen = currentGeneration();
   const [conns, integrations, agents, projects] = await Promise.all([
     api("/api/connections"),
     api("/api/integrations"),
@@ -2553,6 +2564,7 @@ async function renderConnections(root) {
       <tbody>${appRows(items)}</tbody>
     </table></div>`;
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Connections</h1>
@@ -2914,6 +2926,7 @@ async function renderConnections(root) {
 // ---------------------------------------------------------------- view: rules
 
 async function renderRules(root) {
+  const gen = currentGeneration();
   const [rules, agents, projects, integrations] = await Promise.all([
     api("/api/rules"),
     api("/api/agents"),
@@ -2927,6 +2940,7 @@ async function renderRules(root) {
   const integrationTitle = (id) =>
     id === "*" ? "All integrations" : (integrations.find((i) => i.id === id)?.title ?? id);
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Rules</h1>
@@ -3086,8 +3100,10 @@ async function renderRules(root) {
 // ---------------------------------------------------------------- view: audit
 
 async function renderAudit(root) {
+  const gen = currentGeneration();
   const agents = await api("/api/agents");
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>Audit log</h1>
@@ -3109,6 +3125,7 @@ async function renderAudit(root) {
     const qs = agentId ? `&agentId=${encodeURIComponent(agentId)}` : "";
     try {
       const rows = await api(`/api/audit?limit=200${qs}`);
+      if (!isCurrentGeneration(gen)) return; // navigated away while loading
       $("#audit-table", root).innerHTML = auditTable(rows);
     } catch (err) {
       if (err.status !== 401) toast(`Failed to load audit log: ${err.message}`);
@@ -3133,9 +3150,11 @@ function fmtNum(n) {
 }
 
 async function renderUsage(root) {
+  const gen = currentGeneration();
   const agents = await api("/api/agents");
   const agentName = (id) => agents.find((a) => a.id === id)?.name ?? id ?? "–";
 
+  if (!isCurrentGeneration(gen)) return; // navigated away while loading
   root.innerHTML = `
     <header class="view-header">
       <h1>LLM usage</h1>
@@ -3164,6 +3183,7 @@ async function renderUsage(root) {
       if (err.status !== 401) toast(`Failed to load usage: ${err.message}`);
       return;
     }
+    if (!isCurrentGeneration(gen)) return; // navigated away while loading
 
     // opts.turns adds an "Est. turns" column (estimated conversational turns,
     // inferred from request gaps, see turnEstimate). Only the model/bot rollups
@@ -3273,6 +3293,9 @@ function hashParams() {
 }
 
 async function route() {
+  // Bump first: any render still in flight from a previous navigation is now
+  // stale and will abandon its writes rather than paint over this view.
+  const gen = beginGeneration();
   const view = currentView();
   $$("#nav a, #drawer-nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
   closeDrawer();
@@ -3282,6 +3305,7 @@ async function route() {
     await renderers[view](root);
   } catch (err) {
     if (err.status === 401) return; // logout() already took over
+    if (!isCurrentGeneration(gen)) return; // navigated away, do not paint a stale error
     root.innerHTML = `<div class="card error-block">Failed to load ${esc(view)}: ${esc(err.message)}</div>`;
   }
 }
