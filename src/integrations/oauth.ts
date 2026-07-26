@@ -146,6 +146,37 @@ function cacheKey(integrationId: string, credId: string): string {
   return `oauth_access_token:${integrationId}:${credId}`;
 }
 
+/**
+ * In-flight refreshes, keyed by the same cache key the resulting token is
+ * stored under. Providers that rotate the refresh token on every use (GitLab)
+ * invalidate the presented token as soon as the first exchange lands, so two
+ * concurrent refreshes against one credential would leave the loser holding a
+ * consumed token: its exchange is rejected and, worse, a late write could
+ * clobber the winner's freshly rotated token and brick the credential. Callers
+ * that arrive while a refresh is running await that same promise instead.
+ */
+const inFlightRefreshes = new Map<string, Promise<CachedToken>>();
+
+/**
+ * Runs a refresh under a per-credential single flight. The entry is cleared in
+ * a finally so a rejected refresh never poisons later attempts, and only the
+ * owner of the flight persists the token, so a late loser cannot overwrite a
+ * newer cache entry.
+ */
+function refreshSingleFlight(
+  key: string,
+  run: () => Promise<CachedToken>,
+): Promise<CachedToken> {
+  const existing = inFlightRefreshes.get(key);
+  if (existing) return existing;
+  const flight = run().finally(() => {
+    // Only retract our own entry: a later flight may already own the key.
+    if (inFlightRefreshes.get(key) === flight) inFlightRefreshes.delete(key);
+  });
+  inFlightRefreshes.set(key, flight);
+  return flight;
+}
+
 function readCache(store: Store, key: string): string | null {
   const raw = store.getSetting(key);
   if (!raw) return null;
@@ -224,8 +255,18 @@ export async function oauthBearerToken(
   if (!integration.oauth) {
     throw new Error(`${integration.id} has a refresh token but no OAuth descriptor`);
   }
-  const fresh = await refreshAccessToken(integration.id, integration.oauth, cred, store);
-  store.setSetting(key, JSON.stringify(fresh));
+  const oauth = integration.oauth;
+  const fresh = await refreshSingleFlight(key, async () => {
+    // Re-read under the flight: a refresh may have completed between our cache
+    // miss and this point, in which case there is nothing to exchange.
+    const raced = readCache(store, key);
+    if (raced) return { token: raced, exp: Date.now() + EXPIRY_MARGIN_MS };
+    const minted = await refreshAccessToken(integration.id, oauth, cred, store);
+    // Persisted by the flight owner only, so a stale result from an earlier
+    // attempt can never overwrite a newer token.
+    store.setSetting(key, JSON.stringify(minted));
+    return minted;
+  });
   return fresh.token;
 }
 
