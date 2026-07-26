@@ -437,7 +437,8 @@ describe("cli credentials: set", () => {
   it("fails when no --data pair is given", async () => {
     const { err, exit } = await run("credentials", "set", "github", "--name", "gh");
     expect(exit).toBe(1);
-    expect(err).toBe("onegate: at least one --data k=v is required");
+    expect(err).toContain("onegate: at least one --data k=v is required");
+    expect(err).toContain("--data-stdin");
   });
 
   it("rejects a --data value with no =", async () => {

@@ -3,7 +3,7 @@
  *
  *   onegate connections list
  *   onegate connections add --vendor <v> --name <n> [secret flags] [--default]   (LLM)
- *   onegate connections add --kind app --integration <id> --name <n> --data k=v [--agent <id>] [--default]
+ *   onegate connections add --kind app --integration <id> --name <n> --data-stdin [--agent <id>] [--default]
  *   onegate connections set-default <id>
  *   onegate connections rm <id>
  *   onegate connections grants --id <conn>                          (list grants)
@@ -23,11 +23,21 @@
  * flag then writes the connection row directly to the local store, replacing the
  * hand-written SQLite seeding we do today. Secrets come from flags or stdin and
  * are never logged.
+ *
+ * Prefer the stdin forms (--secret-stdin, --data-stdin). A secret passed as an
+ * argv flag is visible in `ps`, in /proc/<pid>/cmdline to any local user, and in
+ * shell history. The argv flags remain for backwards compatibility only.
  */
 
 import { parseArgs } from "node:util";
 import { disabledIntegrations } from "../../integrations/index.js";
 import { emit, table } from "../output.js";
+import {
+  parseDataPairs,
+  readDataPairsFromStdin,
+  readSecretFromStdin,
+  rejectDuplicateSecretInput,
+} from "../secret-input.js";
 import type { CliContext } from "../context.js";
 
 /** Builds the connection `data` object from secret flags, reading stdin when asked. */
@@ -35,11 +45,7 @@ async function collectSecretData(
   values: Record<string, unknown>,
 ): Promise<Record<string, string>> {
   const data: Record<string, string> = {};
-  const readStdin = async (): Promise<string> => {
-    const chunks: Buffer[] = [];
-    for await (const c of process.stdin) chunks.push(c as Buffer);
-    return Buffer.concat(chunks).toString("utf8").trim();
-  };
+  const readStdin = readSecretFromStdin;
 
   const apiKey = values["api-key"] as string | undefined;
   const authToken = values["auth-token"] as string | undefined;
@@ -160,6 +166,7 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
       agent: { type: "string" },
       name: { type: "string" },
       data: { type: "string", multiple: true, default: [] },
+      "data-stdin": { type: "boolean", default: false },
       "api-key": { type: "string" },
       "auth-token": { type: "string" },
       "auth-json": { type: "string" },
@@ -220,27 +227,27 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
 
 /**
  * Adds a named app (service) connection. Scope is tenant-wide by default, or
- * agent-bound when --agent <id> is given. Secret material comes from one or more
- * --data k=v pairs and is never echoed back.
+ * agent-bound when --agent <id> is given. Secret material comes from newline
+ * separated key=value pairs on stdin (--data-stdin, preferred) or from --data
+ * k=v flags (legacy, exposes the secret in argv), and is never echoed back.
  */
 async function addApp(ctx: CliContext, values: Record<string, unknown>): Promise<void> {
   const integration = (values.integration as string | undefined) ?? (values.vendor as string | undefined);
   const name = values.name as string | undefined;
   if (!integration || !name) {
     throw new Error(
-      "usage: onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default]",
+      "usage: onegate connections add --kind app --integration <id> --name <n> (--data-stdin | --data k=v [--data k=v...]) [--agent <id>] [--default]",
     );
   }
   const pairs = (values.data as string[]) ?? [];
-  if (!pairs.length) {
-    throw new Error("at least one --data k=v is required for an app connection");
+  const fromStdin = values["data-stdin"] === true;
+  rejectDuplicateSecretInput("--data", "--data-stdin", pairs.length > 0, fromStdin);
+  if (!fromStdin && !pairs.length) {
+    throw new Error(
+      "at least one --data k=v is required for an app connection (prefer --data-stdin, --data exposes the secret in ps and shell history)",
+    );
   }
-  const data: Record<string, string> = {};
-  for (const p of pairs) {
-    const eq = p.indexOf("=");
-    if (eq < 1) throw new Error(`--data must be key=value, got "${p}"`);
-    data[p.slice(0, eq)] = p.slice(eq + 1);
-  }
+  const data = fromStdin ? await readDataPairsFromStdin() : parseDataPairs(pairs);
   const conn = (await ctx.client().post("/api/connections", {
     kind: "app",
     vendor: integration,

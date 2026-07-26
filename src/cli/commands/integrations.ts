@@ -2,16 +2,26 @@
  * M3: integrations (list + OAuth connect URL) and credentials (set/rm).
  *
  *   onegate integrations list
- *   onegate integrations connect <id> --client-id X --client-secret Y --redirect-base URL [--scopes a,b]
- *   onegate credentials set <integrationId> --name N --data k=v [--data k=v...]
+ *   onegate integrations connect <id> --client-id X --client-secret-stdin --redirect-base URL [--scopes a,b]
+ *   onegate credentials set <integrationId> --name N --data-stdin [key]
  *   onegate credentials rm <integrationId>
  *
  * OAuth connect is browser-only by design: the CLI starts the flow and prints
  * the URL for the operator to open. It never completes OAuth headlessly.
+ *
+ * Secret material should be piped in via the --*-stdin flags. The legacy
+ * argv-bearing forms (--client-secret, --data k=v) still work but expose the
+ * secret in `ps`, /proc/<pid>/cmdline and shell history.
  */
 
 import { parseArgs } from "node:util";
 import { emit, table } from "../output.js";
+import {
+  parseDataPairs,
+  readDataPairsFromStdin,
+  readRequiredSecretFromStdin,
+  rejectDuplicateSecretInput,
+} from "../secret-input.js";
 import type { CliContext } from "../context.js";
 
 interface IntegrationView {
@@ -75,6 +85,7 @@ async function connect(ctx: CliContext, args: string[]): Promise<void> {
     options: {
       "client-id": { type: "string" },
       "client-secret": { type: "string" },
+      "client-secret-stdin": { type: "boolean", default: false },
       "redirect-base": { type: "string" },
       scopes: { type: "string" },
     },
@@ -82,12 +93,22 @@ async function connect(ctx: CliContext, args: string[]): Promise<void> {
   const id = positionals[0];
   if (!id || !values["client-id"] || !values["redirect-base"]) {
     throw new Error(
-      "usage: onegate integrations connect <id> --client-id X --client-secret Y --redirect-base URL [--scopes a,b]",
+      "usage: onegate integrations connect <id> --client-id X (--client-secret-stdin | --client-secret Y) --redirect-base URL [--scopes a,b]",
     );
   }
+  rejectDuplicateSecretInput(
+    "--client-secret",
+    "--client-secret-stdin",
+    values["client-secret"] !== undefined,
+    values["client-secret-stdin"] === true,
+  );
+  const clientSecret =
+    values["client-secret-stdin"] === true
+      ? await readRequiredSecretFromStdin("client secret")
+      : ((values["client-secret"] as string | undefined) ?? "");
   const body: Record<string, unknown> = {
     clientId: values["client-id"],
-    clientSecret: values["client-secret"] ?? "",
+    clientSecret,
     redirectBase: values["redirect-base"],
   };
   if (values.scopes) {
@@ -178,20 +199,24 @@ async function credentialsSet(ctx: CliContext, args: string[]): Promise<void> {
     options: {
       name: { type: "string" },
       data: { type: "string", multiple: true, default: [] },
+      "data-stdin": { type: "boolean", default: false },
     },
   });
   const integrationId = positionals[0];
   if (!integrationId) {
-    throw new Error("usage: onegate credentials set <integrationId> --name N --data k=v [--data k=v...]");
+    throw new Error(
+      "usage: onegate credentials set <integrationId> --name N (--data-stdin [key] | --data k=v [--data k=v...])",
+    );
   }
   const pairs = values.data as string[];
-  if (!pairs.length) throw new Error("at least one --data k=v is required");
-  const data: Record<string, string> = {};
-  for (const p of pairs) {
-    const eq = p.indexOf("=");
-    if (eq < 1) throw new Error(`--data must be key=value, got "${p}"`);
-    data[p.slice(0, eq)] = p.slice(eq + 1);
+  const fromStdin = values["data-stdin"] === true;
+  rejectDuplicateSecretInput("--data", "--data-stdin", pairs.length > 0, fromStdin);
+  if (!fromStdin && !pairs.length) {
+    throw new Error("at least one --data k=v is required (prefer --data-stdin, --data exposes the secret in ps and shell history)");
   }
+  // `--data-stdin [key]` may name a sole key, letting the caller pipe the raw
+  // secret with no key=value framing at all.
+  const data = fromStdin ? await readDataPairsFromStdin(positionals[1]) : parseDataPairs(pairs);
   const res = (await ctx.client().put(`/api/credentials/${encodeURIComponent(integrationId)}`, {
     name: values.name ?? integrationId,
     data,
