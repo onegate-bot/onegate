@@ -32,6 +32,8 @@ let caPem: string;
 /** x-api-key values the stub saw, in order. */
 let seenKeys: string[] = [];
 let seenBodies: string[] = [];
+/** Full request header sets the stub saw, in order. */
+let seenHeaders: http.IncomingHttpHeaders[] = [];
 
 let routedToken: string;
 let routedAgentId: string;
@@ -60,6 +62,7 @@ beforeAll(async () => {
         const key = String(req.headers["x-api-key"] ?? "");
         seenKeys.push(key);
         seenBodies.push(body);
+        seenHeaders.push(req.headers);
         if (key === "key-429") {
           res.writeHead(429, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "rate_limited" }));
@@ -142,6 +145,7 @@ function viaProxy(opts: {
   method?: string;
   path?: string;
   body?: string;
+  headers?: Record<string, string>;
 }): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const connectReq = http.request({
@@ -167,7 +171,7 @@ function viaProxy(opts: {
             host: LLM_HOST,
             method: opts.method ?? "POST",
             path: opts.path ?? "/v1/messages",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", ...(opts.headers ?? {}) },
           },
           (res) => {
             let body = "";
@@ -192,6 +196,7 @@ function viaProxy(opts: {
 function reset(): void {
   seenKeys = [];
   seenBodies = [];
+  seenHeaders = [];
 }
 
 describe("legacy back-compat (no LLM config)", () => {
@@ -420,5 +425,88 @@ describe("per-vendor strategy override", () => {
     }
     expect(seenKeys).toEqual(["key-good", "key-good", "key-good"]);
     expect(store.listAudit({ limit: 3 })[0].llmStrategy).toBe("fallback");
+  });
+});
+
+describe("upstream header hygiene on the LLM-routed path", () => {
+  it("strips x-onegate-connection so the internal routing control never reaches the vendor", async () => {
+    reset();
+    store.updateConnection(connA.id, { data: { apiKey: "key-good" } });
+    // Earlier failover tests leave persisted strategy counters behind, which
+    // would otherwise pin this agent to the backup connection.
+    store.clearLlmStrategyState(routedAgentId);
+    store.setAgentLlmConfig(routedAgentId, {
+      enabled: true,
+      strategy: "fallback",
+      connectionIds: [connA.id, connB.id],
+    });
+
+    const r = await viaProxy({
+      token: routedToken,
+      body: "{}",
+      headers: {
+        // OneGate-internal routing control. It selects a stored connection and
+        // is meaningless to the vendor, but it carries operator-meaningful
+        // connection ids/names, so it must not be forwarded upstream.
+        "x-onegate-connection": "conn_secret_tenant_name",
+        // A caller header with no special meaning must still pass through, so
+        // this proves the fix strips precisely, not broadly.
+        "x-passthrough-marker": "keep-me",
+      },
+    });
+
+    expect(r.status).toBe(200);
+    expect(seenHeaders).toHaveLength(1);
+    expect(seenHeaders[0]["x-onegate-connection"]).toBeUndefined();
+    expect(seenHeaders[0]["x-passthrough-marker"]).toBe("keep-me");
+  });
+
+  it("strips the caller's authorization header on the LLM-routed path", async () => {
+    reset();
+    store.updateConnection(connA.id, { data: { apiKey: "key-good" } });
+    store.clearLlmStrategyState(routedAgentId);
+    store.setAgentLlmConfig(routedAgentId, {
+      enabled: true,
+      strategy: "fallback",
+      connectionIds: [connA.id, connB.id],
+    });
+
+    const r = await viaProxy({
+      token: routedToken,
+      body: "{}",
+      headers: { authorization: "Bearer caller-token-should-not-leak" },
+    });
+
+    expect(r.status).toBe(200);
+    expect(seenHeaders).toHaveLength(1);
+    expect(seenHeaders[0].authorization).toBeUndefined();
+    // The injected vendor credential is what actually authenticates upstream.
+    expect(seenKeys).toEqual(["key-good"]);
+  });
+
+  it("also strips x-onegate-connection when the request fails over to the backup connection", async () => {
+    reset();
+    // Primary returns 429 so the request must fail over to the backup, giving
+    // two upstream attempts whose headers both have to be clean.
+    store.updateConnection(connA.id, { data: { apiKey: "key-429" } });
+    store.clearLlmStrategyState(routedAgentId);
+    store.setAgentLlmConfig(routedAgentId, {
+      enabled: true,
+      strategy: "fallback",
+      connectionIds: [connA.id, connB.id],
+    });
+
+    const r = await viaProxy({
+      token: routedToken,
+      body: "{}",
+      headers: { "x-onegate-connection": "conn_secret_tenant_name" },
+    });
+
+    expect(r.status).toBe(200);
+    // Both the failed attempt and the retry must be clean.
+    expect(seenHeaders).toHaveLength(2);
+    for (const h of seenHeaders) expect(h["x-onegate-connection"]).toBeUndefined();
+
+    store.updateConnection(connA.id, { data: { apiKey: "key-good" } });
   });
 });

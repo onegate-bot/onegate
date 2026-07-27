@@ -87,6 +87,35 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
+/**
+ * Request headers that must never reach an upstream vendor, on top of the
+ * hop-by-hop set.
+ *
+ * - `authorization`: the caller's client-side auth is replaced by the injected
+ *   credential; forwarding it would leak the agent's own token upstream.
+ * - `x-onegate-connection`: a OneGate-internal routing control that selects
+ *   which stored connection to use. It is consumed entirely by
+ *   `resolveConnectionForRequest` / the LLM route resolver and is meaningless
+ *   to the vendor, but it carries operator-meaningful connection ids and names
+ *   that would otherwise land in third-party request logs.
+ */
+const STRIPPED_REQUEST_HEADERS = new Set(["authorization", "x-onegate-connection"]);
+
+/**
+ * Builds the upstream request headers for a forwarded request: everything the
+ * client sent, minus hop-by-hop headers and the OneGate-internal headers above.
+ *
+ * Shared by both forward paths (the normal integration path and the LLM-routed
+ * path) so the two can never drift apart on what they leak upstream.
+ */
+function forwardHeaders(reqHeaders: http.IncomingHttpHeaders): http.IncomingHttpHeaders {
+  const headers: http.IncomingHttpHeaders = {};
+  for (const [k, v] of Object.entries(reqHeaders)) {
+    if (!HOP_BY_HOP.has(k) && !STRIPPED_REQUEST_HEADERS.has(k)) headers[k] = v;
+  }
+  return headers;
+}
+
 /** Cap for buffered bodies (integrations with `needsBody`). */
 function maxBufferedBody(): number {
   const fromEnv = Number(process.env.ONEGATE_MAX_BUFFERED_BODY);
@@ -975,11 +1004,7 @@ export class GatewayProxy {
       return;
     }
 
-    const headers: http.IncomingHttpHeaders = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (!HOP_BY_HOP.has(k) && k !== "authorization" && k !== "x-onegate-connection")
-        headers[k] = v;
-    }
+    const headers = forwardHeaders(req.headers);
     headers.host = host;
 
     // Integrations that sign the payload (e.g. AWS SigV4) need the body
@@ -1248,10 +1273,7 @@ export class GatewayProxy {
     // injection failure.
     const attempt = (conn: Connection): Promise<http.IncomingMessage> =>
       new Promise((resolve, reject) => {
-        const headers: http.IncomingHttpHeaders = {};
-        for (const [k, v] of Object.entries(req.headers)) {
-          if (!HOP_BY_HOP.has(k) && k !== "authorization") headers[k] = v;
-        }
+        const headers = forwardHeaders(req.headers);
         headers.host = host;
         const injectCtx = {
           headers,

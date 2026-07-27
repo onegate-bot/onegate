@@ -68,6 +68,43 @@ describe("extractRequestModel (pure)", () => {
     expect(extractRequestModel("/v1/messages", Buffer.from("{}"))).toBeNull();
     expect(extractRequestModel("/health", undefined)).toBeNull();
   });
+
+  it("percent-decodes a well-formed escape in the path model segment", () => {
+    expect(extractRequestModel("/v1beta/models/gemini%2Dtest:generateContent", undefined)).toBe(
+      "gemini-test",
+    );
+  });
+
+  // The documented contract on extractRequestModel is "Never throws", and the
+  // LLM handler calls it on the hot request path without a try/catch. Malformed
+  // percent-escapes survive canonicalization (policy's decodeOnce preserves
+  // them by design rather than throwing), so they reach this function verbatim.
+  it("never throws on malformed percent-escapes in the path", () => {
+    const malformed = [
+      "/v1beta/models/%:generateContent",
+      "/v1beta/models/%%3AgenerateContent",
+      "/v1beta/models/%zz:generateContent",
+      "/v1beta/models/%E0%A4:generateContent",
+      "/v1beta/models/%",
+    ];
+    for (const path of malformed) {
+      expect(() => extractRequestModel(path, undefined)).not.toThrow();
+    }
+  });
+
+  it("falls back to the raw matched segment when the escape is malformed", () => {
+    // The canonicalized form of "/v1beta/models/%%3AgenerateContent": policy's
+    // decodeOnce turns %3A into ":" and leaves the stray "%" as a literal.
+    expect(extractRequestModel("/v1beta/models/%:generateContent", undefined)).toBe("%");
+    expect(extractRequestModel("/v1beta/models/gemini%zz:generateContent", undefined)).toBe(
+      "gemini%zz",
+    );
+  });
+
+  it("still prefers a valid body model when the path is malformed", () => {
+    const body = Buffer.from(JSON.stringify({ model: "claude-opus-4-8" }));
+    expect(extractRequestModel("/v1beta/models/%:generateContent", body)).toBe("claude-opus-4-8");
+  });
 });
 
 describe("usageFromObject / usageFromJson (pure)", () => {
