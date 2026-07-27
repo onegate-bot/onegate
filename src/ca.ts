@@ -122,7 +122,13 @@ export class Ca {
     // sanitized on-disk filename.
     const leaf = this.mintLeaf(host.toLowerCase());
     writeFileSync(diskCert, leaf.cert);
-    writeFileSync(diskKey, leaf.key);
+    // Create the private key 0600 in the same syscall as the write: passing the
+    // mode later via chmodSync leaves a window where the file exists at
+    // umask-default (typically 0644) and any local process can open a handle
+    // that stays readable after the chmod. The chmodSync below is belt and
+    // braces -- writeFileSync's mode only applies when the file is created, so
+    // it does not tighten a pre-existing (e.g. previously 0644) key file.
+    writeFileSync(diskKey, leaf.key, { mode: 0o600 });
     chmodSync(diskKey, 0o600);
     this.cache.set(key, leaf);
     return leaf;
@@ -230,7 +236,10 @@ export function initCa(dataDir: string, commonName = "OneGate Root CA"): Ca {
   mkdirSync(dataDir, { recursive: true });
   const root = makeRootCa(commonName);
   writeFileSync(p.certPath, root.cert);
-  writeFileSync(p.keyPath, root.key);
+  // Same reasoning as leafFor: create the root key 0600 atomically rather than
+  // relying on a follow-up chmod. This key signs every MITM leaf, so a reader
+  // who wins the race can forge certificates for any intercepted host.
+  writeFileSync(p.keyPath, root.key, { mode: 0o600 });
   chmodSync(p.keyPath, 0o600);
   return new Ca(root.cert, root.key, p.certsDir);
 }
