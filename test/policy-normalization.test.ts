@@ -78,10 +78,67 @@ describe("normalizeRequestPath", () => {
     expect(normalizeRequestPath("/repos/onegate%2")).toBe("/repos/onegate%2");
   });
 
-  it("is idempotent", () => {
+  it("is stable on a path that is already fully canonical", () => {
     const once = normalizeRequestPath("//repos/x/../onegate-bot%2Fonegate/pulls");
     expect(once).toBe(CANONICAL);
     expect(normalizeRequestPath(once)).toBe(CANONICAL);
+  });
+
+  // Regression guard: normalizeRequestPath is NOT idempotent in general, because
+  // decodeOnce peels exactly ONE percent-decode layer per call. Nothing may
+  // assume otherwise -- in particular ruleMatches must never re-normalize, or a
+  // double-encoded traversal resolves for policy but not for the forwarded
+  // request. This documents the non-idempotence so it cannot silently regress
+  // into a "safe to call twice" assumption.
+  it("is NOT idempotent on a double-encoded traversal (one decode layer per call)", () => {
+    const raw = "/repos/onegate-bot/onegate/%252e%252e/x";
+    const once = normalizeRequestPath(raw);
+    const twice = normalizeRequestPath(once);
+    // First pass peels %25 -> %, leaving the dot-segments still encoded, so the
+    // traversal does NOT resolve. This is the path forwarded upstream.
+    expect(once).toBe("/repos/onegate-bot/onegate/%2e%2e/x");
+    // A second pass decodes a layer the proxy never applied, escaping the repo.
+    expect(twice).toBe("/repos/onegate-bot/x");
+    expect(twice).not.toBe(once);
+  });
+});
+
+describe("ruleMatches treats req.path as already canonical (no double-decode)", () => {
+  const deny = rule({
+    integrationId: "github",
+    methods: ["*"],
+    pathGlob: DENY_GLOB,
+    effect: "deny",
+  });
+
+  // The proxy normalizes ONCE at the edge and forwards THAT path upstream. The
+  // policy engine must match the very same string, otherwise the pin is evaded.
+  const doubleEncoded = [
+    "/repos/onegate-bot/onegate/%252e%252e/x",
+    "/repos/onegate-bot/onegate/%252e%252e/%252e%252e/etc",
+    "/repos/onegate-bot/onegate/%252E%252E/x",
+  ];
+
+  for (const raw of doubleEncoded) {
+    it(`still denies the forwarded form of ${raw}`, () => {
+      const forwarded = normalizeRequestPath(raw);
+      // The upstream request stays inside the pinned repo subtree...
+      expect(forwarded.startsWith("/repos/onegate-bot/onegate/")).toBe(true);
+      // ...so the deny rule pinned to that subtree must fire on it.
+      expect(
+        ruleMatches(deny, { integrationId: "github", method: "GET", path: forwarded }),
+      ).toBe(true);
+    });
+  }
+
+  it("does not re-decode a single-encoded literal segment", () => {
+    // %252Fb is a literal "%2Fb" segment after one decode. Re-normalizing would
+    // turn it into a path separator and change which rule matches.
+    const forwarded = normalizeRequestPath("/repos/onegate-bot/onegate/a%252Fb");
+    expect(forwarded).toBe("/repos/onegate-bot/onegate/a%2Fb");
+    expect(
+      ruleMatches(deny, { integrationId: "github", method: "GET", path: forwarded }),
+    ).toBe(true);
   });
 });
 
@@ -104,7 +161,12 @@ describe("ruleMatches with canonicalization (deny-glob evasion is closed)", () =
 
   for (const p of evasions) {
     it(`matches the deny glob for equivalent path ${p}`, () => {
-      expect(ruleMatches(deny, { integrationId: "github", method: "GET", path: p })).toBe(true);
+      // Model the real pipeline: the proxy canonicalizes once at the edge, then
+      // policy matches that exact (forwarded) path.
+      const forwarded = normalizeRequestPath(p);
+      expect(ruleMatches(deny, { integrationId: "github", method: "GET", path: forwarded })).toBe(
+        true,
+      );
     });
   }
 
@@ -140,7 +202,11 @@ describe("evaluate: encoded/dot-segment/double-slash variants of a pinned path a
 
   for (const p of denied) {
     it(`denies ${p}`, () => {
-      const v = evaluate(agent(), rules, { integrationId: "github", method: "GET", path: p });
+      const v = evaluate(agent(), rules, {
+        integrationId: "github",
+        method: "GET",
+        path: normalizeRequestPath(p),
+      });
       expect(v.effect).toBe("deny");
       expect(v.ruleId).toBe("rl_deny");
     });
@@ -150,8 +216,40 @@ describe("evaluate: encoded/dot-segment/double-slash variants of a pinned path a
     const v = evaluate(agent(), rules, {
       integrationId: "github",
       method: "GET",
-      path: "/repos/zivisaiah/nanoclaw/pulls?state=open",
+      path: normalizeRequestPath("/repos/zivisaiah/nanoclaw/pulls?state=open"),
     });
     expect(v.effect).toBe("allow");
+  });
+
+  // End-to-end regression for the double-encoding deny bypass. Before the fix,
+  // evaluate() re-normalized and saw "/repos/onegate-bot/x" (outside the pin) so
+  // it ALLOWED, while the proxy forwarded a path still inside the pinned repo.
+  it("denies a double-encoded traversal whose forwarded path stays in the pinned repo", () => {
+    const rawTarget = "/repos/onegate-bot/onegate/%252e%252e/x";
+    const forwarded = normalizeRequestPath(rawTarget);
+
+    // What the vendor actually receives is inside the pinned subtree.
+    expect(forwarded).toBe("/repos/onegate-bot/onegate/%2e%2e/x");
+
+    const v = evaluate(agent(), rules, {
+      integrationId: "github",
+      method: "GET",
+      path: forwarded,
+    });
+    expect(v.effect).toBe("deny");
+    expect(v.ruleId).toBe("rl_deny");
+  });
+
+  it("denies a multi-segment double-encoded traversal", () => {
+    const forwarded = normalizeRequestPath(
+      "/repos/onegate-bot/onegate/%252e%252e/%252e%252e/etc",
+    );
+    const v = evaluate(agent(), rules, {
+      integrationId: "github",
+      method: "GET",
+      path: forwarded,
+    });
+    expect(v.effect).toBe("deny");
+    expect(v.ruleId).toBe("rl_deny");
   });
 });

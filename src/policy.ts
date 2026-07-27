@@ -153,10 +153,18 @@ export function globToRegExp(glob: string): RegExp {
 export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   if (rule.integrationId !== "*" && rule.integrationId !== req.integrationId) return false;
   if (!rule.methods.includes("*") && !rule.methods.includes(req.method.toUpperCase())) return false;
-  // Match against the canonical path portion. normalizeRequestPath is
-  // idempotent on an already-canonical path, so this is safe whether the caller
-  // (the proxy) pre-normalized or passed a raw target.
-  const path = normalizeRequestPath(req.path).split("?")[0];
+  // `req.path` is REQUIRED to be already canonical: callers must pass the exact
+  // path the proxy will forward upstream (see normalizeRequestPath, applied once
+  // at the proxy edge). Only the query string is stripped here.
+  //
+  // Do NOT re-normalize. normalizeRequestPath is deliberately NOT idempotent:
+  // decodeOnce peels exactly one percent-decode layer per call, so a second pass
+  // decodes a further layer that the proxy never applied and never forwards. A
+  // double-encoded traversal (`/repos/a/b/%252e%252e/x`) forwards upstream as
+  // `/repos/a/b/%2e%2e/x` but would match here as `/repos/a/x`, escaping a deny
+  // glob pinned to `/repos/a/b/**` while the vendor still serves the pinned repo.
+  // Matching the forwarded path verbatim is what keeps that invariant true.
+  const path = req.path.split("?")[0];
   return globToRegExp(rule.pathGlob).test(path);
 }
 
