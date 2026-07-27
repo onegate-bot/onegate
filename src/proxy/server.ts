@@ -11,6 +11,7 @@
  *  - any other host → opaque passthrough tunnel (no MITM, no inspection).
  */
 
+import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -128,6 +129,13 @@ class BodyTooLargeError extends Error {
   }
 }
 
+/** A CONNECT passthrough destination that resolves somewhere internal. */
+class BlockedDestinationError extends Error {
+  constructor(target: string) {
+    super(`Passthrough to internal destination refused: ${target}`);
+  }
+}
+
 function readBody(req: http.IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -183,6 +191,71 @@ export function isValidConnectHost(host: string): boolean {
   if (!/^[a-z0-9.-]+$/i.test(host)) return false;
   if (host.includes("..")) return false;
   return true;
+}
+
+/**
+ * Hostnames that always name the local machine regardless of what the resolver
+ * says. `localhost` is normally a loopback A/AAAA record and would be caught by
+ * the resolved-address check below, but a poisoned or unusual resolver could
+ * map it elsewhere; either way an agent has no business tunnelling to it.
+ */
+const LOCAL_HOSTNAMES = new Set(["localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"]);
+
+/**
+ * True when `ip` is a literal address OneGate must never open a passthrough
+ * tunnel to. The gateway runs alongside private infrastructure (in the fleet
+ * deployment the OneGate admin API itself binds 172.17.0.1:8080), so an
+ * unrestricted CONNECT tunnel turns any authenticated agent into an SSRF pivot
+ * onto the admin plane, the docker bridge, and cloud metadata.
+ *
+ * Blocked: loopback (127/8, ::1), link-local (169.254/16, fe80::/10, which
+ * covers cloud metadata at 169.254.169.254), RFC1918 private (10/8, 172.16/12,
+ * 192.168/16), IPv6 unique-local (fc00::/7), CGNAT (100.64/10) and the
+ * unspecified addresses (0.0.0.0, ::). IPv4-mapped IPv6 forms
+ * (`::ffff:127.0.0.1`) are unwrapped first so they cannot smuggle a blocked v4
+ * address past the v6 checks.
+ *
+ * A non-address string returns false: this helper only judges IPs. Hostnames
+ * are handled by resolving them and re-checking the result (see resolveTarget).
+ */
+export function isBlockedDestination(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (family === 0) return false;
+
+  if (family === 6) {
+    const v6 = ip.toLowerCase().split("%")[0]; // strip any zone index
+    // Unwrap IPv4-mapped/compatible forms (::ffff:127.0.0.1, ::127.0.0.1) and
+    // re-judge as IPv4, otherwise ::ffff:169.254.169.254 would sail through.
+    const mapped = /^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
+    if (mapped) return isBlockedDestination(mapped[1]);
+    if (v6 === "::1" || v6 === "::") return true;
+    if (/^fe[89ab]/.test(v6)) return true; // fe80::/10 link-local
+    if (/^f[cd]/.test(v6)) return true; // fc00::/7 unique-local
+    return false;
+  }
+
+  const octets = ip.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o))) return false;
+  const [a, b] = octets;
+  if (a === 0) return true; // 0.0.0.0/8 unspecified ("this network")
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 10) return true; // 10.0.0.0/8 private
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + metadata
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  return false;
+}
+
+/**
+ * Operator escape hatch. Some deployments genuinely need agents to tunnel to an
+ * internal host (a self-hosted vendor on the same LAN, for example). Blocked by
+ * default; set ONEGATE_ALLOW_INTERNAL_PASSTHROUGH=1 to opt back in to the old
+ * unrestricted behaviour.
+ */
+function internalPassthroughAllowed(): boolean {
+  const raw = process.env.ONEGATE_ALLOW_INTERNAL_PASSTHROUGH?.trim().toLowerCase();
+  return raw === "1" || raw === "true";
 }
 
 export class GatewayProxy {
@@ -299,9 +372,84 @@ export class GatewayProxy {
     this.terminate(agent, integration, host, port, socket, head);
   }
 
-  /** Opaque tunnel for hosts we have no integration for. */
+  /**
+   * Opaque tunnel for hosts we have no integration for.
+   *
+   * Because this path is a raw byte pipe there is no policy inspection of the
+   * inner protocol at all, so the destination address is the only thing we can
+   * enforce on. Everything internal is refused before net.connect (see
+   * isBlockedDestination); without that, an authenticated agent could CONNECT
+   * to 172.17.0.1:8080 (the admin API) or 169.254.169.254 (cloud metadata) and
+   * use the gateway as an SSRF pivot past the network segmentation that is
+   * supposed to keep agents off the admin plane.
+   *
+   * Hostnames are resolved and the resolved address is both checked and then
+   * dialled directly ("pinning"), so a DNS entry that flips between the check
+   * and the connect cannot land us on a blocked address (DNS rebinding).
+   */
   private passthrough(agent: Agent, host: string, port: number, socket: Duplex, head: Buffer): void {
-    const target = this.opts.upstreamLookup?.(host, port) ?? { host, port };
+    const override = this.opts.upstreamLookup?.(host, port);
+    if (override) {
+      // An upstreamLookup target is operator-sanctioned (it is how tests and
+      // operators deliberately redirect upstream to a local fixture), so it is
+      // dialled as given. The guard applies to agent-chosen destinations.
+      this.openTunnel(agent, host, override, socket, head);
+      return;
+    }
+    void this.resolveTarget(host, port).then(
+      (target) => this.openTunnel(agent, host, target, socket, head),
+      (err: Error) => {
+        if (err instanceof BlockedDestinationError) {
+          this.opts.store.audit({
+            agentId: agent.id,
+            agentName: agent.name,
+            host,
+            // The Decision union has no dedicated "blocked" value, so a
+            // gateway-side refusal is recorded as a deny (audit-meta already
+            // renders a null ruleId deny as "Blocked by OneGate").
+            decision: "deny",
+            status: 403,
+          });
+          this.log(`passthrough blocked ${agent.name} -> ${host}:${port} (${err.message})`);
+          socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+          return;
+        }
+        socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      },
+    );
+  }
+
+  /**
+   * Resolves a CONNECT destination to a concrete address to dial, rejecting
+   * with BlockedDestinationError when it points anywhere internal. An IP
+   * literal is judged directly; a hostname is resolved first and the resolved
+   * address is what we both judge and return, so the caller dials the exact
+   * address that passed the check.
+   */
+  private async resolveTarget(host: string, port: number): Promise<{ host: string; port: number }> {
+    if (internalPassthroughAllowed()) return { host, port };
+
+    if (net.isIP(host) !== 0) {
+      if (isBlockedDestination(host)) throw new BlockedDestinationError(host);
+      return { host, port };
+    }
+
+    if (LOCAL_HOSTNAMES.has(host.toLowerCase())) throw new BlockedDestinationError(host);
+
+    const { address } = await dns.promises.lookup(host);
+    if (isBlockedDestination(address)) throw new BlockedDestinationError(`${host} -> ${address}`);
+    return { host: address, port };
+  }
+
+  /** Dials an already-vetted destination and bridges the two sockets. */
+  private openTunnel(
+    agent: Agent,
+    host: string,
+    target: { host: string; port: number },
+    socket: Duplex,
+    head: Buffer,
+  ): void {
+    if (socket.destroyed) return;
     const upstream = net.connect(target.port, target.host, () => {
       this.opts.store.audit({
         agentId: agent.id,
