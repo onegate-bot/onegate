@@ -283,6 +283,147 @@ describe("leaf cache is bounded (unbounded-growth DoS)", () => {
   });
 });
 
+describe("leafForAsync (keygen off the event loop)", () => {
+  let asyncDir: string;
+  let asyncCa: Ca;
+
+  beforeAll(() => {
+    asyncDir = mkdtempSync(join(tmpdir(), "onegate-async-"));
+    asyncCa = initCa(asyncDir, "Async CA");
+  });
+
+  afterAll(() => {
+    rmSync(asyncDir, { recursive: true, force: true });
+  });
+
+  it("mints a leaf with the same fields as the sync path", async () => {
+    const leaf = await asyncCa.leafForAsync("api.github.com");
+    const cert = forge.pki.certificateFromPem(leaf.cert);
+    const root = forge.pki.certificateFromPem(asyncCa.rootPem);
+    expect(root.verify(cert)).toBe(true);
+    expect(cert.subject.getField("CN").value).toBe("api.github.com");
+    const san = cert.getExtension("subjectAltName") as { altNames: Array<{ value: string }> };
+    const names = san.altNames.map((a) => a.value);
+    expect(names).toContain("api.github.com");
+    expect(names).toContain("*.api.github.com");
+    // The AKI is load-bearing: OpenSSL 3.x strict clients reject a leaf without
+    // one, so the async path must not drop it.
+    const aki = cert.getExtension("authorityKeyIdentifier") as { value: string } | undefined;
+    expect(aki).toBeDefined();
+    expect(aki!.value.includes(root.generateSubjectKeyIdentifier().getBytes())).toBe(true);
+    // Same PKCS#1 on-disk key format the sync path has always written.
+    expect(leaf.key.startsWith("-----BEGIN RSA PRIVATE KEY-----")).toBe(true);
+  });
+
+  it("the async leaf is accepted by node:tls when the root is trusted", async () => {
+    const leaf = await asyncCa.leafForAsync("localhost");
+    const server = tls.createServer({ cert: leaf.cert, key: leaf.key }, (sock) => sock.end("ok"));
+    await new Promise<void>((res) => server.listen(0, "127.0.0.1", res));
+    const port = (server.address() as { port: number }).port;
+    const verified = await new Promise<boolean>((resolve) => {
+      const sock = tls.connect(
+        { host: "127.0.0.1", port, servername: "localhost", ca: asyncCa.rootPem },
+        () => {
+          resolve(sock.authorized);
+          sock.end();
+        },
+      );
+      sock.on("error", () => resolve(false));
+    });
+    server.close();
+    expect(verified).toBe(true);
+  });
+
+  it("coalesces a parallel burst for one new host into a single keygen", async () => {
+    // This is the DoS-relevant property: without coalescing, N simultaneous
+    // CONNECTs to one never-before-seen host cost N RSA keygens.
+    const spied = asyncCa as unknown as { generateLeafKeys: () => Promise<unknown> };
+    const original = spied.generateLeafKeys.bind(asyncCa);
+    let calls = 0;
+    spied.generateLeafKeys = () => {
+      calls++;
+      return original();
+    };
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () => asyncCa.leafForAsync("burst.googleapis.com")),
+      );
+      expect(calls).toBe(1);
+      // Every caller gets the identical leaf, not eight racing ones.
+      for (const r of results) expect(r.cert).toBe(results[0].cert);
+    } finally {
+      spied.generateLeafKeys = original;
+    }
+  });
+
+  it("serves cache hits without generating a new key", async () => {
+    const first = await asyncCa.leafForAsync("cached.example.com");
+    const spied = asyncCa as unknown as { generateLeafKeys: () => Promise<unknown> };
+    const original = spied.generateLeafKeys.bind(asyncCa);
+    let calls = 0;
+    spied.generateLeafKeys = () => {
+      calls++;
+      return original();
+    };
+    try {
+      const second = await asyncCa.leafForAsync("cached.example.com");
+      // A case variant collapses onto the same cache key, still no keygen.
+      const third = await asyncCa.leafForAsync("Cached.Example.COM");
+      expect(calls).toBe(0);
+      expect(second.cert).toBe(first.cert);
+      expect(third.cert).toBe(first.cert);
+    } finally {
+      spied.generateLeafKeys = original;
+    }
+  });
+
+  it("reuses a leaf minted synchronously, and vice versa", async () => {
+    const sync = asyncCa.leafFor("mixed.example.com");
+    expect((await asyncCa.leafForAsync("mixed.example.com")).cert).toBe(sync.cert);
+    const fromAsync = await asyncCa.leafForAsync("mixed2.example.com");
+    expect(asyncCa.leafFor("mixed2.example.com").cert).toBe(fromAsync.cert);
+  });
+
+  it("a failed mint rejects the caller and does not wedge later attempts", async () => {
+    const spied = asyncCa as unknown as { generateLeafKeys: () => Promise<unknown> };
+    const original = spied.generateLeafKeys.bind(asyncCa);
+    spied.generateLeafKeys = () => Promise.reject(new Error("entropy exhausted"));
+    try {
+      await expect(asyncCa.leafForAsync("fails.example.com")).rejects.toThrow(/entropy exhausted/);
+    } finally {
+      spied.generateLeafKeys = original;
+    }
+    // The in-flight entry was cleared on failure, so a retry mints normally
+    // instead of forever awaiting a promise that already rejected.
+    const retry = await asyncCa.leafForAsync("fails.example.com");
+    expect(forge.pki.certificateFromPem(retry.cert).subject.getField("CN").value).toBe(
+      "fails.example.com",
+    );
+  });
+
+  it("persists the leaf to disk with a 0600 private key", async () => {
+    await asyncCa.leafForAsync("persisted.example.com");
+    const certsDir = caPaths(asyncDir).certsDir;
+    expect(existsSync(join(certsDir, "persisted.example.com.crt"))).toBe(true);
+    const keyPath = join(certsDir, "persisted.example.com.key");
+    expect(existsSync(keyPath)).toBe(true);
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("does not block the event loop while a key is generated", async () => {
+    // A timer scheduled before the mint must still fire promptly: with a
+    // synchronous keygen the whole loop, timers included, stalls until it ends.
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 1);
+    try {
+      await asyncCa.leafForAsync("nonblocking.googleapis.com");
+    } finally {
+      clearInterval(timer);
+    }
+    expect(ticks).toBeGreaterThan(0);
+  });
+});
+
 describe("loadCa", () => {
   it("throws a helpful error when no CA exists", () => {
     expect(() => loadCa(join(tmpdir(), "onegate-nonexistent"))).toThrow(/onegate init/);

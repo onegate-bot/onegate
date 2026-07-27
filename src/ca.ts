@@ -18,7 +18,11 @@ import {
   statSync,
   rmSync,
 } from "node:fs";
+import { generateKeyPair as generateKeyPairCb } from "node:crypto";
+import { promisify } from "node:util";
 import { join } from "node:path";
+
+const generateKeyPairAsync = promisify(generateKeyPairCb);
 
 const ROOT_DAYS = 3650;
 const LEAF_DAYS = 365;
@@ -126,6 +130,18 @@ export class Ca {
   private certsDir: string;
   /** Hard cap on distinct cached hosts, in memory and on disk. */
   private readonly maxEntries: number;
+  /**
+   * Mints currently in flight, keyed by `hostCacheKey(host)`.
+   *
+   * A burst of parallel CONNECTs to the same never-before-seen host would
+   * otherwise each miss the cache and start its own RSA keygen, so N tunnels to
+   * one new host cost N keygens where one suffices. Every caller after the
+   * first awaits the pending promise instead, which both collapses the CPU cost
+   * and stops the racing writers from clobbering each other's on-disk pair.
+   * Entries are removed as soon as the mint settles, success or failure, so a
+   * failed mint never poisons later attempts.
+   */
+  private inflight = new Map<string, Promise<LeafCert>>();
 
   constructor(rootCertPem: string, rootKeyPem: string, certsDir: string) {
     this.rootPem = rootCertPem;
@@ -227,16 +243,11 @@ export class Ca {
   }
 
   /**
-   * Returns a leaf certificate for `host`, minting and caching it if needed.
-   * The cert covers both `host` and `*.host` so e.g. one cert serves
-   * `googleapis.com` subdomain lookups when the proxy normalizes hosts.
+   * Resolves `host` from the in-memory LRU or the on-disk cache, without ever
+   * minting. Returns null on a full miss. Shared by the sync and async entry
+   * points so both see exactly the same cache semantics.
    */
-  leafFor(host: string): LeafCert {
-    // Normalize + sanitize the host before it touches any Map key or disk path.
-    // `key` is lowercased so case variants share one leaf; the filesystem name
-    // additionally strips path separators so a crafted host can never escape
-    // certsDir (defense in depth behind the CONNECT-host guard in the proxy).
-    const key = hostCacheKey(host);
+  private cachedLeaf(key: string): LeafCert | null {
     const cached = this.cache.get(key);
     if (cached) {
       // A hit makes this the most-recently-used entry, so a hot host is never
@@ -254,23 +265,82 @@ export class Ca {
         return fromDisk;
       }
     }
+    return null;
+  }
 
-    // Mint against the lowercased host so the cert Subject/SAN is the canonical
-    // hostname (TLS SNI matching is case-insensitive), independent of the
-    // sanitized on-disk filename.
-    const leaf = this.mintLeaf(host.toLowerCase());
-    writeFileSync(diskCert, leaf.cert);
+  /** Persists a freshly minted leaf and installs it in the bounded caches. */
+  private persist(key: string, leaf: LeafCert): void {
+    writeFileSync(join(this.certsDir, `${key}.crt`), leaf.cert);
     // Create the private key 0600 in the same syscall as the write: passing the
     // mode later via chmodSync leaves a window where the file exists at
     // umask-default (typically 0644) and any local process can open a handle
     // that stays readable after the chmod. The chmodSync below is belt and
     // braces -- writeFileSync's mode only applies when the file is created, so
     // it does not tighten a pre-existing (e.g. previously 0644) key file.
+    const diskKey = join(this.certsDir, `${key}.key`);
     writeFileSync(diskKey, leaf.key, { mode: 0o600 });
     chmodSync(diskKey, 0o600);
     this.store(key, leaf);
     // Bound the directory itself, which outlives this process's LRU.
     this.pruneDisk(key);
+  }
+
+  /**
+   * Returns a leaf certificate for `host`, minting and caching it if needed,
+   * without ever blocking the event loop on RSA key generation.
+   *
+   * This is the entry point the proxy's CONNECT path uses. Key generation is
+   * the expensive part of a mint (tens to hundreds of milliseconds of pure
+   * arithmetic), and running it synchronously on the single Node thread stalls
+   * every other agent's request, LLM route and tunnel for its full duration.
+   * Because an integration can claim a whole domain suffix, an authorized agent
+   * can steer the proxy into minting for unlimited distinct subdomains, each a
+   * guaranteed cache miss, turning that stall into a fleet-wide denial of
+   * service. Generating off-thread keeps the proxy responsive while a mint runs.
+   */
+  async leafForAsync(host: string): Promise<LeafCert> {
+    // Normalize + sanitize the host before it touches any Map key or disk path.
+    // `key` is lowercased so case variants share one leaf; the filesystem name
+    // additionally strips path separators so a crafted host can never escape
+    // certsDir (defense in depth behind the CONNECT-host guard in the proxy).
+    const key = hostCacheKey(host);
+    const cached = this.cachedLeaf(key);
+    if (cached) return cached;
+
+    // Coalesce: a parallel burst to the same new host shares one keygen.
+    const pending = this.inflight.get(key);
+    if (pending) return pending;
+
+    // Mint against the lowercased host so the cert Subject/SAN is the canonical
+    // hostname (TLS SNI matching is case-insensitive), independent of the
+    // sanitized on-disk filename.
+    const mint = this.mintLeafAsync(host.toLowerCase())
+      .then((leaf) => {
+        this.persist(key, leaf);
+        return leaf;
+      })
+      .finally(() => {
+        this.inflight.delete(key);
+      });
+    this.inflight.set(key, mint);
+    return mint;
+  }
+
+  /**
+   * Synchronous leaf lookup, kept for callers outside the request hot path
+   * (CLI, tests, one-shot tooling) where blocking is harmless.
+   *
+   * Prefer `leafForAsync` anywhere a stalled event loop would be felt: on a
+   * cache miss this generates the RSA key inline and blocks the whole process
+   * until it completes.
+   */
+  leafFor(host: string): LeafCert {
+    const key = hostCacheKey(host);
+    const cached = this.cachedLeaf(key);
+    if (cached) return cached;
+
+    const leaf = this.mintLeaf(host.toLowerCase());
+    this.persist(key, leaf);
     return leaf;
   }
 
@@ -287,8 +357,43 @@ export class Ca {
     }
   }
 
+  /**
+   * Generates a leaf keypair off the event loop.
+   *
+   * node:crypto delegates to OpenSSL on libuv's threadpool, so the generation
+   * neither blocks the main thread nor competes with it, and native OpenSSL is
+   * several times faster than node-forge's pure-JS implementation. The PEMs are
+   * handed back to node-forge purely to assemble and sign the certificate, and
+   * re-serializing the private key through forge preserves the exact PKCS#1
+   * ("RSA PRIVATE KEY") on-disk format earlier releases wrote, so existing
+   * cached leaves and anything reading them stay compatible.
+   */
+  private async generateLeafKeys(): Promise<forge.pki.rsa.KeyPair> {
+    const { publicKey, privateKey } = await generateKeyPairAsync("rsa", {
+      modulusLength: LEAF_BITS,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    return {
+      publicKey: forge.pki.publicKeyFromPem(publicKey),
+      privateKey: forge.pki.privateKeyFromPem(privateKey),
+    };
+  }
+
+  private async mintLeafAsync(host: string): Promise<LeafCert> {
+    return this.assembleLeaf(host, await this.generateLeafKeys());
+  }
+
   private mintLeaf(host: string): LeafCert {
-    const keys = forge.pki.rsa.generateKeyPair(LEAF_BITS);
+    return this.assembleLeaf(host, forge.pki.rsa.generateKeyPair(LEAF_BITS));
+  }
+
+  /**
+   * Builds and signs the leaf certificate around an already-generated keypair.
+   * Shared by both mint paths so the sync and async routes emit byte-identical
+   * cert structures (same fields, SANs and extensions).
+   */
+  private assembleLeaf(host: string, keys: forge.pki.rsa.KeyPair): LeafCert {
     const cert = forge.pki.createCertificate();
     cert.publicKey = keys.publicKey;
     cert.serialNumber = randomSerial();
