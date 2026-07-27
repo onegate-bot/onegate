@@ -56,7 +56,19 @@ export function extractRequestModel(path: string, body: Buffer | undefined): str
   // Gemini path form: /v1beta/models/<model>:generateContent (or :streamGenerateContent).
   const match = /\/models\/([^/:?#]+)/.exec(path);
   if (match) {
-    const m = decodeURIComponent(match[1]).trim();
+    // decodeURIComponent throws URIError on a malformed escape (a `%` not
+    // followed by two hex digits). Such paths DO reach here: the canonicalizer
+    // preserves malformed escapes as literals rather than rejecting them. This
+    // function is documented as never throwing and is called on the hot request
+    // path without a try/catch, so fall back to the raw matched segment instead
+    // of propagating. Well-formed input decodes exactly as before.
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(match[1]);
+    } catch {
+      decoded = match[1];
+    }
+    const m = decoded.trim();
     if (m) return m;
   }
   return null;
