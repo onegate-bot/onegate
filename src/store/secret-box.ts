@@ -84,14 +84,36 @@ export function loadSecretKey(dbPath: string): Buffer {
 
   const dir = dirname(dbPath);
   const keyPath = join(dir, "db-secret.key");
-  if (existsSync(keyPath)) {
-    const buf = decodeKey(readFileSync(keyPath, "utf8"));
-    if (buf.length !== 32) throw new Error(`${keyPath} is corrupt (expected a 32-byte key)`);
-    return buf;
-  }
+  if (existsSync(keyPath)) return readKeyFile(keyPath);
+
   const key = randomBytes(32);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(keyPath, key.toString("base64"), { mode: 0o600 });
+  // `wx` (O_CREAT|O_EXCL) is load-bearing, do NOT relax it to a plain write.
+  // The proxy server and the CLI are separate processes that each build their
+  // own Store against the same data dir, so on an empty data dir (first boot,
+  // or after the key file is lost) they can both fall through the existsSync
+  // check above. Without O_EXCL each would generate a DIFFERENT key, seal rows
+  // with its own in-memory key, and the last writeFileSync would silently
+  // overwrite the other's key file. Rows sealed under the losing key then fail
+  // AES-GCM auth forever: permanent, silent credential loss with no error at
+  // write time. With `wx` exactly one generated key can ever reach disk, and
+  // the EEXIST loser re-reads the winner's file so both processes converge on
+  // the same key. The re-read goes through readKeyFile, which validates length
+  // and throws on a corrupt file rather than generating yet another key --
+  // that fallback is the very hazard this branch exists to remove.
+  try {
+    writeFileSync(keyPath, key.toString("base64"), { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    return readKeyFile(keyPath);
+  }
   chmodSync(keyPath, 0o600);
   return key;
+}
+
+/** Reads and validates a persisted key file. Throws if it is not a 32-byte key. */
+function readKeyFile(keyPath: string): Buffer {
+  const buf = decodeKey(readFileSync(keyPath, "utf8"));
+  if (buf.length !== 32) throw new Error(`${keyPath} is corrupt (expected a 32-byte key)`);
+  return buf;
 }
