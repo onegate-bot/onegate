@@ -198,6 +198,15 @@ describe("evaluate: encoded/dot-segment/double-slash variants of a pinned path a
     "/repos%2Fonegate-bot%2Fonegate%2Fpulls",
     "//repos/onegate-bot//onegate/pulls",
     "/repos/x/../onegate-bot/onegate/pulls",
+    // Re-casing: GitHub resolves owner/repo case-insensitively and serves the
+    // pinned repo, so the deny must fire on these too (normalization preserves
+    // case by design; the deny glob is what folds it).
+    "/repos/OneGate-Bot/onegate/pulls",
+    "/repos/onegate-bot/OneGate/pulls",
+    "/repos/ONEGATE-BOT/ONEGATE/pulls",
+    // Re-casing combined with the encoding evasions above.
+    "/repos%2FOneGate-Bot%2FOnegate%2Fpulls",
+    "/repos/x/../OneGate-Bot/onegate/pulls",
   ];
 
   for (const p of denied) {

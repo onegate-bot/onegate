@@ -121,6 +121,12 @@ export function normalizeRequestPath(target: string): string {
   return canonical + query;
 }
 
+/**
+ * Compiled-glob cache. The key MUST carry the case mode as well as the glob
+ * text: the same glob compiles to two different regexes (with and without the
+ * `i` flag), and keying on the glob alone would serve whichever variant was
+ * compiled first to both callers.
+ */
 const globCache = new Map<string, RegExp>();
 
 /**
@@ -131,9 +137,13 @@ const globCache = new Map<string, RegExp>();
  * prefix `/x` and any sub-path `/x/...` (regex `^/x(/.*)?$`). This lets a
  * single rule cover a resource and everything beneath it. `**` anywhere else
  * (including a mid-path `/**`) keeps the plain "matches anything" behavior.
+ *
+ * `caseInsensitive` adds the `i` flag. It is used ONLY for deny rules — see the
+ * asymmetry note on ruleMatches.
  */
-export function globToRegExp(glob: string): RegExp {
-  let re = globCache.get(glob);
+export function globToRegExp(glob: string, caseInsensitive = false): RegExp {
+  const cacheKey = caseInsensitive ? `i:${glob}` : `s:${glob}`;
+  let re = globCache.get(cacheKey);
   if (re) return re;
   // Detect a trailing `/**` on an otherwise glob-free prefix segment so we can
   // make the trailing `/...` optional (covers the bare prefix too).
@@ -145,8 +155,8 @@ export function globToRegExp(glob: string): RegExp {
     .replace(/\*/g, "[^/]*")
     .replace(/\0/g, ".*");
   const escaped = trailing ? `${escapedBase}(/.*)?` : escapedBase;
-  re = new RegExp(`^${escaped}$`);
-  globCache.set(glob, re);
+  re = new RegExp(`^${escaped}$`, caseInsensitive ? "i" : "");
+  globCache.set(cacheKey, re);
   return re;
 }
 
@@ -165,7 +175,27 @@ export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   // glob pinned to `/repos/a/b/**` while the vendor still serves the pinned repo.
   // Matching the forwarded path verbatim is what keeps that invariant true.
   const path = req.path.split("?")[0];
-  return globToRegExp(rule.pathGlob).test(path);
+  // Case sensitivity is ASYMMETRIC by effect, and deliberately so. Do not
+  // "simplify" this into one mode for both.
+  //
+  // Several vendors resolve significant path segments case-insensitively:
+  // GitHub serves /repos/OWNER/REPO under any casing of owner and repo. The
+  // proxy forwards the path exactly as matched, so with byte-case-sensitive
+  // matching a DENY (or a connection-scoped deny-except pin) written as
+  // `/repos/onegate-bot/onegate/**` simply does not fire on
+  // `/repos/OneGate-Bot/onegate/...`. That falls through to the agent's broad
+  // allow rule, is forwarded upstream, and the vendor serves the very resource
+  // the deny was meant to fence off -- audited as an ordinary allow, so the
+  // evasion is near-invisible after the fact.
+  //
+  // Matching DENY case-insensitively closes that. It can only ever REFUSE more
+  // requests, so widening it is fail-safe.
+  //
+  // ALLOW stays case-sensitive. Other vendors have genuinely case-SENSITIVE
+  // path segments (S3 object keys, Drive file ids, base64 identifiers), where
+  // an allow of `/files/AbC` matching `/files/abc` would grant access to a
+  // DIFFERENT object. Widening an allow is fail-OPEN, so it is not done.
+  return globToRegExp(rule.pathGlob, rule.effect === "deny").test(path);
 }
 
 /**
