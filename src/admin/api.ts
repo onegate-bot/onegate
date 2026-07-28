@@ -1571,7 +1571,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
    * enabled flag), and the affected agents' strategy state is reset so
    * counters never point at a connection that no longer exists. The store
    * promotes the oldest remaining connection of the vendor to default when
-   * the default is deleted.
+   * the default is deleted, and purges any upstream token cached against the
+   * deleted connection.
    */
   app.delete("/api/connections/:id", (req, res) => {
     const cur = store.getConnection(req.params.id);
@@ -1581,11 +1582,6 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     }
     if (cur.kind === "app") {
       store.removeConnectionFromAppConfigs(cur.id);
-      // OAuth connections cache a live access token in settings keyed on the
-      // connection id. Purge it so a re-created connection never reuses it.
-      if (registry.get(cur.vendor)?.oauth) {
-        store.deleteSetting(`oauth_access_token:${cur.vendor}:${cur.id}`);
-      }
     } else {
       for (const agentId of store.removeConnectionFromLlmConfigs(cur.id)) {
         store.clearLlmStrategyState(agentId);
