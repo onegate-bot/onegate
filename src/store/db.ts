@@ -5,7 +5,7 @@
 
 import { createRequire } from "node:module";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SecretBox, loadSecretKey } from "./secret-box.js";
 import type {
@@ -496,12 +496,40 @@ function rowToLlmUsageEvent(r: Row): LlmUsageEvent {
   };
 }
 
+/**
+ * Creates (or tightens) the data directory that holds the SQLite database, its
+ * -wal/-shm sidecars and the `db-secret.key` file.
+ *
+ * The mode has to be applied here, at the very first mkdir, because
+ * `mkdirSync(dir, { recursive: true, mode })` is a no-op on a directory that
+ * already exists: it neither errors nor re-applies the mode. `loadSecretKey`
+ * passes 0o700 but always runs *after* this call, so on a real first boot the
+ * directory was previously created with the process umask (typically 0755) and
+ * the documented "0600 key, in a 0700 dir" protection never took effect. The
+ * database itself is then created 0644 inside a world-traversable directory,
+ * exposing the audit trail, token hashes and webhook rows to any local user.
+ *
+ * The explicit chmod covers the upgrade path, where the directory already
+ * exists at 0755 from an earlier release. It is best-effort: a data directory
+ * owned by another user (an operator-provisioned mount, for example) would make
+ * chmod throw EPERM, and refusing to start would be worse than running with the
+ * operator's chosen permissions.
+ */
+function ensureDataDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // Not ours to tighten (foreign owner / read-only mount). Keep going.
+  }
+}
+
 export class Store {
   private db: DatabaseSync;
   private secrets: SecretBox;
 
   constructor(dbPath: string) {
-    if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
+    if (dbPath !== ":memory:") ensureDataDir(dirname(dbPath));
     this.secrets = new SecretBox(loadSecretKey(dbPath));
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
