@@ -329,6 +329,72 @@ describe("connections", () => {
     expect(store.getDefaultConnection("llm", "anthropic")).toBeNull();
   });
 
+  it("deleting a connection purges every cached upstream token shape", () => {
+    // gitlab has an oauth descriptor, but the store purges off the connection
+    // id alone so the descriptor is irrelevant here.
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "gitlab",
+      name: "gl",
+      data: { refreshToken: "rt" },
+    });
+    const cached = JSON.stringify({ token: "live", exp: Date.now() + 1e6 });
+    const keys = [
+      `oauth_access_token:gitlab:${conn.id}`,
+      `docker_hub_jwt:${conn.id}`,
+      `github_app_token:${conn.id}`,
+      `gcp_access_token:${conn.id}:aaaaaaaaaaaa`,
+      `gcp_access_token:${conn.id}:bbbbbbbbbbbb`,
+    ];
+    for (const k of keys) store.setSetting(k, cached);
+
+    store.deleteConnection(conn.id);
+
+    for (const k of keys) expect(store.getSetting(k)).toBeNull();
+  });
+
+  it("purges cached tokens for vendors that have no oauth descriptor", () => {
+    // mongodb-atlas connects with api_key (no oauth descriptor) yet caches
+    // under the oauth_access_token prefix via the client_credentials grant.
+    // gcp/docker/github-app are likewise descriptor-less token minters.
+    const cases: [string, (id: string) => string][] = [
+      ["mongodb-atlas", (id) => `oauth_access_token:mongodb-atlas:${id}`],
+      ["gcp", (id) => `gcp_access_token:${id}:0123456789ab`],
+      ["docker", (id) => `docker_hub_jwt:${id}`],
+      ["github-app", (id) => `github_app_token:${id}`],
+    ];
+    for (const [vendor, key] of cases) {
+      const conn = store.createConnection({ kind: "app", vendor, name: vendor, data: {} });
+      const k = key(conn.id);
+      store.setSetting(k, JSON.stringify({ token: "live", exp: Date.now() + 1e6 }));
+      store.deleteConnection(conn.id);
+      expect(store.getSetting(k)).toBeNull();
+    }
+  });
+
+  it("purging one connection leaves other connections' cached tokens alone", () => {
+    const a = store.createConnection({ kind: "app", vendor: "gcp", name: "a", data: {} });
+    const b = store.createConnection({ kind: "app", vendor: "gcp", name: "b", data: {} });
+    const keyA = `gcp_access_token:${a.id}:aaaaaaaaaaaa`;
+    const keyB = `gcp_access_token:${b.id}:bbbbbbbbbbbb`;
+    store.setSetting(keyA, "a-token");
+    store.setSetting(keyB, "b-token");
+    store.deleteConnection(a.id);
+    expect(store.getSetting(keyA)).toBeNull();
+    expect(store.getSetting(keyB)).toBe("b-token");
+  });
+
+  it("deleteSettingsByPrefix treats LIKE metacharacters literally", () => {
+    store.setSetting("gcp_access_token:conn_a:tag", "purge-me");
+    // Would be swept up if "_" were left as a single-char LIKE wildcard.
+    store.setSetting("gcpXaccess_token:conn_a:tag", "keep-me");
+    store.setSetting("gcp_access_token:conn_b:tag", "keep-me-too");
+    store.deleteSettingsByPrefix("gcp_access_token:conn_a:");
+    expect(store.getSetting("gcp_access_token:conn_a:tag")).toBeNull();
+    expect(store.getSetting("gcpXaccess_token:conn_a:tag")).toBe("keep-me");
+    expect(store.getSetting("gcp_access_token:conn_b:tag")).toBe("keep-me-too");
+  });
+
   it("leaves the app credentials table completely untouched", () => {
     store.setCredential("github", "pat", { pat: "tok1" });
     store.createConnection({ kind: "llm", vendor: "anthropic", name: "a", data: { apiKey: "k" } });
