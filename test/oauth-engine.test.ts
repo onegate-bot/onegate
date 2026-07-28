@@ -82,7 +82,9 @@ describe("token endpoint flows", () => {
   let server: http.Server;
   let url: string;
   let lastReq: { headers: http.IncomingHttpHeaders; body: string; contentType?: string };
-  let respond: (req: typeof lastReq) => { status: number; body: unknown };
+  let respond: (
+    req: typeof lastReq,
+  ) => { status: number; body: unknown } | Promise<{ status: number; body: unknown }>;
 
   beforeAll(async () => {
     server = http.createServer((req, res) => {
@@ -90,9 +92,16 @@ describe("token endpoint flows", () => {
       req.on("data", (c) => (body += c));
       req.on("end", () => {
         lastReq = { headers: req.headers, body, contentType: req.headers["content-type"] };
-        const out = respond(lastReq);
-        res.writeHead(out.status, { "content-type": "application/json" });
-        res.end(JSON.stringify(out.body));
+        void (async () => {
+          try {
+            const out = await respond(lastReq);
+            res.writeHead(out.status, { "content-type": "application/json" });
+            res.end(JSON.stringify(out.body));
+          } catch (err) {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+        })();
       });
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -237,6 +246,53 @@ describe("token endpoint flows", () => {
       respond = () => ({ status: 401, body: { error: "invalid_client" } });
       const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
       await expect(oauthBearerToken(integ(), c, store)).rejects.toThrow(/token refresh failed/);
+    });
+
+    it("coalesces concurrent refreshes into a single exchange (rotating provider)", async () => {
+      // A rotating provider consumes the presented refresh token, so a second
+      // concurrent exchange would present an already-used token and be
+      // rejected. The single flight must collapse both callers onto one POST.
+      let calls = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      respond = async (req) => {
+        calls++;
+        expect(new URLSearchParams(req.body).get("refresh_token")).toBe("rt");
+        // Hold the first exchange open so the second caller arrives mid-flight.
+        await gate;
+        return {
+          status: 200,
+          body: {
+            access_token: `at_${calls}`,
+            refresh_token: `rt_rotated_${calls}`,
+            expires_in: 3600,
+          },
+        };
+      };
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+
+      const first = oauthBearerToken(integ(), c, store);
+      const second = oauthBearerToken(integ(), c, store);
+      // Give the second caller a tick to reach the refresh path before the
+      // first one is allowed to finish.
+      await new Promise((r) => setTimeout(r, 20));
+      release();
+      const [a, b] = await Promise.all([first, second]);
+
+      expect(calls).toBe(1);
+      expect(a).toBe("at_1");
+      expect(b).toBe(a);
+      // The winner's rotated token must survive, not be clobbered by a loser.
+      expect(store.getCredential("testx")?.data.refreshToken).toBe("rt_rotated_1");
+    });
+
+    it("clears the in-flight entry after a failure so later refreshes retry", async () => {
+      respond = () => ({ status: 401, body: { error: "invalid_client" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      await expect(oauthBearerToken(integ(), c, store)).rejects.toThrow(/token refresh failed/);
+      // A poisoned map would replay the rejected promise instead of retrying.
+      respond = () => ({ status: 200, body: { access_token: "at_after", expires_in: 3600 } });
+      expect(await oauthBearerToken(integ(), c, store)).toBe("at_after");
     });
   });
 
