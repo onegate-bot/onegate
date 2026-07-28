@@ -1,7 +1,7 @@
 /**
  * Docker Hub via username + personal access token. Hub's v2 API wants a
  * JWT from POST /v2/users/login, so inject logs in lazily with the stored
- * PAT, caches the JWT until its exp claim (settings table) and injects it
+ * PAT, caches the JWT until its exp claim (settings table, sealed) and injects it
  * as Bearer. Nothing happens at connect time, a bad credential fails at
  * first use.
  */
@@ -38,11 +38,9 @@ export async function dockerHubToken(cred: Credential, store: Store): Promise<st
   }
 
   const cacheKey = `docker_hub_jwt:${cred.id}`;
-  const cachedRaw = store.getSetting(cacheKey);
-  if (cachedRaw) {
-    const cached = JSON.parse(cachedRaw) as { token: string; exp: number };
-    if (cached.exp - Date.now() > EXPIRY_MARGIN_MS) return cached.token;
-  }
+  // Sealed at rest; an unreadable row degrades to a cache miss and re-logs in.
+  const cached = store.getSecretSetting<{ token: string; exp: number }>(cacheKey);
+  if (cached && cached.exp - Date.now() > EXPIRY_MARGIN_MS) return cached.token;
 
   const res = await postJson(loginUrl(), { username, password: apiToken }, { accept: "application/json" });
   if (res.status !== 200) {
@@ -58,7 +56,7 @@ export async function dockerHubToken(cred: Credential, store: Store): Promise<st
   if (!token) throw new Error("Docker Hub login did not return a token");
 
   const exp = jwtExpiryMs(token) ?? Date.now() + 3_600_000;
-  store.setSetting(cacheKey, JSON.stringify({ token, exp }));
+  store.setSecretSetting(cacheKey, { token, exp });
   return token;
 }
 
