@@ -762,6 +762,18 @@ export class Store {
     this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
   }
 
+  /**
+   * Deletes every setting whose key starts with the given prefix. Callers pass
+   * literal prefixes, so the LIKE metacharacters (% _ and the escape itself)
+   * are escaped rather than treated as wildcards.
+   */
+  deleteSettingsByPrefix(prefix: string): void {
+    const escaped = prefix.replace(/[\\%_]/g, (c) => `\\${c}`);
+    this.db
+      .prepare("DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'")
+      .run(`${escaped}%`);
+  }
+
   // ---- projects ----
 
   createProject(name: string): Project {
@@ -1142,11 +1154,13 @@ export class Store {
   deleteConnection(id: string): void {
     const cur = this.getConnection(id);
     if (!cur) return;
-    // Deleting a connection and promoting the next default must be atomic: an
-    // interrupt between the two would leave a vendor with no default connection
-    // (or, with grants cascaded off, in a half-torn state). Run both together.
+    // Deleting a connection, purging its cached upstream tokens and promoting
+    // the next default must be atomic: an interrupt between them would leave a
+    // vendor with no default connection (or, with grants cascaded off, in a
+    // half-torn state), or a live token outliving the credential. Run together.
     this.tx(() => {
       this.db.prepare("DELETE FROM connections WHERE id = ?").run(id);
+      this.purgeCachedTokens(cur);
       if (cur.isDefault) {
         const next = this.listConnections({
           kind: cur.kind,
@@ -1160,6 +1174,22 @@ export class Store {
         }
       }
     });
+  }
+
+  /**
+   * Drops every short-lived upstream token an integration may have cached in
+   * the settings table for this connection, so deleting a connection really
+   * does revoke access instead of leaving a valid token behind until it
+   * expires. Keyed off the connection id rather than the presence of an oauth
+   * descriptor: several integrations mint and cache tokens without one (GCP
+   * service accounts, Docker Hub, GitHub Apps, MongoDB Atlas). The GCP key
+   * carries a trailing scope tag, so that one needs a prefix delete.
+   */
+  private purgeCachedTokens(conn: Connection): void {
+    this.deleteSetting(`oauth_access_token:${conn.vendor}:${conn.id}`);
+    this.deleteSetting(`docker_hub_jwt:${conn.id}`);
+    this.deleteSetting(`github_app_token:${conn.id}`);
+    this.deleteSettingsByPrefix(`gcp_access_token:${conn.id}:`);
   }
 
   private clearDefaultConnection(
