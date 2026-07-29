@@ -248,6 +248,58 @@ export function connectFlowKind(integration: Integration): "oauth" | "credential
   return null;
 }
 
+/**
+ * How specifically an integration's host entry matches a concrete host. Higher
+ * wins. An exact host claim always beats a dot-suffix claim, and among suffix
+ * claims the longest (most specific) suffix wins, so resolution does not depend
+ * on the order integrations were registered in.
+ *
+ * Returns null when `entry` does not claim `host` at all.
+ */
+function claimSpecificity(entry: string, host: string): number | null {
+  if (entry.startsWith(".")) {
+    // ".make.com" claims "eu1.make.com" and the bare apex "make.com". The
+    // leading dot anchors the match, so "evilmake.com" is not captured.
+    if (host.endsWith(entry) || host === entry.slice(1)) {
+      // Suffix claims rank below every exact claim, longest suffix first.
+      return entry.length;
+    }
+    return null;
+  }
+  // Exact claims all share one rank above any suffix claim: two integrations
+  // naming the same host are equally specific by definition.
+  return host === entry ? EXACT_RANK : null;
+}
+
+/** Above any possible suffix length, so exact claims always sort first. */
+const EXACT_RANK = Number.MAX_SAFE_INTEGER;
+
+/**
+ * The strongest claim `integration` has on `host`, or null when it claims none.
+ * An integration listing both an exact host and a covering suffix keeps the
+ * exact (stronger) rank.
+ */
+function bestClaim(integration: Integration, host: string): number | null {
+  let best: number | null = null;
+  for (const entry of integration.hosts) {
+    const rank = claimSpecificity(entry.toLowerCase(), host);
+    if (rank !== null && (best === null || rank > best)) best = rank;
+  }
+  return best;
+}
+
+/**
+ * Integration pairs that deliberately claim identical hosts, keyed by the
+ * sorted id pair. Both stay candidates and the proxy picks whichever has a
+ * connected credential (see resolveHostCandidates), so an exact-host overlap
+ * between these is expected rather than a configuration error.
+ */
+const INTENTIONAL_HOST_SHARERS = new Set(["github github-app", "confluence jira"]);
+
+function sharerKey(a: string, b: string): string {
+  return a < b ? `${a} ${b}` : `${b} ${a}`;
+}
+
 export class Registry {
   private byId = new Map<string, Integration>();
 
@@ -255,7 +307,46 @@ export class Registry {
     if (this.byId.has(integration.id)) {
       throw new Error(`Integration "${integration.id}" already registered`);
     }
+    this.assertNoExactHostCollision(integration);
     this.byId.set(integration.id, integration);
+  }
+
+  /**
+   * Rejects a new integration that claims the exact same host as an existing
+   * one, unless the pair is a known intentional sharer.
+   *
+   * Why throw rather than warn: an exact-host collision means two integrations
+   * would inject different credentials into the same vendor's traffic, and
+   * which one wins is not derivable from specificity. For the builtin catalog
+   * that is a developer error, and throwing surfaces it in CI on the first test
+   * run instead of silently re-routing a host once someone reorders BUILTINS.
+   * Only genuinely ambiguous *exact* overlap throws. Suffix overlap is not a
+   * collision at all: it is resolved deterministically by specificity (an exact
+   * host beats a suffix, a longer suffix beats a shorter one), which is exactly
+   * how google/gemini sit inside gcp's `.googleapis.com` claim. So a community
+   * integration adding a narrower or broader suffix still loads fine, and a
+   * running deployment is only refused on the unresolvable case.
+   */
+  private assertNoExactHostCollision(integration: Integration): void {
+    const incoming = new Set(
+      integration.hosts.filter((h) => !h.startsWith(".")).map((h) => h.toLowerCase()),
+    );
+    if (incoming.size === 0) return;
+    for (const existing of this.byId.values()) {
+      if (INTENTIONAL_HOST_SHARERS.has(sharerKey(existing.id, integration.id))) continue;
+      for (const entry of existing.hosts) {
+        if (entry.startsWith(".")) continue;
+        const host = entry.toLowerCase();
+        if (incoming.has(host)) {
+          throw new Error(
+            `Integration "${integration.id}" claims host "${host}" already owned by ` +
+              `"${existing.id}". Two integrations claiming the same exact host is ambiguous: ` +
+              `rename the host, or add the pair to INTENTIONAL_HOST_SHARERS if both are meant ` +
+              `to be candidates.`,
+          );
+        }
+      }
+    }
   }
 
   get(id: string): Integration | null {
@@ -272,27 +363,30 @@ export class Registry {
   }
 
   /**
-   * All integrations claiming `host`, in registration order. A host may have
-   * several owners (api.github.com: github PAT and github-app). The proxy
-   * picks the first candidate with a connected credential, so connecting
-   * exactly one of the overlapping integrations selects it.
+   * All integrations claiming `host`, most specific first. Specificity, not
+   * registration order, decides: an exact host claim outranks a dot-suffix
+   * claim, and a longer suffix outranks a shorter one. So google's explicit
+   * `gmail.googleapis.com` beats gcp's `.googleapis.com` regardless of where
+   * either sits in BUILTINS, and reordering the array (or dropping in a
+   * community integration) can no longer silently re-route a host to a
+   * different integration and therefore a different injected credential.
+   *
+   * Equally specific claims (two integrations naming the same exact host, e.g.
+   * api.github.com for both github and github-app) keep registration order
+   * relative to each other, so the existing "connected credential wins, else
+   * the first registered" behaviour in the proxy is unchanged.
    */
   resolveHostCandidates(host: string): Integration[] {
     const h = host.toLowerCase();
-    const out: Integration[] = [];
+    const matches: { integration: Integration; rank: number; order: number }[] = [];
+    let order = 0;
     for (const integration of this.byId.values()) {
-      for (const entry of integration.hosts) {
-        if (entry.startsWith(".")) {
-          if (h.endsWith(entry) || h === entry.slice(1)) {
-            out.push(integration);
-            break;
-          }
-        } else if (h === entry) {
-          out.push(integration);
-          break;
-        }
-      }
+      const rank = bestClaim(integration, h);
+      if (rank !== null) matches.push({ integration, rank, order });
+      order++;
     }
-    return out;
+    // Stable by construction: ties fall back to registration order.
+    matches.sort((a, b) => b.rank - a.rank || a.order - b.order);
+    return matches.map((m) => m.integration);
   }
 }

@@ -285,8 +285,10 @@ export class GatewayProxy {
     }
 
     // A host may be claimed by several integrations (api.github.com belongs
-    // to both the github PAT integration and github-app). The connected one
-    // wins; with none or several connected, registration order decides.
+    // to both the github PAT integration and github-app). Candidates arrive
+    // most-specific-first, so a broad dot-suffix claim can never outrank an
+    // exact owner here. The connected one wins; with none or several
+    // connected, the most specific candidate does.
     const candidates = this.opts.registry.resolveHostCandidates(host);
     const integration =
       candidates.length > 1

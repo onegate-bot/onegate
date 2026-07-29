@@ -4,9 +4,9 @@
  * key in the `?key=` query param get it rewritten to the real key too, since
  * the API accepts either and a stale query key would otherwise win.
  *
- * Registered between google and gcp: google's explicit Workspace hosts do
- * not claim generativelanguage.googleapis.com, and registering before gcp
- * keeps gemini ahead of gcp's `.googleapis.com` dot-suffix claim.
+ * Owns generativelanguage.googleapis.com as an exact claim, which google does
+ * not list and which outranks gcp's `.googleapis.com` dot-suffix claim by
+ * specificity, whatever order the three are registered in.
  */
 
 import type { Integration, InjectionContext } from "./types.js";

@@ -35,8 +35,9 @@ export const google: Integration = {
   title: "Google Workspace",
   // Workspace product hosts only. The rest of *.googleapis.com (compute,
   // storage, bigquery, vertex, ...) belongs to the gcp service-account
-  // integration, which is registered after this one so these explicit
-  // hosts win.
+  // integration, which claims the `.googleapis.com` suffix. These explicit
+  // exact hosts outrank that suffix by specificity, independent of
+  // registration order (see Registry.resolveHostCandidates).
   hosts: [
     "gmail.googleapis.com",
     "www.googleapis.com",
