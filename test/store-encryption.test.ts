@@ -185,6 +185,50 @@ describe("secrets at rest (C2)", () => {
     reopened!.close();
   });
 
+  it("returns null (not throw) from getAgentNotify for an undecryptable webhook row", () => {
+    const store = new Store(dbPath);
+    const { agent } = store.createAgent("notify-bot");
+    store.setAgentNotify(agent.id, "https://hooks.example.com/tok_secret");
+    store.close();
+
+    // Simulate a row sealed under a rotated key / a truncated envelope. The
+    // enc.v1 prefix keeps it "sealed" so box.open attempts it and throws.
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE agent_notify SET webhook_url = ? WHERE agent_id = ?").run(
+      "enc.v1:garbage",
+      agent.id,
+    );
+    db.close();
+
+    // Must degrade to "no webhook configured". A throw here lands on the proxy's
+    // deny path inside an unawaited async handler and kills the whole gateway.
+    const reopened = new Store(dbPath);
+    expect(() => reopened.getAgentNotify(agent.id)).not.toThrow();
+    expect(reopened.getAgentNotify(agent.id)).toBeNull();
+    reopened.close();
+  });
+
+  it("keeps other agents' webhooks working when one row is undecryptable", () => {
+    const store = new Store(dbPath);
+    const bad = store.createAgent("bad-bot").agent;
+    const good = store.createAgent("good-bot").agent;
+    store.setAgentNotify(bad.id, "https://hooks.example.com/tok_bad");
+    store.setAgentNotify(good.id, "https://hooks.example.com/tok_good");
+    store.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE agent_notify SET webhook_url = ? WHERE agent_id = ?").run(
+      "enc.v1:garbage",
+      bad.id,
+    );
+    db.close();
+
+    const reopened = new Store(dbPath);
+    expect(reopened.getAgentNotify(bad.id)).toBeNull();
+    expect(reopened.getAgentNotify(good.id)).toBe("https://hooks.example.com/tok_good");
+    reopened.close();
+  });
+
   it("persists a usable key file next to the DB (0600)", () => {
     const store = new Store(dbPath);
     store.setCredential("github", "gh", { token: "ghp_x" });

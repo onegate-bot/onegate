@@ -386,12 +386,15 @@ function rowToOnboardingLink(r: Row): OnboardingLink {
  * different key, or a truncated/corrupt envelope, makes `box.open` throw (bad
  * GCM tag or JSON.parse). Without isolation one such row would take down the
  * whole `rowTo*` map path (and thus the vendor's connection list and all proxy
- * resolution for it), or block boot from `encryptSecretsAtRest`. We log the row
- * id (never the ciphertext or any secret material) and let the caller skip it.
+ * resolution for it), block boot from `encryptSecretsAtRest`, or (for the
+ * `agent_notify` webhook URL) throw from inside the proxy's deny path, where
+ * the async request handler's promise is unobserved and the throw becomes a
+ * process-killing unhandled rejection. We log the row id (never the ciphertext
+ * or any secret material) and let the caller skip it.
  */
-function safeOpen(box: SecretBox, data: string, rowId: string): Record<string, string> | null {
+function safeOpen<T = Record<string, string>>(box: SecretBox, data: string, rowId: string): T | null {
   try {
-    return box.open(data);
+    return box.open<T>(data);
   } catch {
     console.warn(`onegate: skipping undecryptable secret row id=${rowId} (bad key or corrupt envelope)`);
     return null;
@@ -2031,13 +2034,21 @@ export class Store {
       .run(agentId, this.secrets.seal(webhookUrl), ts, ts);
   }
 
-  /** Returns the decrypted webhook URL for an agent, or null if not set. */
+  /**
+   * Returns the decrypted webhook URL for an agent, or null if not set.
+   *
+   * An undecryptable row (rotated key, restored key mismatch, corrupt envelope)
+   * degrades to "no webhook configured" rather than throwing: the main caller is
+   * `maybeNotifyOwner` on the proxy's deny path, whose async handler promise is
+   * never awaited, so a throw there would surface as an unhandled rejection and
+   * kill the gateway process for every agent, not just the one with the bad row.
+   */
   getAgentNotify(agentId: string): string | null {
     const r = this.db
       .prepare("SELECT webhook_url FROM agent_notify WHERE agent_id = ?")
       .get(agentId) as Row | undefined;
     if (!r) return null;
-    return this.secrets.open<string>(r.webhook_url);
+    return safeOpen<string>(this.secrets, r.webhook_url, `agent_notify:${agentId}`);
   }
 
   /** Removes the notify webhook config for an agent. No-op if not set. */
