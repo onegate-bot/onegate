@@ -371,13 +371,20 @@ async function grant(ctx: CliContext, args: string[]): Promise<void> {
     );
   }
   const { connId, scope, subjectId } = target;
-  await ctx.client().post(`/api/connections/${encodeURIComponent(connId)}/grants`, {
+  const result = (await ctx.client().post(`/api/connections/${encodeURIComponent(connId)}/grants`, {
     scope,
     subjectId,
+  })) as { ruleId?: string; ruleCreated?: boolean };
+  emit({ connectionId: connId, scope, subjectId, granted: true, ...result }, () => {
+    console.log(`Granted connection ${connId} to ${scope} ${subjectId}.`);
+    // Tell the operator the allow rule is handled, so they do not go hunting for
+    // a second step (or hit a 403 assuming the grant was enough when it wasn't).
+    if (result?.ruleCreated) {
+      console.log(`Created allow rule ${result.ruleId} so this grant is usable on its own.`);
+    } else if (result?.ruleId) {
+      console.log(`Existing rule ${result.ruleId} already covers this integration (left unchanged).`);
+    }
   });
-  emit({ connectionId: connId, scope, subjectId, granted: true }, () =>
-    console.log(`Granted connection ${connId} to ${scope} ${subjectId}.`),
-  );
 }
 
 async function revoke(ctx: CliContext, args: string[]): Promise<void> {

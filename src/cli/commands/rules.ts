@@ -23,6 +23,7 @@ interface Rule {
   leaseTtlSeconds?: number | null;
   connectionId?: string | null;
   connectionScope?: "only" | "except";
+  createdBy?: "operator" | "grant" | null;
 }
 
 /** Human summary of a rule's access lease for the LEASE column. */
@@ -45,6 +46,9 @@ async function list(ctx: CliContext): Promise<void> {
       ...r,
       lease: leaseCell(r),
       connection: r.connectionScope ? `${r.connectionScope} ${r.connectionId}` : "-",
+      // "grant" marks a rule auto-created alongside a connection grant, so an
+      // operator can tell it apart from one they wrote by hand.
+      origin: r.createdBy === "grant" ? "grant" : "operator",
     }));
     console.log(
       table(withLease as unknown as Array<Record<string, unknown>>, [
@@ -56,6 +60,7 @@ async function list(ctx: CliContext): Promise<void> {
         ["PATH", "pathGlob"],
         ["EFFECT", "effect"],
         ["CONNECTION", "connection"],
+        ["ORIGIN", "origin"],
         ["LEASE", "lease"],
       ]),
     );

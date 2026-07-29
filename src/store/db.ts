@@ -28,6 +28,7 @@ import type {
   OwnerNotificationStatus,
   Project,
   Rule,
+  RuleOrigin,
   RuleScope,
 } from "../types.js";
 import { auditReason, auditSource } from "../audit-meta.js";
@@ -71,7 +72,8 @@ CREATE TABLE IF NOT EXISTS rules (
   expires_at TEXT,
   lease_ttl_seconds INTEGER,
   connection_id TEXT,
-  connection_scope TEXT CHECK (connection_scope IN ('only','except'))
+  connection_scope TEXT CHECK (connection_scope IN ('only','except')),
+  created_by TEXT CHECK (created_by IN ('operator','grant'))
 );
 CREATE INDEX IF NOT EXISTS idx_rules_subject ON rules(scope, subject_id);
 -- Time-boxed integrations: presence of a row marks the integration as
@@ -359,6 +361,7 @@ function rowToRule(r: Row): Rule {
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
     connectionId: r.connection_id ?? null,
     connectionScope: r.connection_scope ? (r.connection_scope as Rule["connectionScope"]) : undefined,
+    createdBy: (r.created_by as Rule["createdBy"]) ?? null,
   };
 }
 
@@ -597,6 +600,14 @@ export class Store {
     if (!ruleCols.has("connection_scope"))
       this.db.exec(
         "ALTER TABLE rules ADD COLUMN connection_scope TEXT CHECK (connection_scope IN ('only','except'))",
+      );
+    // Rule provenance. NULL on every pre-existing row, which reads back as an
+    // operator-authored rule -- the correct interpretation for rules that
+    // predate auto-creation. Attribution only; never consulted by the policy
+    // engine.
+    if (!ruleCols.has("created_by"))
+      this.db.exec(
+        "ALTER TABLE rules ADD COLUMN created_by TEXT CHECK (created_by IN ('operator','grant'))",
       );
     if (!connCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE connections ADD COLUMN lease_ttl_seconds INTEGER");
@@ -1073,6 +1084,71 @@ export class Store {
         "INSERT OR IGNORE INTO connection_grants (connection_id, scope, subject_id, created_at) VALUES (?, ?, ?, ?)",
       )
       .run(connectionId, scope, subjectId, now());
+  }
+
+  /**
+   * Closes the grant/rule double gate: makes sure the subject of a connection
+   * grant also has an allow rule for that connection's integration, so that
+   * granting a connection is on its own enough to reach the integration.
+   *
+   * Before this existed, an operator had to do BOTH (grant the connection AND
+   * write an allow rule) and got an unexplained 403 when they only did the
+   * first. This is deliberately solved HERE, at grant time, and NOT in the
+   * policy engine: `evaluate()` stays a strict deny-wins short-circuit that
+   * knows nothing about grants.
+   *
+   * Idempotent and conservative:
+   *   - Returns the existing rule untouched if ANY rule (allow or deny) already
+   *     covers this subject+integration. An operator's narrower allow is never
+   *     widened, and an explicit DENY is never overridden or deleted -- a deny
+   *     present means we create nothing, so deny still wins in `evaluate()`.
+   *   - Only ever creates an ALLOW rule, never a deny.
+   *   - The created rule is tagged `createdBy: "grant"` for attribution.
+   *
+   * Returns the rule that now covers the pair, plus whether it was created.
+   * Returns null when the connection or subject does not resolve.
+   */
+  ensureAllowRuleForGrant(
+    connectionId: string,
+    scope: RuleScope,
+    subjectId: string,
+  ): { rule: Rule; created: boolean } | null {
+    const conn = this.getConnection(connectionId);
+    // Grants are an app-connection concept; LLM routing has its own path and
+    // must not get policy rules synthesized for it.
+    if (!conn || conn.kind !== "app") return null;
+    const integrationId = conn.vendor;
+    if (!integrationId) return null;
+    const subjectExists =
+      scope === "agent" ? !!this.getAgent(subjectId) : !!this.getProject(subjectId);
+    if (!subjectExists) return null;
+
+    // Look only at rules written directly against THIS subject at THIS scope.
+    // A project-scoped rule is intentionally not treated as covering an
+    // agent-scoped grant: the grant is agent-scoped, so its rule should be too,
+    // and creating it is harmless (an equal-or-wider project allow already
+    // permits the call, and a project DENY still wins by deny-short-circuit).
+    const existing = this.listRules({ scope, subjectId }).find(
+      (r) => r.integrationId === integrationId || r.integrationId === "*",
+    );
+    if (existing) return { rule: existing, created: false };
+
+    // Match the connect-wizard's shape so a manually granted connection behaves
+    // identically to a wizard-onboarded one, including any access lease the
+    // integration or connection asks for.
+    const ttl = this.effectiveLeaseTtlSeconds(integrationId, conn.leaseTtlSeconds ?? null);
+    const rule = this.createRule({
+      scope,
+      subjectId,
+      integrationId,
+      methods: ["*"],
+      pathGlob: "/**",
+      effect: "allow",
+      expiresAt: ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null,
+      leaseTtlSeconds: ttl,
+      createdBy: "grant",
+    });
+    return { rule, created: true };
   }
 
   /** Removes a grant. No-op if absent. */
@@ -1763,6 +1839,8 @@ export class Store {
     connectionId?: string | null;
     /** "only" = applies for that connection, "except" = applies for all others. */
     connectionScope?: ConnectionScope;
+    /** Provenance for attribution. Defaults to "operator". See Rule.createdBy. */
+    createdBy?: RuleOrigin | null;
   }): Rule {
     const r: Rule = {
       id: newId("rl"),
@@ -1773,10 +1851,11 @@ export class Store {
       leaseTtlSeconds: input.leaseTtlSeconds ?? null,
       connectionId: input.connectionId ?? null,
       connectionScope: input.connectionScope,
+      createdBy: input.createdBy ?? "operator",
     };
     this.db
       .prepare(
-        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         r.id,
@@ -1791,6 +1870,7 @@ export class Store {
         r.leaseTtlSeconds ?? null,
         r.connectionId ?? null,
         r.connectionScope ?? null,
+        r.createdBy ?? null,
       );
     return r;
   }
