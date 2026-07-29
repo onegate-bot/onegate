@@ -66,11 +66,9 @@ export async function githubAppToken(cred: Credential, store: Store): Promise<st
   }
 
   const cacheKey = `github_app_token:${cred.id}`;
-  const cachedRaw = store.getSetting(cacheKey);
-  if (cachedRaw) {
-    const cached = JSON.parse(cachedRaw) as { token: string; exp: number };
-    if (cached.exp - Date.now() > EXPIRY_MARGIN_MS) return cached.token;
-  }
+  // Sealed at rest; an unreadable row degrades to a cache miss and re-mints.
+  const cached = store.getSecretSetting<{ token: string; exp: number }>(cacheKey);
+  if (cached && cached.exp - Date.now() > EXPIRY_MARGIN_MS) return cached.token;
 
   const jwt = signGithubAppJwt(appId, privateKey);
   const res = await postJson(
@@ -97,7 +95,7 @@ export async function githubAppToken(cred: Credential, store: Store): Promise<st
   const json = JSON.parse(res.body) as { token?: string; expires_at?: string };
   if (!json.token) throw new Error("GitHub did not return an installation token");
   const exp = json.expires_at ? new Date(json.expires_at).getTime() : Date.now() + 3_600_000;
-  store.setSetting(cacheKey, JSON.stringify({ token: json.token, exp }));
+  store.setSecretSetting(cacheKey, { token: json.token, exp });
   return json.token;
 }
 

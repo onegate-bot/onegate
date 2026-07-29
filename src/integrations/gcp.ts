@@ -107,13 +107,11 @@ export async function gcpAccessToken(cred: Credential, store: Store): Promise<st
   // gets served a token minted for the old scopes.
   const scopeTag = createHash("sha256").update(scopesFor(cred)).digest("hex").slice(0, 12);
   const cacheKey = `gcp_access_token:${cred.id}:${scopeTag}`;
-  const cachedRaw = store.getSetting(cacheKey);
-  if (cachedRaw) {
-    const cached = JSON.parse(cachedRaw) as CachedToken;
-    if (cached.exp - Date.now() > 60_000) return cached.token;
-  }
+  // Sealed at rest; an unreadable row degrades to a cache miss and re-mints.
+  const cached = store.getSecretSetting<CachedToken>(cacheKey);
+  if (cached && cached.exp - Date.now() > 60_000) return cached.token;
   const fresh = await exchangeAssertion(cred);
-  store.setSetting(cacheKey, JSON.stringify(fresh));
+  store.setSecretSetting(cacheKey, fresh);
   return fresh.token;
 }
 

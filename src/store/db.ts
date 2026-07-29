@@ -762,6 +762,41 @@ export class Store {
     this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
   }
 
+  /**
+   * Sealed variant of setSetting, for the short-lived UPSTREAM access tokens
+   * the integrations mint and cache (OAuth bearer tokens, GCP access tokens,
+   * the Docker Hub JWT, GitHub App installation tokens). Those are the very
+   * credentials the proxy injects, so leaving them as plaintext settings rows
+   * would hand a leaked DB file live upstream access and defeat the at-rest
+   * encryption applied to `credentials` and `connections`. The value is
+   * envelope-encrypted with the same SecretBox. Plain (non-secret) settings
+   * keep using setSetting/getSetting.
+   */
+  setSecretSetting(key: string, value: unknown): void {
+    this.setSetting(key, this.secrets.seal(value));
+  }
+
+  /**
+   * Reads a value written by setSecretSetting. Tolerant by design, because
+   * these rows are caches, not sources of truth:
+   *  - a row written before this sealing existed is plain JSON, which
+   *    `SecretBox.open` parses as-is, so an upgrade keeps working;
+   *  - a row sealed under a rotated key (or a corrupt envelope) degrades to a
+   *    cache MISS instead of throwing into the request path, so the caller
+   *    simply re-mints and re-seals the token.
+   * Never logs the stored value.
+   */
+  getSecretSetting<T = unknown>(key: string): T | null {
+    const raw = this.getSetting(key);
+    if (raw === null) return null;
+    try {
+      return this.secrets.open<T>(raw);
+    } catch {
+      console.warn(`onegate: discarding unreadable cached secret setting key=${key}`);
+      return null;
+    }
+  }
+
   // ---- projects ----
 
   createProject(name: string): Project {

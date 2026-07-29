@@ -10,7 +10,8 @@
  * ({ clientId, clientSecret, refreshToken }) keep working unchanged.
  *
  * Token calls go through direct node:https (never fetch, the global
- * dispatcher may carry an ambient proxy) and cache in the settings table.
+ * dispatcher may carry an ambient proxy) and cache in the settings table,
+ * sealed at rest (these are live upstream access tokens).
  */
 
 import type { OAuthDescriptor } from "./types.js";
@@ -147,9 +148,10 @@ function cacheKey(integrationId: string, credId: string): string {
 }
 
 function readCache(store: Store, key: string): string | null {
-  const raw = store.getSetting(key);
-  if (!raw) return null;
-  const cached = JSON.parse(raw) as CachedToken;
+  // Sealed at rest; a legacy plaintext row still reads, an unreadable one
+  // degrades to a cache miss so the token is simply re-minted.
+  const cached = store.getSecretSetting<CachedToken>(key);
+  if (!cached) return null;
   return cached.exp - Date.now() > EXPIRY_MARGIN_MS ? cached.token : null;
 }
 
@@ -225,7 +227,7 @@ export async function oauthBearerToken(
     throw new Error(`${integration.id} has a refresh token but no OAuth descriptor`);
   }
   const fresh = await refreshAccessToken(integration.id, integration.oauth, cred, store);
-  store.setSetting(key, JSON.stringify(fresh));
+  store.setSecretSetting(key, fresh);
   return fresh.token;
 }
 
@@ -258,6 +260,6 @@ export async function clientCredentialsToken(
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,
   };
-  store.setSetting(key, JSON.stringify(fresh));
+  store.setSecretSetting(key, fresh);
   return fresh.token;
 }
