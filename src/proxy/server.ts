@@ -674,6 +674,90 @@ export class GatewayProxy {
   }
 
   /**
+   * Records (or reuses) the pending approval for a held request, and notifies
+   * the owner with a decision link.
+   *
+   * Reuse: a bot retrying a held call must not mint a fresh approval and a fresh
+   * owner notification on every attempt, so a still-pending approval for the
+   * same agent/integration/method/path is returned as-is. Its plaintext token is
+   * unrecoverable (only the hash is stored), so the reused case returns no URL —
+   * the owner already has the link from the first notification.
+   *
+   * NEVER THROWS. Any failure returns null and the caller falls back to
+   * describing the call as denied, so a broken approval path degrades to a plain
+   * refusal and never to a forwarded request.
+   */
+  private pendingApprovalFor(
+    agent: Agent,
+    integration: Integration,
+    ruleId: string,
+    method: string,
+    path: string,
+  ): { id: string; expiresAt: string; url: string | null } | null {
+    try {
+      const existing = this.opts.store.activeApprovalFor(agent.id, integration.id, method, path);
+      if (existing) return { id: existing.id, expiresAt: existing.expiresAt, url: null };
+      const approval = this.opts.store.createApproval({
+        agentId: agent.id,
+        integrationId: integration.id,
+        ruleId,
+        method,
+        path,
+      });
+      const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+      const url = `${base}/approve/${approval.token}`;
+      // Owner notification reuses the SS1 pipeline. Dedup is per approval, so a
+      // genuinely new held call always reaches the owner while retries of the
+      // same call (which reuse the approval above) never re-notify.
+      this.notifyOwnerForApproval(agent, integration, approval.id, url, approval.expiresAt);
+      return { id: approval.id, expiresAt: approval.expiresAt, url };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Sends the owner an approve/reject link for a held call. Best-effort and
+   * never throws: a webhook that is absent or failing must not change the
+   * policy outcome (the call stays held either way).
+   */
+  private notifyOwnerForApproval(
+    agent: Agent,
+    integration: Integration,
+    approvalId: string,
+    url: string,
+    expiresAt: string,
+  ): void {
+    try {
+      const webhookUrl = this.opts.store.getAgentNotify(agent.id);
+      if (!webhookUrl) return;
+      const dedupKey = `approval:${approvalId}`;
+      if (this.opts.store.findOwnerNotificationByDedupKey(dedupKey)) return;
+      const row = this.opts.store.enqueueOwnerNotification({
+        agentId: agent.id,
+        integrationId: integration.id,
+        connectToken: null,
+        dedupKey,
+      });
+      this.dispatchOwnerNotification(
+        row,
+        {
+          agentId: agent.id,
+          agentName: agent.name,
+          integrationId: integration.id,
+          integrationTitle: integration.title,
+          connectUrl: url,
+          connectExpiresAt: expiresAt,
+          reason: "approval_required",
+        },
+        webhookUrl,
+      );
+    } catch {
+      // Swallowed on purpose: notification is a side effect, not the decision.
+    }
+  }
+
+  /**
    * Resolves the app connection for a request (x-onegate-connection header, else
    * the agent's saved choice, else the tenant default), writing the appropriate
    * error response itself when resolution fails.
@@ -838,6 +922,39 @@ export class GatewayProxy {
                   connect_url: renew.url,
                   connect_expires_at: renew.expiresAt,
                   hint: "Show connect_url to your owner as a bare link. Opening it re-allows this connection for another period (no credential re-entry), then retry the request.",
+                }
+              : {}),
+          }),
+        );
+        return;
+      }
+      // A require_approval rule matched: the call is HELD for an owner decision
+      // rather than refused outright. Note this is reached only after the
+      // explicit-deny short-circuit in evaluate(), so a deny rule always wins
+      // and can never be softened into a "pending" state.
+      //
+      // The response is still a 4xx and the request is NOT forwarded. Phase one
+      // does not replay the held request: the agent is told to retry once the
+      // owner has decided.
+      if (verdict.requiresApproval && verdict.ruleId) {
+        const pending = this.pendingApprovalFor(agent, integration, verdict.ruleId, method, path);
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "onegate_approval_pending",
+            message: `${method} ${host}${path} for agent "${agent.name}" requires owner approval. The request was NOT sent. It is pending a decision${pending ? "" : " (approval could not be recorded, treat as denied)"}; retry after your owner approves.`,
+            ...(pending
+              ? {
+                  approval_id: pending.id,
+                  approval_expires_at: pending.expiresAt,
+                  ...(pending.url
+                    ? {
+                        approval_url: pending.url,
+                        hint: "Show approval_url to your owner as a bare link. Opening it lets them approve or reject this call, then retry the request.",
+                      }
+                    : {
+                        hint: "Ask your owner to approve this call in OneGate, then retry the request.",
+                      }),
                 }
               : {}),
           }),

@@ -12,6 +12,8 @@ import type {
   Agent,
   AgentAppConfig,
   AgentLlmConfig,
+  Approval,
+  ApprovalStatus,
   AuditEntry,
   Connection,
   ConnectionKind,
@@ -28,6 +30,7 @@ import type {
   OwnerNotificationStatus,
   Project,
   Rule,
+  RuleAction,
   RuleScope,
 } from "../types.js";
 import { auditReason, auditSource } from "../audit-meta.js";
@@ -71,7 +74,13 @@ CREATE TABLE IF NOT EXISTS rules (
   expires_at TEXT,
   lease_ttl_seconds INTEGER,
   connection_id TEXT,
-  connection_scope TEXT CHECK (connection_scope IN ('only','except'))
+  connection_scope TEXT CHECK (connection_scope IN ('only','except')),
+  -- Optional action layered on the effect. NULL = plain allow/deny (legacy).
+  -- 'require_approval' rules are stored with effect='deny' so that any reader
+  -- unaware of actions fails CLOSED. A future action value can be added with a
+  -- plain ALTER, whereas widening the effect CHECK above would need a full
+  -- table rebuild, which is why the action lives in its own column.
+  action TEXT CHECK (action IN ('require_approval'))
 );
 CREATE INDEX IF NOT EXISTS idx_rules_subject ON rules(scope, subject_id);
 -- Time-boxed integrations: presence of a row marks the integration as
@@ -220,6 +229,26 @@ CREATE TABLE IF NOT EXISTS owner_notifications (
   dedup_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_owner_notifications_pair ON owner_notifications(agent_id, integration_id);
+-- Pending owner decisions raised by a rule whose action is 'require_approval'.
+-- Only the SHA-256 of the decision token is stored, exactly as for
+-- onboarding_links: the plaintext exists solely in the approve/reject URL
+-- handed to the owner at mint time. A status other than 'pending' marks the
+-- token spent, which is what makes a decision single-use.
+CREATE TABLE IF NOT EXISTS approvals (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  integration_id TEXT NOT NULL,
+  rule_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','expired')),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_agent ON approvals(agent_id, integration_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 `;
 
 export function hashToken(token: string): string {
@@ -359,6 +388,29 @@ function rowToRule(r: Row): Rule {
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
     connectionId: r.connection_id ?? null,
     connectionScope: r.connection_scope ? (r.connection_scope as Rule["connectionScope"]) : undefined,
+    // Unknown/garbage values are dropped to null rather than passed through, so
+    // a row written by a newer build cannot make an older engine treat a rule as
+    // something it does not understand. The stored effect ('deny') still stands.
+    action: r.action === "require_approval" ? "require_approval" : null,
+  };
+}
+
+function rowToApproval(r: Row): Approval {
+  return {
+    id: r.id,
+    agentId: r.agent_id,
+    integrationId: r.integration_id,
+    ruleId: r.rule_id,
+    method: r.method,
+    path: r.path,
+    tokenHash: r.token_hash,
+    // Only the hash is stored; the plaintext lives solely in the decision URL
+    // minted once at creation time.
+    token: "",
+    status: r.status as ApprovalStatus,
+    createdAt: r.created_at,
+    expiresAt: r.expires_at,
+    decidedAt: r.decided_at ?? null,
   };
 }
 
@@ -598,6 +650,12 @@ export class Store {
       this.db.exec(
         "ALTER TABLE rules ADD COLUMN connection_scope TEXT CHECK (connection_scope IN ('only','except'))",
       );
+    // Rule action column. NULL = plain allow/deny (every pre-existing row), so
+    // legacy databases keep behaving exactly as before. The CHECK is carried on
+    // the new column rather than widening the `effect` CHECK, which SQLite
+    // cannot alter without rebuilding the table.
+    if (!ruleCols.has("action"))
+      this.db.exec("ALTER TABLE rules ADD COLUMN action TEXT CHECK (action IN ('require_approval'))");
     if (!connCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE connections ADD COLUMN lease_ttl_seconds INTEGER");
     const linkCols = new Set(
@@ -1763,11 +1821,26 @@ export class Store {
     connectionId?: string | null;
     /** "only" = applies for that connection, "except" = applies for all others. */
     connectionScope?: ConnectionScope;
+    /**
+     * Optional action layered on the effect. "require_approval" holds the call
+     * for an owner decision. Such a rule is ALWAYS persisted with
+     * effect='deny' regardless of the effect passed in (see below).
+     */
+    action?: RuleAction | null;
   }): Rule {
+    const action = input.action ?? null;
     const r: Rule = {
       id: newId("rl"),
       ...input,
       methods: input.methods.map((m) => m.toUpperCase()),
+      // Fail-closed by construction, enforced here at the single write path
+      // rather than left to every caller: a require_approval rule is stored as
+      // a DENY. Readers that predate actions (llm/mode.ts vendorAllowed,
+      // discovery.ts access badge, the admin rules table) branch on `effect`
+      // alone, so storing 'allow' would hand them a live grant that no approval
+      // ever gated. Storing 'deny' makes the worst case a plain refusal.
+      effect: action === "require_approval" ? "deny" : input.effect,
+      action,
       createdAt: now(),
       expiresAt: input.expiresAt ?? null,
       leaseTtlSeconds: input.leaseTtlSeconds ?? null,
@@ -1776,7 +1849,7 @@ export class Store {
     };
     this.db
       .prepare(
-        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         r.id,
@@ -1791,6 +1864,7 @@ export class Store {
         r.leaseTtlSeconds ?? null,
         r.connectionId ?? null,
         r.connectionScope ?? null,
+        r.action ?? null,
       );
     return r;
   }
@@ -1944,6 +2018,155 @@ export class Store {
         link.ruleId ?? null,
       );
     return link;
+  }
+
+  /**
+   * Mints a pending approval for a request held by a `require_approval` rule.
+   *
+   * The decision token is 24 random bytes rendered as HEX, not base64url: chat
+   * clients auto-linkify URLs and mangle the `_` that base64url can emit, which
+   * previously produced dead connect links. Only its SHA-256 is persisted, so a
+   * database read never yields a usable decision token.
+   */
+  createApproval(input: {
+    agentId: string;
+    integrationId: string;
+    ruleId: string;
+    method: string;
+    path: string;
+    /** How long the owner has to decide. Defaults to 24h; clamped to > 0. */
+    ttlSeconds?: number;
+  }): Approval {
+    const ttl = input.ttlSeconds && input.ttlSeconds > 0 ? input.ttlSeconds : 24 * 60 * 60;
+    const createdAt = now();
+    const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+    const token = randomBytes(24).toString("hex");
+    const approval: Approval = {
+      id: newId("apr"),
+      agentId: input.agentId,
+      integrationId: input.integrationId,
+      ruleId: input.ruleId,
+      method: input.method.toUpperCase(),
+      path: input.path,
+      tokenHash: hashToken(token),
+      // Plaintext: returned to the caller for the decision URL, never persisted.
+      token,
+      status: "pending",
+      createdAt,
+      expiresAt,
+      decidedAt: null,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO approvals (id, agent_id, integration_id, rule_id, method, path, token_hash, status, created_at, expires_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        approval.id,
+        approval.agentId,
+        approval.integrationId,
+        approval.ruleId,
+        approval.method,
+        approval.path,
+        approval.tokenHash,
+        approval.status,
+        approval.createdAt,
+        approval.expiresAt,
+        null,
+      );
+    return approval;
+  }
+
+  /** Looks an approval up by its plaintext decision token. */
+  getApprovalByToken(token: string): Approval | null {
+    const r = this.db.prepare("SELECT * FROM approvals WHERE token_hash = ?").get(hashToken(token)) as
+      | Row
+      | undefined;
+    return r ? rowToApproval(r) : null;
+  }
+
+  getApproval(id: string): Approval | null {
+    const r = this.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id) as Row | undefined;
+    return r ? rowToApproval(r) : null;
+  }
+
+  /** Pending approvals, newest first. Optionally narrowed to one agent. */
+  listApprovals(agentId?: string): Approval[] {
+    const rows = agentId
+      ? (this.db
+          .prepare("SELECT * FROM approvals WHERE agent_id = ? ORDER BY created_at DESC")
+          .all(agentId) as Row[])
+      : (this.db.prepare("SELECT * FROM approvals ORDER BY created_at DESC").all() as Row[]);
+    return rows.map(rowToApproval);
+  }
+
+  /**
+   * Records the owner's decision on a pending approval.
+   *
+   * SINGLE-USE and race-free: the UPDATE itself carries `status = 'pending'`,
+   * so SQLite's write serialization means only the first of two concurrent
+   * decisions can change a row. A zero-row result means the approval was
+   * already spent (or never pending) and the caller must reject the attempt
+   * rather than assume success.
+   *
+   * Expiry is enforced here too: a pending-but-past-expiry approval is
+   * transitioned to "expired" and the decision is refused. An approval
+   * therefore cannot be redeemed late even if the sweeper has not yet run.
+   */
+  decideApproval(id: string, decision: "approved" | "rejected", nowMs: number = Date.now()): Approval | null {
+    const existing = this.getApproval(id);
+    if (!existing) return null;
+    if (existing.status !== "pending") return null;
+    const exp = Date.parse(existing.expiresAt);
+    if (!Number.isNaN(exp) && exp <= nowMs) {
+      this.db
+        .prepare("UPDATE approvals SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'pending'")
+        .run(new Date(nowMs).toISOString(), id);
+      return null;
+    }
+    const decidedAt = new Date(nowMs).toISOString();
+    const res = this.db
+      .prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'")
+      .run(decision, decidedAt, id);
+    if (Number(res.changes) === 0) return null;
+    return this.getApproval(id);
+  }
+
+  /**
+   * Marks every pending approval whose expiry has passed as "expired".
+   * Returns the number transitioned. Idempotent.
+   */
+  expireApprovals(nowMs: number = Date.now()): number {
+    const iso = new Date(nowMs).toISOString();
+    const res = this.db
+      .prepare("UPDATE approvals SET status = 'expired', decided_at = ? WHERE status = 'pending' AND expires_at <= ?")
+      .run(iso, iso);
+    return Number(res.changes ?? 0);
+  }
+
+  /**
+   * The newest pending, unexpired approval for an agent+integration+method+path,
+   * or null. Lets the proxy reuse one live approval across a bot's retries
+   * instead of minting (and notifying about) a fresh one on every attempt.
+   *
+   * The returned approval carries an EMPTY `token`: only the hash is stored, so
+   * the plaintext cannot be recovered. Callers use this purely to detect that a
+   * decision is already outstanding.
+   */
+  activeApprovalFor(
+    agentId: string,
+    integrationId: string,
+    method: string,
+    path: string,
+    nowMs: number = Date.now(),
+  ): Approval | null {
+    const r = this.db
+      .prepare(
+        "SELECT * FROM approvals WHERE agent_id = ? AND integration_id = ? AND method = ? AND path = ? AND status = 'pending' AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(agentId, integrationId, method.toUpperCase(), path, new Date(nowMs).toISOString()) as
+      | Row
+      | undefined;
+    return r ? rowToApproval(r) : null;
   }
 
   /**

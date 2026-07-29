@@ -2,8 +2,17 @@
  * Policy engine.
  *
  * A request is checked against the union of the agent's own rules and its
- * project's rules. Explicit DENY beats explicit ALLOW, which beats the
- * agent's default policy (`allow-all` or `deny-unmatched`).
+ * project's rules. Precedence, strongest first:
+ *
+ *   DENY  >  REQUIRE_APPROVAL  >  ALLOW  >  default policy
+ *
+ * Explicit DENY still short-circuits the scan and wins outright — that is
+ * unchanged and deliberately unweakened. REQUIRE_APPROVAL sits BELOW deny and
+ * ABOVE allow: it is a restriction layered on a capability, so a narrow gate
+ * (`require_approval` on `/repos/*\/delete`) must bite even when a broad allow
+ * (`/**`) also matches, otherwise the gate would be silently inert in the most
+ * common real configuration. It can never manufacture access on its own: its
+ * reported `effect` is always "deny".
  */
 
 import type { Agent, Effect, Rule } from "./types.js";
@@ -28,6 +37,17 @@ export interface PolicyResult {
   effect: Effect;
   /** Rule that decided the outcome, null when the default policy applied. */
   ruleId: string | null;
+  /**
+   * True when the deciding rule carried the `require_approval` action: the call
+   * is HELD for an owner decision rather than refused outright.
+   *
+   * `effect` is ALWAYS "deny" when this is set. That is deliberate: every
+   * existing caller that branches on `effect` keeps blocking the request, and
+   * only a caller that explicitly understands `requiresApproval` (the proxy)
+   * turns it into a pending-approval response. A caller that ignores this flag
+   * therefore fails CLOSED, never open.
+   */
+  requiresApproval?: boolean;
   /**
    * True when the ONLY allow rule that matched had an access lease that has
    * expired. The effect is "deny" (ruleId null, a default-deny), but the proxy
@@ -225,6 +245,7 @@ export function evaluate(
 ): PolicyResult {
   const scoping = opts.connectionScoping ?? connectionScopingEnabled();
   let allowed: Rule | null = null;
+  let approval: Rule | null = null;
   let lapsed: Rule | null = null;
   let needsConnection = false;
   for (const rule of rules) {
@@ -238,6 +259,18 @@ export function evaluate(
       continue;
     }
     if (cm === "excluded") continue;
+    if (rule.action === "require_approval") {
+      // Held for owner decision. Recorded and the scan CONTINUES, because a
+      // later explicit deny must still short-circuit and win outright. Not
+      // returned here, so ordering within the rule list never lets an approval
+      // gate pre-empt a deny.
+      //
+      // Such a rule is persisted with effect = "deny" (see RuleAction), so if
+      // this branch were ever removed or the action column were lost, the rule
+      // degrades to a plain deny below. It cannot degrade to an allow.
+      if (!approval) approval = rule;
+      continue;
+    }
     if (rule.effect === "deny")
       return { effect: "deny", ruleId: rule.id, ...(needsConnection ? { needsConnection: true } : {}) };
     if (ruleLapsed(rule, nowMs)) {
@@ -250,6 +283,17 @@ export function evaluate(
     }
     if (!allowed) allowed = rule;
   }
+  // REQUIRE_APPROVAL outranks ALLOW. No explicit deny matched (that would have
+  // returned already), so this is the strongest surviving verdict. `effect` is
+  // "deny": the call is refused NOW and only a caller that understands
+  // `requiresApproval` may offer the owner a decision.
+  if (approval)
+    return {
+      effect: "deny",
+      ruleId: approval.id,
+      requiresApproval: true,
+      ...(needsConnection ? { needsConnection: true } : {}),
+    };
   if (allowed)
     return { effect: "allow", ruleId: allowed.id, ...(needsConnection ? { needsConnection: true } : {}) };
   // A lapsed lease only bites when the default would deny anyway: an allow-all

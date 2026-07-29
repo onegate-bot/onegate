@@ -946,6 +946,70 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     );
   });
 
+  /**
+   * One-tap decision page for a held request. The proxy mints an approval link
+   * (`/approve/:token`) when a require_approval rule matches, refuses the
+   * request, and notifies the owner. GET renders the decision page; POST records
+   * approve or reject.
+   *
+   * The token is single-use: decideApproval only transitions a row that is still
+   * pending, so a replayed link (or a second click) falls through to the
+   * invalid-link page rather than flipping an already-decided record. A pending
+   * row past its expiry is swept to expired by the same call and also refuses.
+   */
+  app.get("/approve/:token", (req, res) => {
+    const approval = store.getApprovalByToken(req.params.token);
+    if (!approval || approval.status !== "pending" || Date.parse(approval.expiresAt) <= Date.now()) {
+      invalidLinkPage(res);
+      return;
+    }
+    const integration = registry.get(approval.integrationId);
+    const title = integration ? esc(integration.title) : esc(approval.integrationId);
+    const agent = store.getAgent(approval.agentId);
+    const who = agent ? esc(agent.name) : "Your bot";
+    res.type("html").send(
+      publicShell({
+        docTitle: "OneGate",
+        body:
+          `<h1>Allow ${who} to run this ${title} request?</h1>` +
+          `<p class="og-muted">${who} tried to call <code>${esc(approval.method)} ${esc(approval.path)}</code> ` +
+          `on your ${title} account. The request was <strong>not</strong> sent. It is waiting for your decision. ` +
+          `Approving lets ${who} retry it. Your credential is never shown to ${who}.</p>` +
+          `<form method="post" action="${publicBase()}/approve/${esc(req.params.token)}">` +
+          `<button class="og-btn" type="submit" name="decision" value="approve">Approve</button> ` +
+          `<button class="og-btn secondary" type="submit" name="decision" value="reject">Reject</button>` +
+          `</form>`,
+      }),
+    );
+  });
+
+  app.post("/approve/:token", express.urlencoded({ extended: false }), (req, res) => {
+    const approval = store.getApprovalByToken(req.params.token);
+    if (!approval) {
+      invalidLinkPage(res);
+      return;
+    }
+    // Anything that is not an explicit "approve" is a rejection: a malformed or
+    // missing decision must never be read as consent.
+    const status = req.body?.decision === "approve" ? "approved" : "rejected";
+    const decided = store.decideApproval(approval.id, status, Date.now());
+    if (!decided) {
+      invalidLinkPage(res);
+      return;
+    }
+    const integration = registry.get(approval.integrationId);
+    const title = integration ? esc(integration.title) : esc(approval.integrationId);
+    const agent = store.getAgent(approval.agentId);
+    const who = agent ? esc(agent.name) : "Your bot";
+    if (status === "approved") {
+      res.send(
+        resultPage(`Approved ${CHECK_SVG}`, `${who} can retry that ${title} request. You can close this tab.`),
+      );
+      return;
+    }
+    res.send(resultPage("Rejected", `${who} will not run that ${title} request. You can close this tab.`));
+  });
+
   // ---- admin auth gate ----
 
   app.use("/api", (req, res, next) => {
@@ -2100,10 +2164,27 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   app.get("/api/rules", (_req, res) => res.json(store.listRules()));
 
   app.post("/api/rules", (req, res) => {
-    const { scope, subjectId, integrationId, methods, pathGlob, effect, ttlSeconds, connectionId, connectionScope } =
-      req.body ?? {};
+    const {
+      scope,
+      subjectId,
+      integrationId,
+      methods,
+      pathGlob,
+      effect,
+      ttlSeconds,
+      connectionId,
+      connectionScope,
+      action,
+    } = req.body ?? {};
     if (!scope || !subjectId || !integrationId || !effect) {
       res.status(400).json({ error: "scope, subjectId, integrationId and effect are required" });
+      return;
+    }
+    // Optional action layered on the effect. Only "require_approval" exists; an
+    // unrecognised value is rejected rather than dropped, so a typo can never
+    // silently degrade a gate into whatever `effect` happened to say.
+    if (action != null && action !== "require_approval") {
+      res.status(400).json({ error: 'action must be "require_approval"' });
       return;
     }
     // Optional connection scoping: pins the rule to a specific app connection.
@@ -2143,7 +2224,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     // expires at now+ttl; 0/null = no lease. Only meaningful on allow rules.
     let expiresAt: string | null = null;
     let leaseTtl: number | null = null;
-    if (effect === "allow" && ttlSeconds != null && Number(ttlSeconds) > 0) {
+    // A require_approval rule is stored with effect "deny", so a lease on it
+    // would be a leased deny: meaningless, and on lapse it would read as a
+    // lapsed grant. Leases stay an allow-only concept.
+    if (action == null && effect === "allow" && ttlSeconds != null && Number(ttlSeconds) > 0) {
       leaseTtl = Math.floor(Number(ttlSeconds));
       expiresAt = new Date(Date.now() + leaseTtl * 1000).toISOString();
     }
@@ -2158,6 +2242,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         expiresAt,
         leaseTtlSeconds: leaseTtl,
         ...(connectionId ? { connectionId, connectionScope } : {}),
+        ...(action ? { action } : {}),
       }),
     );
   });
@@ -2183,6 +2268,43 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     store.deleteRule(req.params.id);
     res.status(204).end();
   });
+
+  // ---- approvals (held requests from require_approval rules) ----
+
+  /**
+   * Lists held requests, optionally for one agent. The sweep runs first so a
+   * pending row past its expiry is reported as expired rather than actionable:
+   * expiry is enforced on read, never left to a background timer that may not
+   * be running.
+   */
+  app.get("/api/approvals", (req, res) => {
+    store.expireApprovals(Date.now());
+    const agentId = req.query.agentId ? String(req.query.agentId) : undefined;
+    res.json(store.listApprovals(agentId));
+  });
+
+  /**
+   * Admin-side equivalent of the owner's one-tap page. Same single-use
+   * semantics: a row that is not still pending (already decided, or expired)
+   * returns 409 rather than being flipped.
+   */
+  for (const [verb, status] of [
+    ["approve", "approved"],
+    ["reject", "rejected"],
+  ] as const) {
+    app.post(`/api/approvals/:id/${verb}`, (req, res) => {
+      if (!store.getApproval(req.params.id)) {
+        res.status(404).json({ error: "unknown_approval" });
+        return;
+      }
+      const decided = store.decideApproval(req.params.id, status, Date.now());
+      if (!decided) {
+        res.status(409).json({ error: "approval_not_pending" });
+        return;
+      }
+      res.json(decided);
+    });
+  }
 
   // ---- connect-wizard onboarding links (admin mint) ----
 

@@ -29,6 +29,7 @@ import { ApiError } from "./cli/client.js";
 import { connectionsCommand, agentsLlmCommand, agentsAppsCommand, agentsNotifyCommand } from "./cli/commands/connections.js";
 import { agentsCommand } from "./cli/commands/agents.js";
 import { rulesCommand } from "./cli/commands/rules.js";
+import { approvalsCommand } from "./cli/commands/approvals.js";
 import { credentialsCommand, integrationsCommand } from "./cli/commands/integrations.js";
 import { auditCommand, usageCommand } from "./cli/commands/observe.js";
 import { projectsCommand } from "./cli/commands/projects.js";
@@ -205,6 +206,7 @@ Admin API commands (talk to a running gateway over --host + admin token):
   onegate agents apps get <agentId>|set <agentId> <integrationId> --connection <id>|clear <agentId> <integrationId>
   onegate agents notify get <agentId>|set <agentId> --url <webhookUrl>|clear <agentId>
   onegate rules list|add|rm
+  onegate approvals list [--agent <id>]|approve <id>|reject <id>
   onegate integrations list
   onegate integrations connect <id> --client-id X --client-secret Y --redirect-base URL
   onegate credentials set <integrationId> --name N --data k=v [--data k=v...]
@@ -276,6 +278,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (cmd === "agents" && sub === "notify") return await agentsNotifyCommand(ctx, rest[0], rest.slice(1));
     if (cmd === "agents") return await agentsCommand(ctx, sub, rest);
     if (cmd === "rules") return await rulesCommand(ctx, sub, rest);
+    if (cmd === "approvals") return await approvalsCommand(ctx, sub, rest);
     if (cmd === "integrations") return await integrationsCommand(ctx, sub, rest);
     if (cmd === "credentials") return await credentialsCommand(ctx, sub, rest);
     if (cmd === "audit") return await auditCommand(ctx, cleaned.slice(1));
