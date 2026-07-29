@@ -969,9 +969,12 @@ function openLlmConnectionModal({ vendors, connection = null, onSaved }) {
           anthropicMode === "auth_token"
             ? `<wa-input class="field" name="llm_authToken" label="Subscription auth token" type="password" ${req}
                  spellcheck="false" autocomplete="off" placeholder="${esc(secretPh("from: claude setup-token"))}"></wa-input>
-               <p class="hint">A long-lived token from <span class="mono">claude setup-token</span>. OneGate sends it as Authorization: Bearer with the oauth-2025-04-20 beta header. Note: subscription tokens are intended for Claude Code, load-balancing several through a proxy is a gray area with Anthropic.</p>`
+               <p class="hint">Paste the long-lived token printed by <span class="mono">claude setup-token</span>. OneGate sends it as Authorization: Bearer with the oauth-2025-04-20 beta header.</p>
+               <p class="hint">Two different Anthropic tokens both start with <span class="mono">sk-ant-oat</span>, so this form cannot tell them apart. Do not copy the short-lived token that the Claude Code client caches in your local keychain. That one is rotated by its owning client, so the connection looks fine now and starts returning 401 hours later.</p>
+               <p class="hint">A subscription token is only accepted for the Claude Code client. Any other client sending one gets a 429 that looks like a rate limit but is really a client-identity refusal, so waiting will not fix it. If this agent is not Claude Code, use an API key instead.</p>`
             : `<wa-input class="field" name="llm_apiKey" label="API key" type="password" ${req}
-                 spellcheck="false" autocomplete="off" placeholder="${esc(secretPh("sk-ant-..."))}"></wa-input>`
+                 spellcheck="false" autocomplete="off" placeholder="${esc(secretPh("sk-ant-api03-..."))}"></wa-input>
+               <p class="hint">An API key from <span class="mono">console.anthropic.com</span> (starts with <span class="mono">sk-ant-api03</span>). This is the right choice for every client except Claude Code itself.</p>`
         }
         ${keepHint}`;
     }

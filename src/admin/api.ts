@@ -17,6 +17,7 @@ import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry 
 import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
 import { buildAuthUrl, exchangeCode } from "../integrations/oauth.js";
+import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
@@ -1245,16 +1246,18 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       }
       if (d.authMode === "auth_token") {
         if (!d.authToken) return 'anthropic auth-token connections need "authToken"';
-        return null;
+        return anthropicSecretMismatch("auth_token", d.authToken as string);
       }
       if (d.authMode === "api_key") {
         if (!d.apiKey) return 'anthropic api-key connections need "apiKey"';
-        return null;
+        return anthropicSecretMismatch("api_key", d.apiKey as string);
       }
       if (!d.apiKey && !d.authToken) {
         return 'anthropic connections need "apiKey" or "authToken"';
       }
-      return null;
+      // Untagged: the field the value landed in is the only stated intent.
+      if (d.authToken) return anthropicSecretMismatch("auth_token", d.authToken as string);
+      return anthropicSecretMismatch("api_key", d.apiKey as string);
     }
     if (vendor === "gemini") {
       if (!d.apiKey) return `${vendor} connections need "apiKey"`;
