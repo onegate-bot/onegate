@@ -17,6 +17,7 @@ const SLUGS = {
   resend: "resend", todoist: "todoist", trello: "trello", "mongodb-atlas": "mongodb",
   docker: "docker", "jfrog-artifactory": "jfrog", "github-app": "github",
   elevenlabs: "elevenlabs", make: "make", flyio: "flydotio", hetzner: "hetzner",
+  youtube: "youtube",
 };
 
 // Brands simple-icons no longer ships: monogram fallback (title + brand hex).

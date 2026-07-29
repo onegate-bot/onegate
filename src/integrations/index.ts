@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { Registry, type Integration } from "./types.js";
 import { github } from "./github.js";
 import { google } from "./google.js";
+import { youtube } from "./youtube.js";
 import { gemini } from "./gemini.js";
 import { gcp } from "./gcp.js";
 import { aws } from "./aws.js";
@@ -51,6 +52,10 @@ import { make } from "./make.js";
  * Built-ins in registration order. Order matters for host resolution:
  *  - google's explicit Workspace hosts resolve before gcp's `.googleapis.com`
  *    dot-suffix claim.
+ *  - youtube claims only the `/youtube/v3` PATH SCOPE of google's
+ *    www.googleapis.com. A path-scoped claim is more specific than a bare host
+ *    claim regardless of registration order, so google keeps every other path on
+ *    that host (see Registry.resolveHostPathCandidates).
  *  - gemini's generativelanguage.googleapis.com also falls under gcp's
  *    dot-suffix, registering gemini before gcp makes it the first candidate.
  *  - confluence shares api.atlassian.com with jira (registered first), the
@@ -62,6 +67,7 @@ import { make } from "./make.js";
 const BUILTINS: Integration[] = [
   github,
   google,
+  youtube,
   gemini,
   gcp,
   aws,
