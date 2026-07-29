@@ -18,6 +18,7 @@ import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
 import { buildAuthUrl, exchangeCode } from "../integrations/oauth.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
+import { normalizeInstanceOrigin } from "../util/instance-origin.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
 import type { Agent } from "../types.js";
@@ -1299,6 +1300,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     ownerAgentId?: string | null;
     isDefault: boolean;
     leaseTtlSeconds?: number | null;
+    instanceOrigin?: string | null;
     createdAt: string;
     updatedAt: string;
   }) {
@@ -1344,6 +1346,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
             leaseEffectiveSeconds: store.effectiveLeaseTtlSeconds(c.vendor, c.leaseTtlSeconds ?? null),
           }
         : {}),
+      // The owner's self-managed deployment origin, when this connection targets
+      // one. Non-secret: it is a hostname the owner supplied and must be visible
+      // so an operator can see which host this credential is pinned to.
+      ...(c.kind === "app" ? { instanceOrigin: c.instanceOrigin ?? null } : {}),
       ...(authMode !== undefined ? { authMode } : {}),
     };
   }
@@ -1435,8 +1441,67 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     res.json({ llm, apps: [...legacy, ...named] });
   });
 
+  /**
+   * Validates an owner-supplied instance origin for `integration`, returning the
+   * canonical origin, null (when none was supplied), or an error to send as 400.
+   *
+   * Three checks beyond the syntactic/SSRF guards in normalizeInstanceOrigin:
+   *   1. the integration must DECLARE supportsInstanceOrigin. Otherwise an owner
+   *      could bolt a self-hosted host onto a pure-SaaS integration.
+   *   2. the host must not already be claimed by a builtin integration. Claiming
+   *      api.github.com would redirect a real vendor's traffic to a credential of
+   *      the owner's choosing: a credential-redirection attack.
+   *   3. the origin must not already be claimed by another connection, so a host
+   *      never resolves ambiguously to two credentials.
+   */
+  function validateInstanceOrigin(
+    raw: unknown,
+    integration: Integration,
+    excludeConnectionId?: string,
+  ): { origin: string | null } | { error: { error: string; message: string } } {
+    if (raw === undefined || raw === null || raw === "") return { origin: null };
+
+    if (!integration.supportsInstanceOrigin) {
+      return {
+        error: {
+          error: "instance_origin_unsupported",
+          message: `Integration "${integration.id}" does not support a self-managed instance origin.`,
+        },
+      };
+    }
+
+    const parsed = normalizeInstanceOrigin(raw);
+    if ("error" in parsed) {
+      return { error: { error: parsed.error.code, message: parsed.error.message } };
+    }
+
+    // A builtin host claim always wins, so allowing this row would create a
+    // permanently dead claim at best and an attempted hijack at worst.
+    const claimed = registry.resolveStaticHostCandidates(parsed.host);
+    if (claimed.length > 0) {
+      return {
+        error: {
+          error: "instance_origin_reserved_host",
+          message: `Host "${parsed.host}" is already claimed by the "${claimed[0].id}" integration and cannot be used as an instance origin.`,
+        },
+      };
+    }
+
+    const clash = store.getConnectionByInstanceOrigin(parsed.origin);
+    if (clash && clash.id !== excludeConnectionId) {
+      return {
+        error: {
+          error: "instance_origin_conflict",
+          message: `Instance origin "${parsed.origin}" is already claimed by connection "${clash.id}".`,
+        },
+      };
+    }
+
+    return { origin: parsed.origin };
+  }
+
   app.post("/api/connections", (req, res) => {
-    const { kind, vendor, name, data, isDefault, ownerAgentId } = req.body ?? {};
+    const { kind, vendor, name, data, isDefault, ownerAgentId, instanceOrigin } = req.body ?? {};
     if (kind !== "llm" && kind !== "app") {
       res.status(400).json({ error: "unsupported_kind", message: 'kind must be "llm" or "app"' });
       return;
@@ -1478,6 +1543,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         res.status(400).json({ error: "invalid_data", message: dataError });
         return;
       }
+      const originResult = validateInstanceOrigin(instanceOrigin, appIntegration);
+      if ("error" in originResult) {
+        res.status(400).json(originResult.error);
+        return;
+      }
       const conn = store.createConnection({
         kind: "app",
         vendor,
@@ -1485,6 +1555,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         data,
         ownerAgentId: owner,
         isDefault: isDefault === true,
+        instanceOrigin: originResult.origin,
       });
       res.status(201).json(publicConnection(conn));
       return;
@@ -1518,7 +1589,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(404).json({ error: "not_found" });
       return;
     }
-    const { name, data, isDefault, ownerAgentId } = req.body ?? {};
+    const { name, data, isDefault, ownerAgentId, instanceOrigin } = req.body ?? {};
     if (name !== undefined && (typeof name !== "string" || !name.trim())) {
       res.status(400).json({ error: "invalid_name" });
       return;
@@ -1557,10 +1628,34 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         return;
       }
     }
+    // Instance origin: omitted = leave as-is; null or "" = clear the claim;
+    // a string = validate and re-claim. Only meaningful for app connections.
+    let nextInstanceOrigin: string | null | undefined;
+    if (instanceOrigin !== undefined) {
+      if (cur.kind !== "app") {
+        res.status(400).json({
+          error: "instance_origin_unsupported",
+          message: "instanceOrigin applies to app connections only",
+        });
+        return;
+      }
+      const integration = registry.get(cur.vendor);
+      if (!integration) {
+        res.status(400).json({ error: "unknown_vendor", message: `Unknown integration "${cur.vendor}"` });
+        return;
+      }
+      const originResult = validateInstanceOrigin(instanceOrigin, integration, cur.id);
+      if ("error" in originResult) {
+        res.status(400).json(originResult.error);
+        return;
+      }
+      nextInstanceOrigin = originResult.origin;
+    }
     const updated = store.updateConnection(req.params.id, {
       name: name === undefined ? undefined : name.trim(),
       data: nextData,
       isDefault,
+      instanceOrigin: nextInstanceOrigin,
     });
     res.json(publicConnection(updated!));
   });

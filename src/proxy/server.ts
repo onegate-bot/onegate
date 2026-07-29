@@ -211,6 +211,10 @@ export class GatewayProxy {
   constructor(opts: ProxyOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    // Teach host resolution about owner-supplied instance origins. Wired here
+    // (rather than at each call site) so every proxy, including in tests, sees
+    // the same host view as the store it was constructed with.
+    opts.registry.setInstanceOriginLookup((host) => opts.store.instanceOriginClaimFor(host));
     this.upstreamAgent = new https.Agent({ keepAlive: true, ...opts.upstreamTls });
     this.server = http.createServer((req, res) => {
       // Plain (non-CONNECT) proxy requests are not supported: the gateway
@@ -674,6 +678,57 @@ export class GatewayProxy {
   }
 
   /**
+   * When `host` is claimed as a connection's self-managed instance origin,
+   * returns the resolution for THAT connection, else null (meaning: not a
+   * self-managed host, resolve normally).
+   *
+   * The claiming connection is still subject to the grant check. A connection
+   * the agent cannot use does not become usable by virtue of owning the host,
+   * and the agent is NOT silently served some other connection's credential
+   * instead: it gets connection_not_granted, exactly as it would for any
+   * ungranted connection.
+   */
+  private resolveInstanceOriginConnection(
+    agent: Agent,
+    integration: Integration,
+    host: string,
+    method: string,
+    path: string,
+    res: http.ServerResponse,
+  ): ({ sent: true } | { sent: false; connection: Connection | null }) | null {
+    const claim = this.opts.store.instanceOriginClaimFor(host);
+    if (!claim || claim.integrationId !== integration.id) return null;
+
+    const granted = this.opts.store
+      .listAppConnectionsForAgent(agent.id, integration.id)
+      .some((c) => c.id === claim.connectionId);
+    if (!granted) {
+      this.opts.store.audit({
+        agentId: agent.id,
+        agentName: agent.name,
+        integrationId: integration.id,
+        host,
+        method,
+        path,
+        decision: "connection_not_granted",
+        status: 403,
+      });
+      this.maybeNotifyOwner(agent, integration, "connection_not_granted");
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "onegate_connection_not_granted",
+          message: `Host "${host}" is the self-managed instance of connection "${claim.connectionId}", which is not granted to agent "${agent.name}".`,
+        }),
+      );
+      return { sent: true };
+    }
+
+    const connection = this.opts.store.getConnection(claim.connectionId);
+    return connection ? { sent: false, connection } : null;
+  }
+
+  /**
    * Resolves the app connection for a request (x-onegate-connection header, else
    * the agent's saved choice, else the tenant default), writing the appropriate
    * error response itself when resolution fails.
@@ -686,6 +741,14 @@ export class GatewayProxy {
    *
    * Extracted so both the normal allow path and the deny-branch phase-2 recovery
    * can resolve the connection identically without duplicating the logic.
+   *
+   * SELF-MANAGED INSTANCES: when `host` is an owner-supplied instance origin,
+   * resolution is PINNED to the connection that claimed it. Normal resolution
+   * selects by integration id alone, which for a self-hosted deployment would
+   * be a credential-redirection bug: a request to gitlab.acme.example could be
+   * served the gitlab.com SaaS token (or the reverse). The claiming connection
+   * is the only credential that belongs to that host, so it is used directly,
+   * subject to the same grant check as any other connection.
    */
   private resolveConnectionForRequest(
     req: http.IncomingMessage,
@@ -696,6 +759,16 @@ export class GatewayProxy {
     method: string,
     path: string,
   ): { sent: true } | { sent: false; connection: Connection | null } {
+    const pinned = this.resolveInstanceOriginConnection(
+      agent,
+      integration,
+      host,
+      method,
+      path,
+      res,
+    );
+    if (pinned) return pinned;
+
     const headerValue = singleHeader(req.headers["x-onegate-connection"]);
     const resolved = this.opts.store.resolveAppConnection(agent.id, integration.id, headerValue);
     if (resolved && "error" in resolved) {

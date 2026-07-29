@@ -5,6 +5,7 @@
  *   onegate connections add --vendor <v> --name <n> [secret flags] [--default]   (LLM)
  *   onegate connections add --kind app --integration <id> --name <n> --data k=v [--agent <id>] [--default]
  *   onegate connections set-default <id>
+ *   onegate connections set-instance-origin <id> (https://your.host | --clear)
  *   onegate connections rm <id>
  *   onegate connections grants --id <conn>                          (list grants)
  *   onegate connections grant  --id <conn> (--agent <id> | --project <id>)
@@ -96,6 +97,8 @@ interface AppConnection extends PublicConnection {
   ownerAgentId: string | null;
   ownerAgentName: string | null;
   legacy?: boolean;
+  /** Self-managed deployment origin this connection is pinned to, if any. */
+  instanceOrigin?: string | null;
 }
 
 async function list(ctx: CliContext): Promise<void> {
@@ -137,6 +140,9 @@ async function list(ctx: CliContext): Promise<void> {
           ? `agent: ${a.ownerAgentName ?? a.ownerAgentId}`
           : "tenant-wide",
       isDefault: a.isDefault,
+      // Blank for the common SaaS case, so the column only draws attention
+      // when a connection is pinned to a self-managed deployment.
+      instance: a.instanceOrigin ?? "",
     }));
     console.log(
       table(appRows, [
@@ -145,6 +151,7 @@ async function list(ctx: CliContext): Promise<void> {
         ["NAME", "name"],
         ["SCOPE", "scope"],
         ["DEFAULT", "isDefault"],
+        ["INSTANCE", "instance"],
       ]),
     );
   });
@@ -166,6 +173,7 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
       "secret-stdin": { type: "boolean", default: false },
       "auth-token-stdin": { type: "boolean", default: false },
       default: { type: "boolean", default: false },
+      "instance-origin": { type: "string" },
       "allow-disabled-vendor": { type: "boolean", default: false },
     },
   });
@@ -222,13 +230,17 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
  * Adds a named app (service) connection. Scope is tenant-wide by default, or
  * agent-bound when --agent <id> is given. Secret material comes from one or more
  * --data k=v pairs and is never echoed back.
+ *
+ * --instance-origin points the connection at a self-managed deployment of the
+ * integration (e.g. https://gitlab.acme.example). It is validated server-side
+ * and only accepted for integrations that declare support for it.
  */
 async function addApp(ctx: CliContext, values: Record<string, unknown>): Promise<void> {
   const integration = (values.integration as string | undefined) ?? (values.vendor as string | undefined);
   const name = values.name as string | undefined;
   if (!integration || !name) {
     throw new Error(
-      "usage: onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default]",
+      "usage: onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default] [--instance-origin https://host]",
     );
   }
   const pairs = (values.data as string[]) ?? [];
@@ -248,11 +260,13 @@ async function addApp(ctx: CliContext, values: Record<string, unknown>): Promise
     data,
     ownerAgentId: (values.agent as string | undefined) ?? null,
     isDefault: values.default === true,
+    instanceOrigin: (values["instance-origin"] as string | undefined) ?? null,
   })) as AppConnection;
   emit(conn, () => {
     const scope = conn.ownerAgentId ? `agent ${conn.ownerAgentName ?? conn.ownerAgentId}` : "tenant-wide";
+    const where = conn.instanceOrigin ? `, instance=${conn.instanceOrigin}` : "";
     console.log(
-      `App connection "${conn.name}" created (${conn.id}, integration=${conn.vendor}, scope=${scope}, default=${conn.isDefault}).`,
+      `App connection "${conn.name}" created (${conn.id}, integration=${conn.vendor}, scope=${scope}, default=${conn.isDefault}${where}).`,
     );
   });
 }
@@ -287,6 +301,37 @@ async function setDefault(ctx: CliContext, args: string[]): Promise<void> {
     isDefault: true,
   })) as PublicConnection;
   emit(conn, () => console.log(`"${conn.name}" (${conn.id}) is now the default for ${conn.vendor}.`));
+}
+
+/**
+ * Points an existing connection at a self-managed deployment, or clears the
+ * claim with `--clear`.
+ *
+ * This is the only way to set an origin on an OAuth integration such as GitLab,
+ * because those connections are minted by the browser consent round-trip rather
+ * than by `connections add`. Validation (https only, SSRF ranges, reserved
+ * builtin hosts, uniqueness) happens server-side, so the CLI just forwards.
+ */
+async function setInstanceOrigin(ctx: CliContext, args: string[]): Promise<void> {
+  const id = args[0];
+  const rest = args.slice(1);
+  const clear = rest.includes("--clear");
+  const origin = rest.find((a) => !a.startsWith("--"));
+  if (!id || (!origin && !clear)) {
+    throw new Error(
+      "usage: onegate connections set-instance-origin <id> (https://your.host | --clear)",
+    );
+  }
+  const conn = (await ctx.client().put(`/api/connections/${encodeURIComponent(id)}`, {
+    instanceOrigin: clear ? null : origin,
+  })) as AppConnection;
+  emit(conn, () =>
+    console.log(
+      conn.instanceOrigin
+        ? `"${conn.name}" (${conn.id}) now targets ${conn.instanceOrigin}.`
+        : `"${conn.name}" (${conn.id}) no longer targets a self-managed instance.`,
+    ),
+  );
 }
 
 async function remove(ctx: CliContext, args: string[]): Promise<void> {
@@ -406,12 +451,13 @@ export async function connectionsCommand(ctx: CliContext, sub: string, args: str
   if (sub === "list" || sub === "ls") return list(ctx);
   if (sub === "add") return add(ctx, args);
   if (sub === "set-default") return setDefault(ctx, args);
+  if (sub === "set-instance-origin") return setInstanceOrigin(ctx, args);
   if (sub === "rm" || sub === "remove" || sub === "delete") return remove(ctx, args);
   if (sub === "grants") return grantsList(ctx, args);
   if (sub === "grant") return grant(ctx, args);
   if (sub === "revoke") return revoke(ctx, args);
   throw new Error(
-    `unknown connections command "${sub ?? ""}". Try: list, add, set-default, rm, grants, grant, revoke`,
+    `unknown connections command "${sub ?? ""}". Try: list, add, set-default, set-instance-origin, rm, grants, grant, revoke`,
   );
 }
 

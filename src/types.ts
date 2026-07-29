@@ -125,6 +125,19 @@ export interface Connection {
    * Non-time-boxed integrations leave this null and get no lease.
    */
   leaseTtlSeconds?: number | null;
+  /**
+   * App connections only, and only for integrations declaring
+   * `supportsInstanceOrigin`: the canonical https origin of the owner's
+   * self-managed deployment, e.g. "https://gitlab.acme.example" (no port, no
+   * trailing slash, lowercased). NULL = the connection targets the
+   * integration's builtin SaaS hosts, which is every pre-existing connection.
+   *
+   * A non-null value makes that origin's host resolve to this integration and
+   * pins injection to THIS connection, so a SaaS token is never sent to a
+   * self-hosted instance or vice versa. Validated on write, unique across
+   * connections, and never allowed to name a builtin integration's host.
+   */
+  instanceOrigin?: string | null;
   createdAt: string;
   updatedAt: string;
 }

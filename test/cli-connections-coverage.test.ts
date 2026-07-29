@@ -434,7 +434,9 @@ describe("cli connections: unknown subcommand", () => {
     const { err, exit } = await run("connections", "frobnicate");
     expect(exit).toBe(1);
     expect(err).toContain('unknown connections command "frobnicate"');
-    expect(err).toContain("list, add, set-default, rm, grants, grant, revoke");
+    expect(err).toContain(
+      "list, add, set-default, set-instance-origin, rm, grants, grant, revoke",
+    );
   });
 });
 

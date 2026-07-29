@@ -194,8 +194,9 @@ Local commands (operate the data dir directly):
 Admin API commands (talk to a running gateway over --host + admin token):
   onegate connections list
   onegate connections add --vendor <v> --name <n> [--api-key|--auth-token|--auth-json|--secret-stdin] [--default]   (LLM)
-  onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default]
+  onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default] [--instance-origin https://host]
   onegate connections set-default <id>
+  onegate connections set-instance-origin <id> (https://your.host | --clear)   point an app connection at a self-managed instance
   onegate connections rm <id>
   onegate connections grants --id <conn>                                     list grants on an app connection
   onegate connections grant  --id <conn> (--agent <id> | --project <id>)     grant a named app connection (default-deny)
