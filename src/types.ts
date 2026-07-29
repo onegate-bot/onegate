@@ -4,6 +4,30 @@ export type Effect = "allow" | "deny";
 export type DefaultPolicy = "allow-all" | "deny-unmatched";
 export type RuleScope = "agent" | "project";
 /**
+ * A rule's action, layered ON TOP of `effect`.
+ *
+ * Absent/null = the rule behaves exactly as its `effect` says (every rule that
+ * existed before this feature).
+ *
+ * "require_approval" = a held capability: the request is neither allowed
+ * outright nor refused outright. It is parked as a pending approval that the
+ * owner approves or rejects.
+ *
+ * DELIBERATE STORAGE INVARIANT: a require_approval rule is persisted with
+ * `effect = "deny"`. Two reasons, both load-bearing:
+ *   1. `rules.effect` carries a legacy `CHECK (effect IN ('allow','deny'))`
+ *      constraint. SQLite cannot alter a CHECK, so a third effect value would
+ *      force a full table rebuild. A separate nullable `action` column needs
+ *      only an idempotent ALTER, matching the established migration style.
+ *   2. FAIL-CLOSED BY CONSTRUCTION. Several call sites read `effect` without
+ *      knowing about actions (llm/mode.ts vendorAllowed, discovery.ts access
+ *      badge, admin/api.ts). Storing "deny" means every such reader treats a
+ *      require_approval rule as a denial, which is the safe direction. Had it
+ *      been stored as "allow", an unaware reader would grant access with no
+ *      approval ever taking place.
+ */
+export type RuleAction = "require_approval";
+/**
  * How a connection-scoped rule relates to its `connectionId`:
  *   - "only":   the rule participates only when the resolved connection IS connectionId.
  *   - "except": the rule participates only when the resolved connection is NOT connectionId.
@@ -46,6 +70,12 @@ export interface Rule {
   /** Glob over the URL path: `*` = one segment, `**` = anything. */
   pathGlob: string;
   effect: Effect;
+  /**
+   * Optional action layered on `effect`. Absent = plain allow/deny (legacy).
+   * "require_approval" rules are stored with `effect = "deny"` so any reader
+   * unaware of actions fails closed. See RuleAction.
+   */
+  action?: RuleAction | null;
   createdAt: string;
   /**
    * Access lease (time-boxed allow). When set, this allow rule stops granting
@@ -310,4 +340,47 @@ export interface OwnerNotification {
    * requests within one lapse do not spam.
    */
   dedupKey?: string | null;
+}
+
+/** Lifecycle of a pending approval. Only "pending" is actionable. */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+
+/**
+ * A request held for an owner decision, created when a `require_approval` rule
+ * matches. The owner opens a one-tap approve/reject link; the agent is told the
+ * call is PENDING (not denied) and retries later.
+ *
+ * PHASE ONE does not replay the held request: approval creates an allow window
+ * that the agent's own retry lands in. That is why `status` and `expiresAt`
+ * matter more than any stored request body (none is kept).
+ */
+export interface Approval {
+  id: string;
+  agentId: string;
+  integrationId: string;
+  /** The require_approval rule that held this request. */
+  ruleId: string;
+  /** Uppercase HTTP method of the held request, for owner-facing context. */
+  method: string;
+  /** Canonical path of the held request, for owner-facing context. */
+  path: string;
+  /**
+   * SHA-256 of the approve/reject capability token. Like onboarding links, only
+   * the HASH is persisted; the plaintext exists solely in the URL handed to the
+   * owner at creation time. Minted as hex (never base64url) because chat
+   * clients mangle underscores in auto-linkified URLs.
+   */
+  tokenHash: string;
+  /**
+   * Plaintext token. Present ONLY on the object returned at creation time and
+   * when a caller presents it for redemption. Reads from storage carry the hash
+   * here, never a usable token.
+   */
+  token: string;
+  status: ApprovalStatus;
+  createdAt: string;
+  /** Absolute expiry. A pending approval past this is treated as expired. */
+  expiresAt: string;
+  /** When the owner decided, null while pending. */
+  decidedAt: string | null;
 }
