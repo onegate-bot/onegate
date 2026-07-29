@@ -10,11 +10,13 @@ import { join } from "node:path";
 import { Registry, type Integration } from "./types.js";
 import { github } from "./github.js";
 import { google } from "./google.js";
+import { youtube } from "./youtube.js";
 import { gemini } from "./gemini.js";
 import { gcp } from "./gcp.js";
 import { aws } from "./aws.js";
 import { slack } from "./slack.js";
 import { openai } from "./openai.js";
+import { openrouter } from "./openrouter.js";
 import { anthropic } from "./anthropic.js";
 import { jira } from "./jira.js";
 import { notion } from "./notion.js";
@@ -44,7 +46,6 @@ import { docker } from "./docker.js";
 import { jfrogArtifactory } from "./jfrog-artifactory.js";
 import { githubApp } from "./github-app.js";
 import { elevenlabs } from "./elevenlabs.js";
-import { openrouter } from "./openrouter.js";
 import { make } from "./make.js";
 
 /**
@@ -55,6 +56,9 @@ import { make } from "./make.js";
  * therefore change which credential gets injected).
  *  - google's and gemini's explicit *.googleapis.com hosts outrank gcp's
  *    `.googleapis.com` dot-suffix claim by specificity, not by position.
+ *  - youtube claims only the `/youtube/v3` PATH SCOPE of google's
+ *    www.googleapis.com. A path-scoped claim is more specific than a bare host
+ *    claim, so google keeps every other path on that host (see Registry.resolveHostPathCandidates).
  *  - confluence/jira (api.atlassian.com) and github/github-app (every github
  *    host) are equally specific exact claims, so they stay multiple
  *    candidates and the proxy picks the one with a connected credential.
@@ -64,6 +68,7 @@ import { make } from "./make.js";
 const BUILTINS: Integration[] = [
   github,
   google,
+  youtube,
   gemini,
   gcp,
   aws,
