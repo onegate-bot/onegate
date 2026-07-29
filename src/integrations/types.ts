@@ -214,6 +214,20 @@ export interface Integration {
   needsBody?: boolean;
   /** Present on LLM vendor integrations, enables per-agent connection routing. */
   llm?: LlmMeta;
+  /**
+   * True when this integration also ships as a self-managed deployment, so a
+   * connection may carry an owner-supplied `instanceOrigin` (an https origin
+   * like https://gitlab.acme.example). Host resolution then treats that
+   * origin's host as belonging to this integration, and the proxy injects
+   * exactly the connection that declared it.
+   *
+   * Only set this for integrations whose self-hosted API is compatible with
+   * the SaaS one, since `inject` is shared between them. Owner-supplied
+   * origins are validated (https, no IP literals, no internal ranges) and can
+   * never claim a host a builtin integration already owns: see
+   * util/instance-origin.ts.
+   */
+  supportsInstanceOrigin?: boolean;
   /** True for integrations loaded from the community drop-in directory. */
   community?: boolean;
   /**
@@ -248,8 +262,53 @@ export function connectFlowKind(integration: Integration): "oauth" | "credential
   return null;
 }
 
+/**
+ * One owner-supplied instance-origin claim: a connection saying "this host is
+ * my self-managed deployment of this integration". Supplied to the Registry by
+ * the store so host resolution can consult live connection data without the
+ * registry depending on the database.
+ */
+export interface InstanceOriginClaim {
+  /** Lowercased hostname of the claimed origin (no scheme, no port). */
+  host: string;
+  /** The integration the claiming connection belongs to. */
+  integrationId: string;
+  /** The claiming connection's id, so the proxy can pin injection to it. */
+  connectionId: string;
+}
+
+/** Supplies the current set of instance-origin claims, newest state each call. */
+export type InstanceOriginClaimLookup = (host: string) => InstanceOriginClaim | null;
+
 export class Registry {
   private byId = new Map<string, Integration>();
+  private originClaims: InstanceOriginClaimLookup | null = null;
+
+  /**
+   * Installs the owner-supplied instance-origin lookup. Called once at wiring
+   * time with a store-backed function. Until it is installed (and for every
+   * host with no claim) resolution behaves exactly as before.
+   */
+  setInstanceOriginLookup(lookup: InstanceOriginClaimLookup | null): void {
+    this.originClaims = lookup;
+  }
+
+  /**
+   * Returns the owner-supplied claim for `host`, or null. Builtin host claims
+   * always win: `resolveHostCandidates` checks static hosts first and only
+   * falls back here, so an instance origin can never displace a builtin (the
+   * admin API also refuses to store such an origin in the first place, this is
+   * the defence in depth for rows written before a builtin grew a new host).
+   */
+  instanceOriginClaim(host: string): InstanceOriginClaim | null {
+    if (!this.originClaims) return null;
+    const claim = this.originClaims(host.toLowerCase());
+    if (!claim) return null;
+    // A claim is only honoured while its integration still declares support.
+    const integration = this.byId.get(claim.integrationId);
+    if (!integration?.supportsInstanceOrigin) return null;
+    return claim;
+  }
 
   register(integration: Integration): void {
     if (this.byId.has(integration.id)) {
@@ -277,7 +336,15 @@ export class Registry {
    * picks the first candidate with a connected credential, so connecting
    * exactly one of the overlapping integrations selects it.
    */
-  resolveHostCandidates(host: string): Integration[] {
+  /**
+   * Integrations claiming `host` via their DECLARED static hosts only, ignoring
+   * owner-supplied instance origins.
+   *
+   * Callers validating a proposed instance origin must use this: asking the
+   * full resolver would also see instance-origin claims, so a host would appear
+   * "already claimed" by the very connection being validated.
+   */
+  resolveStaticHostCandidates(host: string): Integration[] {
     const h = host.toLowerCase();
     const out: Integration[] = [];
     for (const integration of this.byId.values()) {
@@ -291,6 +358,22 @@ export class Registry {
           out.push(integration);
           break;
         }
+      }
+    }
+    return out;
+  }
+
+  resolveHostCandidates(host: string): Integration[] {
+    const h = host.toLowerCase();
+    const out = this.resolveStaticHostCandidates(h);
+    // Static host claims take precedence, always. Only when no builtin owns
+    // this host do we consult owner-supplied instance origins, so a connection
+    // can never hijack api.github.com even if a stale row claims it.
+    if (out.length === 0) {
+      const claim = this.instanceOriginClaim(h);
+      if (claim) {
+        const integration = this.byId.get(claim.integrationId);
+        if (integration) out.push(integration);
       }
     }
     return out;
