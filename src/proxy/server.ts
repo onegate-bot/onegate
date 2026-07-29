@@ -287,16 +287,28 @@ export class GatewayProxy {
     // A host may be claimed by several integrations (api.github.com belongs
     // to both the github PAT integration and github-app). The connected one
     // wins; with none or several connected, registration order decides.
-    const candidates = this.opts.registry.resolveHostCandidates(host);
-    const integration =
-      candidates.length > 1
-        ? (candidates.find((i) => this.opts.store.getCredential(i.id)) ?? candidates[0])
-        : (candidates[0] ?? null);
+    //
+    // No path is known at CONNECT time, so this is the host-only view: it only
+    // decides whether to MITM-terminate the host (every candidate terminates
+    // identically). When a path-scoped claim is in play, the integration is
+    // re-resolved per inner request in onInnerRequest, where the path is known.
+    const integration = this.pickCandidate(this.opts.registry.resolveHostCandidates(host));
     if (!integration || port !== 443) {
       this.passthrough(agent, host, port, socket, head);
       return;
     }
     this.terminate(agent, integration, host, port, socket, head);
+  }
+
+  /**
+   * Picks one integration from an ordered candidate list: the first with a
+   * connected credential, else the first candidate. The list is already sorted
+   * most-specific-first by the registry, so a path-scoped claim outranks a bare
+   * host claim, and a connected credential then breaks ties among equals.
+   */
+  private pickCandidate(candidates: Integration[]): Integration | null {
+    if (candidates.length <= 1) return candidates[0] ?? null;
+    return candidates.find((i) => this.opts.store.getCredential(i.id)) ?? candidates[0];
   }
 
   /** Opaque tunnel for hosts we have no integration for. */
@@ -767,7 +779,7 @@ export class GatewayProxy {
       this.handleDiscovery(req, res, ctx);
       return;
     }
-    const { agent, host, port, integration } = ctx;
+    const { agent, host, port } = ctx;
     const method = (req.method ?? "GET").toUpperCase();
     // Canonicalize the request target ONCE: percent-decode, collapse dot-segments
     // and duplicate slashes (query preserved). Policy matching, audit AND the
@@ -775,6 +787,20 @@ export class GatewayProxy {
     // be evaded with an equivalent-but-encoded path (%2F, //, /../) that the
     // vendor would still honor. See normalizeRequestPath.
     const path = normalizeRequestPath(req.url ?? "/");
+
+    // Re-resolve the integration now that the path is known, so a path-scoped
+    // host claim can win over a bare claim on the same host (one hostname
+    // serving two auth modes, e.g. www.googleapis.com: Workspace OAuth broadly
+    // plus the API-key-only YouTube Data API under /youtube/v3). Deliberately
+    // uses the SAME canonical path policy and audit use, so the credential
+    // injected always belongs to the request actually forwarded upstream.
+    //
+    // With no path-scoped claim on this host the candidate list is identical to
+    // the CONNECT-time one, so this resolves to the very same integration and
+    // behaviour is unchanged.
+    const integration =
+      this.pickCandidate(this.opts.registry.resolveHostPathCandidates(host, path)) ??
+      ctx.integration;
 
     const rules = this.opts.store.rulesForAgent(agent);
     const verdict = evaluate(agent, rules, { integrationId: integration.id, method, path });
@@ -893,7 +919,10 @@ export class GatewayProxy {
       await this.handleLlmRequest(
         req,
         res,
-        ctx,
+        // Carry the path-resolved integration (identical to ctx.integration
+        // unless a path-scoped claim narrowed it) so the LLM path injects and
+        // audits under the integration that actually owns this request's path.
+        { ...ctx, integration },
         effectiveVerdict.ruleId,
         llmRoute,
         rules,

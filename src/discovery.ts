@@ -13,7 +13,7 @@
  */
 
 import type { Store } from "./store/db.js";
-import type { Registry } from "./integrations/types.js";
+import type { HostClaim, Registry } from "./integrations/types.js";
 import type { Agent, Connection, Credential } from "./types.js";
 import { evaluate } from "./policy.js";
 
@@ -33,6 +33,12 @@ export interface DiscoveryAccount {
 export interface DiscoveryIntegration {
   id: string;
   title: string;
+  /**
+   * Hosts this integration serves. A path-scoped claim is rendered as
+   * "host/prefix" (e.g. "www.googleapis.com/youtube/v3"), which is exactly the
+   * base an agent should call. Bare host claims render unchanged, so the wire
+   * format is still a plain string list.
+   */
   hosts: string[];
   /**
    * Coarse policy hint at path "/": "allowed" when an allow rule covers this
@@ -48,6 +54,16 @@ export interface DiscoveryIntegration {
 export interface DiscoveryResult {
   agent: { id: string; name: string };
   integrations: DiscoveryIntegration[];
+}
+
+/**
+ * Renders one host claim for the agent-facing payload. A bare claim is the
+ * hostname unchanged (so nothing an agent already reads ever changes). A
+ * path-scoped claim renders as "host/prefix", which is the base the agent
+ * should actually call, e.g. "www.googleapis.com/youtube/v3".
+ */
+function renderHostClaim(entry: HostClaim): string {
+  return typeof entry === "string" ? entry : `${entry.host}${entry.path}`;
 }
 
 function synthCredential(integrationId: string, c: Connection): Credential {
@@ -140,7 +156,7 @@ export function buildDiscovery(
     integrations.push({
       id: integration.id,
       title: integration.title,
-      hosts: integration.hosts,
+      hosts: integration.hosts.map(renderHostClaim),
       access: verdict.effect === "deny" ? "denied" : "allowed",
       accounts,
       defaultAccountId: defaultId,
