@@ -4,6 +4,7 @@
  *   onegate rules list
  *   onegate rules add --scope agent|project --subject <id> --integration <id>
  *                     --effect allow|deny [--methods GET,POST] [--path /**]
+ *                     [--action require_approval]
  *   onegate rules rm <id>
  */
 
@@ -20,6 +21,7 @@ interface Rule {
   methods: string[];
   pathGlob: string;
   effect: string;
+  action?: string | null;
   expiresAt?: string | null;
   leaseTtlSeconds?: number | null;
   connectionId?: string | null;
@@ -47,6 +49,9 @@ async function list(ctx: CliContext): Promise<void> {
       ...r,
       lease: leaseCell(r),
       connection: r.connectionScope ? `${r.connectionScope} ${r.connectionId}` : "-",
+      // A require_approval rule is stored with effect "deny", so EFFECT alone
+      // would read as a flat block. ACTION is what tells them apart.
+      action: r.action ?? "-",
       // "grant" marks a rule auto-created alongside a connection grant, so an
       // operator can tell it apart from one they wrote by hand.
       origin: r.createdBy === "grant" ? "grant" : "operator",
@@ -60,6 +65,7 @@ async function list(ctx: CliContext): Promise<void> {
         ["METHODS", "methods"],
         ["PATH", "pathGlob"],
         ["EFFECT", "effect"],
+        ["ACTION", "action"],
         ["CONNECTION", "connection"],
         ["ORIGIN", "origin"],
         ["LEASE", "lease"],
@@ -81,12 +87,19 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
       ttl: { type: "string" },
       connection: { type: "string" },
       "connection-scope": { type: "string" },
+      action: { type: "string" },
     },
   });
   if (!values.scope || !values.subject || !values.integration || !values.effect) {
     throw new Error(
-      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**] [--ttl <seconds|Nh>] [--connection <conn-id> --connection-scope only|except]",
+      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**] [--ttl <seconds|Nh>] [--connection <conn-id> --connection-scope only|except] [--action require_approval]",
     );
+  }
+  // Rejected here as well as server-side: a typo must never fall through and
+  // leave a rule that silently behaves as whatever --effect said.
+  const action = values.action as string | undefined;
+  if (action != null && action !== "require_approval") {
+    throw new Error(`invalid --action "${action}" (only "require_approval" is supported)`);
   }
   const connectionScope = values["connection-scope"] as string | undefined;
   if (connectionScope != null && connectionScope !== "only" && connectionScope !== "except") {
@@ -118,10 +131,11 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
     pathGlob: values.path,
     ...(ttlSeconds != null ? { ttlSeconds } : {}),
     ...(values.connection ? { connectionId: values.connection, connectionScope } : {}),
+    ...(action ? { action } : {}),
   })) as Rule;
   emit(rule, () =>
     console.log(
-      `Rule ${rule.id}: ${rule.effect} ${rule.scope}:${rule.subjectId} -> ${rule.integrationId} ${rule.methods.join(",")} ${rule.pathGlob}${rule.connectionScope ? ` [connection ${rule.connectionScope} ${rule.connectionId}]` : ""}${rule.leaseTtlSeconds ? ` [lease ${leaseCell(rule)}]` : ""}`,
+      `Rule ${rule.id}: ${rule.action ?? rule.effect} ${rule.scope}:${rule.subjectId} -> ${rule.integrationId} ${rule.methods.join(",")} ${rule.pathGlob}${rule.connectionScope ? ` [connection ${rule.connectionScope} ${rule.connectionId}]` : ""}${rule.leaseTtlSeconds ? ` [lease ${leaseCell(rule)}]` : ""}`,
     ),
   );
 }
