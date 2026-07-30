@@ -102,16 +102,56 @@ const HOP_BY_HOP = new Set([
 const STRIPPED_REQUEST_HEADERS = new Set(["authorization", "x-onegate-connection"]);
 
 /**
+ * Headers a client may never remove by naming them in `Connection`.
+ *
+ * RFC 7230 lets a sender scope arbitrary headers to the current hop, but a
+ * caller must not be able to use that to strip fields the gateway's own
+ * correctness depends on. `host` and `content-length` are both reassigned by
+ * the forward paths after this function returns, so dropping them here would
+ * be harmless today; keeping them explicitly protected means a future caller
+ * that stops reassigning them does not silently inherit a client-controlled
+ * hole. `authorization` / `x-onegate-connection` are unconditionally removed
+ * by STRIPPED_REQUEST_HEADERS either way, so naming them changes nothing.
+ */
+const CONNECTION_STRIP_EXEMPT = new Set(["host", "content-length"]);
+
+/**
+ * Parses the hop-scoped header names a client declared in its `Connection`
+ * header (RFC 7230 §6.1). The value is a comma-separated token list; node
+ * joins repeated `Connection` headers into one string, but the type also
+ * admits string[], so both shapes are handled.
+ *
+ * Tokens naming a header in CONNECTION_STRIP_EXEMPT are ignored, so a hostile
+ * `Connection: host` cannot break the forwarded request.
+ */
+function connectionScopedHeaders(value: string | string[] | undefined): Set<string> {
+  const names = new Set<string>();
+  if (value === undefined) return names;
+  for (const part of (Array.isArray(value) ? value : [value]).join(",").split(",")) {
+    const name = part.trim().toLowerCase();
+    if (name && !CONNECTION_STRIP_EXEMPT.has(name)) names.add(name);
+  }
+  return names;
+}
+
+/**
  * Builds the upstream request headers for a forwarded request: everything the
  * client sent, minus hop-by-hop headers and the OneGate-internal headers above.
+ *
+ * The hop-by-hop set is both the fixed HOP_BY_HOP list and, per RFC 7230 §6.1,
+ * every field name the client itself listed in its `Connection` header. Those
+ * were declared meaningful only to the previous hop, so relaying them to the
+ * vendor is a conformance defect in an intermediary.
  *
  * Shared by both forward paths (the normal integration path and the LLM-routed
  * path) so the two can never drift apart on what they leak upstream.
  */
-function forwardHeaders(reqHeaders: http.IncomingHttpHeaders): http.IncomingHttpHeaders {
+export function forwardHeaders(reqHeaders: http.IncomingHttpHeaders): http.IncomingHttpHeaders {
+  const clientScoped = connectionScopedHeaders(reqHeaders.connection);
   const headers: http.IncomingHttpHeaders = {};
   for (const [k, v] of Object.entries(reqHeaders)) {
-    if (!HOP_BY_HOP.has(k) && !STRIPPED_REQUEST_HEADERS.has(k)) headers[k] = v;
+    if (HOP_BY_HOP.has(k) || STRIPPED_REQUEST_HEADERS.has(k) || clientScoped.has(k)) continue;
+    headers[k] = v;
   }
   return headers;
 }
