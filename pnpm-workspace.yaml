@@ -1,2 +1,15 @@
 allowBuilds:
   esbuild: true
+
+# GHSA-mh99-v99m-4gvg: brace-expansion DoS via unbounded expansion length.
+# The advisory is only patched at >=5.0.8, with no backport to the 2.x line,
+# so the vulnerable copy cannot be cleared by a patch bump. It reaches the
+# tree through @vitest/coverage-v8 -> test-exclude -> glob@10 (deprecated)
+# -> minimatch@9 -> brace-expansion@2.
+#
+# glob@11 depends on minimatch@10, which already resolves brace-expansion
+# @5.0.8, so pinning that one edge forward removes the vulnerable copy and
+# also drops a deprecated dependency. Dev-only tooling: if the bump were
+# incompatible the coverage job would fail loudly in CI rather than ship.
+overrides:
+  test-exclude>glob: ^11.0.0
