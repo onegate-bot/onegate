@@ -276,7 +276,7 @@ describe("CONNECT host validation (leaf-cert path traversal guard)", () => {
   it("rejects hosts with control chars, whitespace, or empties", () => {
     expect(isValidConnectHost("")).toBe(false);
     expect(isValidConnectHost("host with space.com")).toBe(false);
-    expect(isValidConnectHost("host .com")).toBe(false);
+    expect(isValidConnectHost("host\0.com")).toBe(false);
     expect(isValidConnectHost("host\n.com")).toBe(false);
   });
 });
