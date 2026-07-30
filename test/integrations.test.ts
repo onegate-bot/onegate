@@ -1472,14 +1472,66 @@ import { make } from "../src/integrations/make.js";
 describe("make integration", () => {
   const store = new Store(":memory:");
 
+  /** ctxFor defaults to path "/", the Make token only rides on /api/ paths. */
+  function makeCtx(host: string, path: string, data: Record<string, string> = { apiToken: "m_1" }) {
+    const ctx = ctxFor(host, cred(data, "make"), store);
+    ctx.path = path;
+    return ctx;
+  }
+
   it("injects the literal Token scheme, not Bearer", () => {
-    const ctx = ctxFor("eu1.make.com", cred({ apiToken: "m_1" }, "make"), store);
+    const ctx = makeCtx("eu1.make.com", "/api/v2/users/me");
     make.inject(ctx);
     expect(ctx.headers.authorization).toBe("Token m_1");
   });
 
   it("throws when the apiToken field is missing", () => {
-    expect(() => make.inject(ctxFor("eu1.make.com", cred({}, "make"), store))).toThrow(/apiToken/);
+    expect(() => make.inject(makeCtx("eu1.make.com", "/api/v2/users/me", {}))).toThrow(/apiToken/);
+  });
+
+  // The `.make.com` suffix claim also covers user-created webhook ingress,
+  // where a Make scenario can log the headers it receives. Injecting the
+  // operator's API token there exfiltrates it to whoever owns the webhook.
+  it("refuses to inject into webhook ingress hosts", () => {
+    for (const host of ["hook.eu1.make.com", "hook.us1.make.com", "hook.make.com"]) {
+      const ctx = makeCtx(host, "/2k3j4h5k6j7");
+      expect(() => make.inject(ctx)).toThrow(/refusing to authenticate/);
+      expect(ctx.headers.authorization).toBeUndefined();
+    }
+  });
+
+  it("refuses webhook ingress even when the path looks like the API", () => {
+    const ctx = makeCtx("hook.eu1.make.com", "/api/v2/users/me");
+    expect(() => make.inject(ctx)).toThrow(/refusing to authenticate/);
+    expect(ctx.headers.authorization).toBeUndefined();
+  });
+
+  it("refuses non-API paths on an API zone host", () => {
+    for (const path of ["/", "/login", "/scenarios/123", "/apixyz/v2"]) {
+      const ctx = makeCtx("eu1.make.com", path);
+      expect(() => make.inject(ctx)).toThrow(/refusing to authenticate/);
+      expect(ctx.headers.authorization).toBeUndefined();
+    }
+  });
+
+  it("refuses the marketing site", () => {
+    const ctx = makeCtx("www.make.com", "/en/register");
+    expect(() => make.inject(ctx)).toThrow(/refusing to authenticate/);
+    expect(ctx.headers.authorization).toBeUndefined();
+  });
+
+  it("still injects across every zone on real API paths", () => {
+    for (const host of ["eu1.make.com", "eu2.make.com", "us1.make.com", "us2.make.com"]) {
+      const ctx = makeCtx(host, "/api/v2/scenarios?teamId=1");
+      make.inject(ctx);
+      expect(ctx.headers.authorization).toBe("Token m_1");
+    }
+  });
+
+  it("names the supported host and path shape in the refusal", () => {
+    expect(() => make.inject(makeCtx("hook.eu1.make.com", "/abc"))).toThrow(
+      /https:\/\/<zone>\.make\.com\/api/,
+    );
   });
 
   it("resolves every make.com zone via the dot-suffix host", async () => {
