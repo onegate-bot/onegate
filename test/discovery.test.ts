@@ -102,6 +102,53 @@ describe("buildDiscovery", () => {
     expect(gh.accounts[0].isDefault).toBe(true);
   });
 
+  it("does NOT advertise the legacy credential when the proxy would deny (named conn exists, not granted)", () => {
+    const { agent } = store.createAgent("mine");
+    const { agent: other } = store.createAgent("other");
+    allowAll(agent.id, "github");
+    // A named app connection exists for github, but it is granted to another agent.
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "github",
+      name: "theirs",
+      data: { pat: "notmine" },
+    });
+    store.grantConnection(conn.id, "agent", other.id);
+    // ...and a legacy shared credential also exists.
+    store.setCredential("github", "legacy-shared", { pat: "legacypat" });
+
+    // The proxy denies this agent outright.
+    expect(store.resolveAppConnection(agent.id, "github", undefined)).toEqual({
+      error: "connection_not_granted",
+    });
+
+    // Discovery must agree: no github entry at all, and no disclosure of the
+    // shared credential's name or material.
+    const result = buildDiscovery(store, registry, agent);
+    expect(result.integrations.map((i) => i.id)).not.toContain("github");
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("legacy-shared");
+    expect(serialized).not.toContain("legacypat");
+  });
+
+  it("still advertises the granted named connection, not the legacy credential", () => {
+    const { agent } = store.createAgent("mine");
+    allowAll(agent.id, "github");
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "github",
+      name: "mine-conn",
+      data: { pat: "p" },
+    });
+    store.grantConnection(conn.id, "agent", agent.id);
+    store.setCredential("github", "legacy-shared", { pat: "legacypat" });
+
+    const gh = buildDiscovery(store, registry, agent).integrations.find((i) => i.id === "github")!;
+    expect(gh.accounts).toHaveLength(1);
+    expect(gh.accounts[0].id).toBe(conn.id);
+    expect(gh.defaultAccountId).toBe(conn.id);
+  });
+
   it("omits integrations the agent has no account for, and LLM vendors", () => {
     const { agent } = store.createAgent("a");
     allowAll(agent.id, "jira");
