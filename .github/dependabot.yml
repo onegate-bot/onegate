@@ -1,0 +1,62 @@
+version: 2
+
+updates:
+  # npm / pnpm dependencies.
+  #
+  # Grouping matters here, it is not cosmetic. Dependabot PR #46 bumped vitest
+  # from 2 to 3 while leaving @vitest/coverage-v8 at ^2, which breaks the C1
+  # coverage gate in ci.yml. That PR had to be closed, and closing it is why no
+  # further Dependabot PRs appeared and 8 advisories accumulated unnoticed.
+  #
+  # The vitest group below exists so those two packages can only ever move
+  # together, majors included. It is declared twice because a group applies to
+  # either version updates or security updates, never both.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Jerusalem
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+      prefix-development: deps-dev
+    groups:
+      vitest-version:
+        applies-to: version-updates
+        patterns:
+          - vitest
+          - "@vitest/*"
+      vitest-security:
+        applies-to: security-updates
+        patterns:
+          - vitest
+          - "@vitest/*"
+      dev-dependencies:
+        applies-to: version-updates
+        dependency-type: development
+        exclude-patterns:
+          - vitest
+          - "@vitest/*"
+      production-dependencies:
+        applies-to: version-updates
+        dependency-type: production
+
+  # Pin drift in the workflows themselves is easy to miss, and a compromised
+  # action runs with repository credentials.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Jerusalem
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
