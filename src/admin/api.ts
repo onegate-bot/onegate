@@ -24,6 +24,16 @@ import type { Agent } from "../types.js";
 
 const ADMIN_TOKEN_KEY = "admin_token_hash";
 
+/**
+ * How long a pending OAuth state stays redeemable. Each pending entry holds the
+ * operator's client id, client secret and redirect URI, so a state value that
+ * leaks (browser history, referrer, a shared machine) must stop being usable on
+ * its own schedule rather than whenever the next /oauth/start happens to sweep.
+ * Enforced at redemption in the callback AND by the start-route sweep, so both
+ * sides always agree on the window.
+ */
+export const OAUTH_PENDING_TTL_MS = 600_000;
+
 export function ensureAdminToken(store: Store): string | null {
   if (store.getSetting(ADMIN_TOKEN_KEY)) return null;
   const token = `oga_${randomBytes(24).toString("hex")}`;
@@ -449,7 +459,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     const state = q.state;
     const pending = state ? pendingOauth.get(state) : undefined;
     if (state) pendingOauth.delete(state);
-    if (!pending || pending.integrationId !== integration.id) {
+    // Single-use is enforced by the delete above, but age must be checked here
+    // too: without a redemption-time check a pending entry survives (and stays
+    // redeemable) for as long as no new /oauth/start runs its sweep.
+    const expired = pending ? Date.now() - pending.createdAt > OAUTH_PENDING_TTL_MS : false;
+    if (!pending || expired || pending.integrationId !== integration.id) {
       res.status(400).send(resultPage("Connection failed", "Invalid or expired OAuth state. Restart the connect flow."));
       return;
     }
@@ -813,7 +827,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       leaseTtlSeconds: parseLeaseOverride(body),
     });
     for (const [k, v] of pendingOauth) {
-      if (Date.now() - v.createdAt > 600_000) pendingOauth.delete(k);
+      if (Date.now() - v.createdAt > OAUTH_PENDING_TTL_MS) pendingOauth.delete(k);
     }
     const url = buildAuthUrl(integration.id, oauth, { clientId, redirectUri, scopes, state });
     res.redirect(url);
@@ -2095,9 +2109,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       ...(reauthConn ? {} : connectionName !== undefined ? { connectionName: String(connectionName).trim() } : {}),
       ...(reauthConn ? {} : { ownerAgentId: ownerAgentId ?? null, isDefault: isDefault === true }),
     });
-    // Single-use states; drop anything older than 10 minutes.
+    // Single-use states; drop anything past OAUTH_PENDING_TTL_MS. The callback
+    // enforces the same window at redemption, so a missed sweep cannot extend it.
     for (const [k, v] of pendingOauth) {
-      if (Date.now() - v.createdAt > 600_000) pendingOauth.delete(k);
+      if (Date.now() - v.createdAt > OAUTH_PENDING_TTL_MS) pendingOauth.delete(k);
     }
     const url = buildAuthUrl(integration.id, oauth, {
       clientId,
