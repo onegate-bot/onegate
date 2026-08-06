@@ -75,7 +75,22 @@ export interface Rule {
    */
   connectionId?: string | null;
   connectionScope?: ConnectionScope;
+  /**
+   * Provenance: how this rule came to exist. Null/absent = written explicitly by
+   * an operator (the default, and what every pre-existing rule reads as).
+   * "grant" = auto-created alongside a connection grant, so that granting a
+   * connection is on its own sufficient to reach the integration.
+   *
+   * Recorded purely for attribution: it is NEVER consulted by the policy engine,
+   * so an auto-created rule carries exactly the same weight as a hand-written
+   * one. It exists so an operator can see in `onegate rules list` where a rule
+   * came from and delete or narrow it deliberately.
+   */
+  createdBy?: RuleOrigin | null;
 }
+
+/** Provenance of a rule. See Rule.createdBy. */
+export type RuleOrigin = "operator" | "grant";
 
 export type ConnectionKind = "app" | "llm";
 export type LlmStrategy = "fallback" | "round-robin";

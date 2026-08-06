@@ -375,6 +375,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           effect: "allow",
           expiresAt,
           leaseTtlSeconds: ttl,
+          // Same provenance as a manually granted connection: this rule exists
+          // because a connection was attached, not because an operator wrote it.
+          createdBy: "grant",
         });
       }
     }
@@ -1637,7 +1640,17 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       return;
     }
     store.grantConnection(conn.id, scope, subjectId);
-    res.status(201).json({ connectionId: conn.id, scope, subjectId });
+    // Close the grant/rule double gate: a grant alone should be enough to reach
+    // the integration. Never widens an existing rule and never overrides a deny
+    // (see Store.ensureAllowRuleForGrant). Reported back so the caller can see
+    // whether a rule was synthesized.
+    const ensured = store.ensureAllowRuleForGrant(conn.id, scope, subjectId);
+    res.status(201).json({
+      connectionId: conn.id,
+      scope,
+      subjectId,
+      ...(ensured ? { ruleId: ensured.rule.id, ruleCreated: ensured.created } : {}),
+    });
   });
 
   /** Revokes a grant. No-op (204) if the grant does not exist. */
