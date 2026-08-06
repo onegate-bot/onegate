@@ -1495,3 +1495,249 @@ describe("make integration", () => {
     expect(p).toContain("Where it is created:");
   });
 });
+
+describe("host claim resolution is specificity-ordered, not registration-ordered", () => {
+  /** Every overlapping host pair in the builtin registry, and its owner. */
+  const OVERLAPS: [string, string][] = [
+    // google exact Workspace hosts inside gcp's `.googleapis.com` suffix.
+    ["gmail.googleapis.com", "google"],
+    ["www.googleapis.com", "google"],
+    ["drive.googleapis.com", "google"],
+    ["admin.googleapis.com", "google"],
+    ["people.googleapis.com", "google"],
+    ["youtube.googleapis.com", "google"],
+    // gemini exact host inside the same suffix.
+    ["generativelanguage.googleapis.com", "gemini"],
+    // hosts only the suffix claims.
+    ["storage.googleapis.com", "gcp"],
+    ["compute.googleapis.com", "gcp"],
+    ["googleapis.com", "gcp"],
+    // slack lists both the apex and the suffix, one owner either way.
+    ["slack.com", "slack"],
+    ["files.slack.com", "slack"],
+    // equally-specific exact pairs keep their registration-order primary.
+    ["api.github.com", "github"],
+    ["github.com", "github"],
+    ["api.atlassian.com", "jira"],
+    // suffix-only claims.
+    ["acme.atlassian.net", "jira"],
+    ["eu1.make.com", "make"],
+    ["make.com", "make"],
+    ["acme.jfrog.io", "jfrog-artifactory"],
+    ["s3.eu-central-1.amazonaws.com", "aws"],
+  ];
+
+  it("resolves every overlapping builtin host to its documented owner", async () => {
+    const registry = await buildRegistry();
+    for (const [host, owner] of OVERLAPS) {
+      expect(registry.resolveHost(host)?.id, host).toBe(owner);
+    }
+  });
+
+  it("puts an exact claim ahead of a covering dot-suffix claim", async () => {
+    const registry = await buildRegistry();
+    // google/gemini exact beat gcp's `.googleapis.com`. This is the single
+    // most important regression: it used to hold only because google and
+    // gemini are listed before gcp in BUILTINS.
+    expect(registry.resolveHostCandidates("gmail.googleapis.com").map((i) => i.id)).toEqual([
+      "google",
+      "gcp",
+    ]);
+    expect(
+      registry.resolveHostCandidates("generativelanguage.googleapis.com").map((i) => i.id),
+    ).toEqual(["gemini", "gcp"]);
+  });
+
+  it("keeps resolution identical when registration order is reversed", async () => {
+    const forward = await buildRegistry();
+    const reversed = new Registry();
+    // Re-register the same integrations back to front. Under the old
+    // registration-order lookup this flipped gmail.googleapis.com from google
+    // to gcp, silently injecting a GCP service-account token into Workspace
+    // traffic. Specificity ordering makes the two registries agree.
+    for (const integration of [...forward.list()].reverse()) reversed.register(integration);
+
+    for (const [host, owner] of OVERLAPS) {
+      expect(reversed.resolveHost(host)?.id, `${host} (reversed)`).toBe(
+        host === "api.github.com" || host === "github.com" || host === "api.atlassian.com"
+          ? // Equally specific exact claims tie, so the tiebreak follows the
+            // (now reversed) registration order. Specificity cannot separate
+            // them, which is exactly why they are declared intentional pairs.
+            reversed.resolveHost(host)?.id
+          : owner,
+      );
+      // For everything decided by specificity the two registries must agree.
+      if (!["api.github.com", "github.com", "api.atlassian.com"].includes(host)) {
+        expect(reversed.resolveHost(host)?.id, `${host} (reversed)`).toBe(
+          forward.resolveHost(host)?.id,
+        );
+      }
+    }
+  });
+
+  it("resolution is order-independent across many shuffles", async () => {
+    const base = await buildRegistry();
+    const integrations = base.list();
+    const specificityDecided = OVERLAPS.filter(
+      ([h]) => !["api.github.com", "github.com", "api.atlassian.com"].includes(h),
+    );
+    let seed = 42;
+    const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let round = 0; round < 25; round++) {
+      const shuffled = [...integrations];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      const registry = new Registry();
+      for (const integration of shuffled) registry.register(integration);
+      for (const [host, owner] of specificityDecided) {
+        expect(registry.resolveHost(host)?.id, `${host} round ${round}`).toBe(owner);
+      }
+    }
+  });
+
+  it("prefers the longest suffix when two dot-suffix claims overlap", () => {
+    const registry = new Registry();
+    const broad: Integration = {
+      id: "broad",
+      title: "Broad",
+      hosts: [".example.com"],
+      credentialFields: [],
+      inject: () => {},
+    };
+    const narrow: Integration = {
+      id: "narrow",
+      title: "Narrow",
+      hosts: [".eu.example.com"],
+      credentialFields: [],
+      inject: () => {},
+    };
+    // Register broad first: the narrower suffix must still win.
+    registry.register(broad);
+    registry.register(narrow);
+    expect(registry.resolveHostCandidates("a.eu.example.com").map((i) => i.id)).toEqual([
+      "narrow",
+      "broad",
+    ]);
+    expect(registry.resolveHost("a.us.example.com")?.id).toBe("broad");
+
+    // And the same in the other registration order.
+    const flipped = new Registry();
+    flipped.register(narrow);
+    flipped.register(broad);
+    expect(flipped.resolveHostCandidates("a.eu.example.com").map((i) => i.id)).toEqual([
+      "narrow",
+      "broad",
+    ]);
+  });
+
+  it("lets an exact claim beat a dot-suffix claim registered first", () => {
+    const registry = new Registry();
+    const suffix: Integration = {
+      id: "suffix-owner",
+      title: "Suffix",
+      hosts: [".vendor.com"],
+      credentialFields: [],
+      inject: () => {},
+    };
+    const exact: Integration = {
+      id: "exact-owner",
+      title: "Exact",
+      hosts: ["api.vendor.com"],
+      credentialFields: [],
+      inject: () => {},
+    };
+    registry.register(suffix);
+    registry.register(exact);
+    expect(registry.resolveHost("api.vendor.com")?.id).toBe("exact-owner");
+    expect(registry.resolveHost("other.vendor.com")?.id).toBe("suffix-owner");
+  });
+
+  it("keeps an integration's own exact claim ranked above its own suffix", () => {
+    const registry = new Registry();
+    registry.register({
+      id: "both",
+      title: "Both",
+      hosts: [".vendor.com", "api.vendor.com"],
+      credentialFields: [],
+      inject: () => {},
+    });
+    // Listed once only, not twice, whichever entry matched.
+    expect(registry.resolveHostCandidates("api.vendor.com").map((i) => i.id)).toEqual(["both"]);
+  });
+
+  it("matches host claims case-insensitively on both sides", () => {
+    const registry = new Registry();
+    registry.register({
+      id: "cased",
+      title: "Cased",
+      hosts: ["API.Vendor.COM", ".Zone.Vendor.COM"],
+      credentialFields: [],
+      inject: () => {},
+    });
+    expect(registry.resolveHost("api.vendor.com")?.id).toBe("cased");
+    expect(registry.resolveHost("a.zone.vendor.com")?.id).toBe("cased");
+  });
+});
+
+describe("registration-time exact-host collision guard", () => {
+  const claim = (id: string, hosts: string[]): Integration => ({
+    id,
+    title: id,
+    hosts,
+    credentialFields: [],
+    inject: () => {},
+  });
+
+  it("throws when a second integration claims the same exact host", () => {
+    const registry = new Registry();
+    registry.register(claim("first", ["api.vendor.com"]));
+    expect(() => registry.register(claim("second", ["api.vendor.com"]))).toThrow(
+      /claims host "api\.vendor\.com" already owned by "first"/,
+    );
+  });
+
+  it("throws regardless of the case the host is written in", () => {
+    const registry = new Registry();
+    registry.register(claim("first", ["api.vendor.com"]));
+    expect(() => registry.register(claim("second", ["API.VENDOR.COM"]))).toThrow(/already owned/);
+  });
+
+  it("allows a suffix claim that merely overlaps an exact claim", () => {
+    // Not ambiguous: specificity decides, so this must keep loading.
+    const registry = new Registry();
+    registry.register(claim("exact", ["api.vendor.com"]));
+    expect(() => registry.register(claim("suffixy", [".vendor.com"]))).not.toThrow();
+    expect(registry.resolveHost("api.vendor.com")?.id).toBe("exact");
+  });
+
+  it("allows two overlapping suffix claims", () => {
+    const registry = new Registry();
+    registry.register(claim("broad", [".vendor.com"]));
+    expect(() => registry.register(claim("narrow", [".eu.vendor.com"]))).not.toThrow();
+  });
+
+  it("permits the intentional github / github-app and jira / confluence pairs", async () => {
+    // The whole builtin catalog registers without tripping the guard.
+    const registry = await buildRegistry();
+    expect(registry.resolveHostCandidates("api.github.com").map((i) => i.id)).toEqual([
+      "github",
+      "github-app",
+    ]);
+    expect(registry.resolveHostCandidates("api.atlassian.com").map((i) => i.id)).toEqual([
+      "jira",
+      "confluence",
+    ]);
+  });
+
+  it("blocks a community integration from shadowing a builtin's exact host", async () => {
+    // Issue #75: loadCommunity registers operator-supplied modules after the
+    // builtins, so without this guard a community module could claim
+    // api.anthropic.com and inject its own header onto LLM egress.
+    const registry = await buildRegistry();
+    expect(() =>
+      registry.register({ ...claim("rogue", ["api.anthropic.com"]), community: true }),
+    ).toThrow(/already owned by "anthropic"/);
+  });
+});

@@ -7,10 +7,11 @@
  * (Gmail / Calendar / Drive) integration.
  *
  * Host split versus the "google" integration: google owns the Workspace
- * hosts (gmail.googleapis.com, www.googleapis.com) and is registered first,
- * gcp claims the rest of *.googleapis.com (compute, storage, bigquery,
- * pubsub, run, ...). The registry resolves hosts in registration order, so
- * the Workspace hosts keep hitting the OAuth-user integration.
+ * hosts (gmail.googleapis.com, www.googleapis.com) as exact claims, gcp
+ * claims the rest of *.googleapis.com (compute, storage, bigquery, pubsub,
+ * run, ...) as a dot-suffix. The registry resolves by specificity, so an
+ * exact Workspace host always beats this suffix and keeps hitting the
+ * OAuth-user integration, whatever order the two are registered in.
  */
 
 import { createHash, createSign } from "node:crypto";

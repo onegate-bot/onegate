@@ -48,16 +48,18 @@ import { openrouter } from "./openrouter.js";
 import { make } from "./make.js";
 
 /**
- * Built-ins in registration order. Order matters for host resolution:
- *  - google's explicit Workspace hosts resolve before gcp's `.googleapis.com`
- *    dot-suffix claim.
- *  - gemini's generativelanguage.googleapis.com also falls under gcp's
- *    dot-suffix, registering gemini before gcp makes it the first candidate.
- *  - confluence shares api.atlassian.com with jira (registered first), the
- *    proxy walks candidates in registration order and picks the first one
- *    with a connected credential.
- *  - github-app shares every github host, the PAT github integration stays
- *    primary when both have credentials.
+ * Built-ins. Array order does NOT decide which integration owns a host:
+ * `Registry.resolveHostCandidates` ranks claims by specificity, so an exact
+ * host claim always beats a dot-suffix claim and a longer suffix beats a
+ * shorter one. Reordering this array cannot silently re-route a host (and
+ * therefore change which credential gets injected).
+ *  - google's and gemini's explicit *.googleapis.com hosts outrank gcp's
+ *    `.googleapis.com` dot-suffix claim by specificity, not by position.
+ *  - confluence/jira (api.atlassian.com) and github/github-app (every github
+ *    host) are equally specific exact claims, so they stay multiple
+ *    candidates and the proxy picks the one with a connected credential.
+ *    Among those ties this array's order is the tiebreak, which keeps jira
+ *    and the PAT github integration primary when both sides are connected.
  */
 const BUILTINS: Integration[] = [
   github,
