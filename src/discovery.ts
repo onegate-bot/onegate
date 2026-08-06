@@ -108,8 +108,13 @@ export function buildDiscovery(
       });
     }
 
-    // No named connections: fall back to the legacy shared credential.
-    if (accounts.length === 0) {
+    // No granted named connections: fall back to the legacy shared credential
+    // ONLY where the proxy itself would, i.e. when resolveAppConnection returns
+    // null (no named app connections exist for this integration at all). When it
+    // returns an { error }, the proxy denies the request, so advertising the
+    // shared credential here would both lie about capability and disclose that
+    // account's non-secret summary to an agent that may not use it.
+    if (accounts.length === 0 && resolved === null) {
       const legacy = store.getCredential(integration.id);
       if (legacy) {
         accounts.push({
