@@ -858,9 +858,19 @@ export class Store {
   }
 
   deleteProject(id: string): void {
-    this.db.prepare("DELETE FROM rules WHERE scope = 'project' AND subject_id = ?").run(id);
-    this.db.prepare("DELETE FROM connection_grants WHERE scope = 'project' AND subject_id = ?").run(id);
-    this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+    // All-or-nothing, same hazard as deleteAgent: `agents.project_id` is
+    // ON DELETE SET NULL, so the member agents outlive an interrupted cascade.
+    // If the rules delete lands but the projects delete does not, every agent
+    // in the project keeps authenticating while its project-scoped rules -
+    // including explicit DENY rules - are already gone = fail-open, with the
+    // admin surface still showing the project as present and configured.
+    this.tx(() => {
+      this.db.prepare("DELETE FROM rules WHERE scope = 'project' AND subject_id = ?").run(id);
+      this.db
+        .prepare("DELETE FROM connection_grants WHERE scope = 'project' AND subject_id = ?")
+        .run(id);
+      this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+    });
   }
 
   // ---- agents ----
@@ -1013,26 +1023,41 @@ export class Store {
   }): Connection {
     const ts = now();
     const ownerAgentId = input.kind === "app" ? input.ownerAgentId ?? null : null;
-    const existing = this.listConnections({ kind: input.kind, vendor: input.vendor, ownerAgentId });
-    const isDefault = input.isDefault === true || existing.length === 0;
     const id = newId("conn");
-    if (isDefault) this.clearDefaultConnection(input.kind, input.vendor, ownerAgentId);
-    this.db
-      .prepare(
-        "INSERT INTO connections (id, kind, vendor, name, data, owner_agent_id, is_default, lease_ttl_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
-        id,
-        input.kind,
-        input.vendor,
-        input.name,
-        this.secrets.seal(input.data),
+    // The "is this bucket empty?" probe, the demotion of the previous default
+    // and the insert are one atomic step. Split apart they break the
+    // one-default-per-bucket invariant two ways: an interrupt between the
+    // demotion and the insert leaves the bucket with NO default (headerless
+    // requests then fall through to resolveAppConnection's oldest-candidate
+    // heuristic, silently changing which credential is injected), and the
+    // read-then-write emptiness check races the other process on this DB (the
+    // admin API and the CLI both open it) to produce TWO defaults. BEGIN
+    // IMMEDIATE takes the write lock before the probe reads.
+    this.tx(() => {
+      const existing = this.listConnections({
+        kind: input.kind,
+        vendor: input.vendor,
         ownerAgentId,
-        isDefault ? 1 : 0,
-        input.leaseTtlSeconds ?? null,
-        ts,
-        ts,
-      );
+      });
+      const isDefault = input.isDefault === true || existing.length === 0;
+      if (isDefault) this.clearDefaultConnection(input.kind, input.vendor, ownerAgentId);
+      this.db
+        .prepare(
+          "INSERT INTO connections (id, kind, vendor, name, data, owner_agent_id, is_default, lease_ttl_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          id,
+          input.kind,
+          input.vendor,
+          input.name,
+          this.secrets.seal(input.data),
+          ownerAgentId,
+          isDefault ? 1 : 0,
+          input.leaseTtlSeconds ?? null,
+          ts,
+          ts,
+        );
+    });
     return this.getConnection(id)!;
   }
 
@@ -1263,16 +1288,22 @@ export class Store {
     const cur = this.getConnection(id);
     if (!cur) return null;
     const makeDefault = patch.isDefault === true && !cur.isDefault;
-    if (makeDefault) this.clearDefaultConnection(cur.kind, cur.vendor, cur.ownerAgentId);
-    this.db
-      .prepare("UPDATE connections SET name = ?, data = ?, is_default = ?, updated_at = ? WHERE id = ?")
-      .run(
-        patch.name ?? cur.name,
-        this.secrets.seal(patch.data ?? cur.data),
-        makeDefault || cur.isDefault ? 1 : 0,
-        now(),
-        id,
-      );
+    // Demoting the old default and promoting this row is one handoff: an
+    // interrupt between them leaves the bucket with no default at all.
+    this.tx(() => {
+      if (makeDefault) this.clearDefaultConnection(cur.kind, cur.vendor, cur.ownerAgentId);
+      this.db
+        .prepare(
+          "UPDATE connections SET name = ?, data = ?, is_default = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(
+          patch.name ?? cur.name,
+          this.secrets.seal(patch.data ?? cur.data),
+          makeDefault || cur.isDefault ? 1 : 0,
+          now(),
+          id,
+        );
+    });
     return this.getConnection(id);
   }
 

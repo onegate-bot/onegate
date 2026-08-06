@@ -336,6 +336,91 @@ describe("connections", () => {
     expect(store.listCredentials()).toHaveLength(1);
     expect(store.getCredential("anthropic")).toBeNull();
   });
+
+  it("keeps exactly one default per bucket across creates and updates", () => {
+    // Buckets are (kind, vendor, owner). Exercise a tenant-wide llm bucket and
+    // two agent-owned app buckets side by side.
+    const { agent: a1 } = store.createAgent("o1");
+    const { agent: a2 } = store.createAgent("o2");
+    const buckets: Array<{ kind: "llm" | "app"; vendor: string; ownerAgentId: string | null }> = [
+      { kind: "llm", vendor: "anthropic", ownerAgentId: null },
+      { kind: "app", vendor: "github", ownerAgentId: a1.id },
+      { kind: "app", vendor: "github", ownerAgentId: a2.id },
+    ];
+    const made = buckets.map((b) => [
+      store.createConnection({ ...b, name: "x", data: {} }),
+      store.createConnection({ ...b, name: "y", data: {} }),
+      store.createConnection({ ...b, name: "z", data: {}, isDefault: true }),
+    ]);
+
+    for (const [i, b] of buckets.entries()) {
+      const defaults = store.listConnections(b).filter((c) => c.isDefault);
+      expect(defaults).toHaveLength(1);
+      expect(defaults[0].id).toBe(made[i][2].id);
+      // Promoting an earlier one demotes the current default, still exactly one.
+      store.updateConnection(made[i][0].id, { isDefault: true });
+      const after = store.listConnections(b).filter((c) => c.isDefault);
+      expect(after).toHaveLength(1);
+      expect(after[0].id).toBe(made[i][0].id);
+    }
+  });
+
+  it("a failed createConnection leaves the previous default intact", () => {
+    const first = store.createConnection({
+      kind: "llm",
+      vendor: "anthropic",
+      name: "a",
+      data: {},
+    });
+    expect(store.getDefaultConnection("llm", "anthropic")?.id).toBe(first.id);
+
+    // Fail on the insert, after clearDefaultConnection has already demoted the
+    // incumbent inside the transaction.
+    const db = (store as unknown as { db: { prepare: (sql: string) => unknown } }).db;
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (sql.startsWith("INSERT INTO connections")) throw new Error("boom");
+      return realPrepare(sql);
+    };
+    expect(() =>
+      store.createConnection({
+        kind: "llm",
+        vendor: "anthropic",
+        name: "b",
+        data: {},
+        isDefault: true,
+      }),
+    ).toThrow(/boom/);
+    db.prepare = realPrepare;
+
+    // The demotion rolled back with the failed insert, so the bucket still has
+    // its one default rather than none.
+    expect(store.getDefaultConnection("llm", "anthropic")?.id).toBe(first.id);
+    expect(store.listConnections({ kind: "llm", vendor: "anthropic" })).toHaveLength(1);
+    expect(
+      store.listConnections({ kind: "llm", vendor: "anthropic" }).filter((c) => c.isDefault),
+    ).toHaveLength(1);
+  });
+
+  it("a failed updateConnection handoff leaves the previous default intact", () => {
+    const a = store.createConnection({ kind: "llm", vendor: "anthropic", name: "a", data: {} });
+    const b = store.createConnection({ kind: "llm", vendor: "anthropic", name: "b", data: {} });
+    expect(store.getDefaultConnection("llm", "anthropic")?.id).toBe(a.id);
+
+    const db = (store as unknown as { db: { prepare: (sql: string) => unknown } }).db;
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (sql.startsWith("UPDATE connections SET name")) throw new Error("boom");
+      return realPrepare(sql);
+    };
+    expect(() => store.updateConnection(b.id, { isDefault: true })).toThrow(/boom/);
+    db.prepare = realPrepare;
+
+    expect(store.getDefaultConnection("llm", "anthropic")?.id).toBe(a.id);
+    expect(
+      store.listConnections({ kind: "llm", vendor: "anthropic" }).filter((c) => c.isDefault),
+    ).toHaveLength(1);
+  });
 });
 
 describe("agent llm config", () => {
@@ -708,6 +793,44 @@ describe("app connections (default-deny grants)", () => {
     store.grantConnection(conn.id, "project", proj.id);
     store.deleteProject(proj.id);
     expect(store.listGrantsForConnection(conn.id)).toHaveLength(0);
+  });
+
+  it("deleteProject rolls back entirely if the cascade is interrupted (no fail-open)", () => {
+    const proj = store.createProject("team");
+    const { agent } = store.createAgent("member", { projectId: proj.id });
+    // An explicit DENY at project scope: the protection that must never vanish
+    // while the agents it covers are still alive.
+    store.createRule({
+      scope: "project",
+      subjectId: proj.id,
+      integrationId: "github",
+      methods: ["GET"],
+      pathGlob: "/**",
+      effect: "deny",
+    });
+    const conn = store.createConnection({ kind: "app", vendor: "github", name: "c", data: {} });
+    store.grantConnection(conn.id, "project", proj.id);
+
+    // Fail on the last statement of the cascade, after the rules and grants
+    // deletes have already run inside the transaction.
+    const db = (store as unknown as { db: { prepare: (sql: string) => unknown } }).db;
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (sql.startsWith("DELETE FROM projects")) throw new Error("boom");
+      return realPrepare(sql);
+    };
+    expect(() => store.deleteProject(proj.id)).toThrow(/boom/);
+    db.prepare = realPrepare;
+
+    // Everything survives: the project, its member agent, and critically the
+    // DENY rule. A partial cascade would have left the agent authenticating
+    // with its project-scoped deny already stripped.
+    expect(store.getProject(proj.id)?.id).toBe(proj.id);
+    const member = store.getAgent(agent.id)!;
+    expect(member.projectId).toBe(proj.id);
+    expect(store.listRules({ scope: "project", subjectId: proj.id })).toHaveLength(1);
+    expect(store.rulesForAgent(member).filter((r) => r.effect === "deny")).toHaveLength(1);
+    expect(store.listGrantsForConnection(conn.id)).toHaveLength(1);
   });
 
   it("resolveAppConnection: ungranted agent is denied even when a named conn exists", () => {
