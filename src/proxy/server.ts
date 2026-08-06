@@ -219,6 +219,72 @@ export function isValidConnectHost(host: string): boolean {
  * mid-body the upstream request is destroyed, instead of being left streaming
  * into a dead socket and leaking its connection.
  */
+
+/**
+ * Hostnames that always name the local machine regardless of what the resolver
+ * says. `localhost` is normally a loopback A/AAAA record and would be caught by
+ * the resolved-address check below, but a poisoned or unusual resolver could
+ * map it elsewhere; either way an agent has no business tunnelling to it.
+ */
+const LOCAL_HOSTNAMES = new Set(["localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"]);
+
+/**
+ * True when `ip` is a literal address OneGate must never open a passthrough
+ * tunnel to. The gateway runs alongside private infrastructure (in the fleet
+ * deployment the OneGate admin API itself binds 172.17.0.1:8080), so an
+ * unrestricted CONNECT tunnel turns any authenticated agent into an SSRF pivot
+ * onto the admin plane, the docker bridge, and cloud metadata.
+ *
+ * Blocked: loopback (127/8, ::1), link-local (169.254/16, fe80::/10, which
+ * covers cloud metadata at 169.254.169.254), RFC1918 private (10/8, 172.16/12,
+ * 192.168/16), IPv6 unique-local (fc00::/7), CGNAT (100.64/10) and the
+ * unspecified addresses (0.0.0.0, ::). IPv4-mapped IPv6 forms
+ * (`::ffff:127.0.0.1`) are unwrapped first so they cannot smuggle a blocked v4
+ * address past the v6 checks.
+ *
+ * A non-address string returns false: this helper only judges IPs. Hostnames
+ * are handled by resolving them and re-checking the result (see resolveTarget).
+ */
+export function isBlockedDestination(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (family === 0) return false;
+
+  if (family === 6) {
+    const v6 = ip.toLowerCase().split("%")[0]; // strip any zone index
+    // Unwrap IPv4-mapped/compatible forms (::ffff:127.0.0.1, ::127.0.0.1) and
+    // re-judge as IPv4, otherwise ::ffff:169.254.169.254 would sail through.
+    const mapped = /^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
+    if (mapped) return isBlockedDestination(mapped[1]);
+    if (v6 === "::1" || v6 === "::") return true;
+    if (/^fe[89ab]/.test(v6)) return true; // fe80::/10 link-local
+    if (/^f[cd]/.test(v6)) return true; // fc00::/7 unique-local
+    return false;
+  }
+
+  const octets = ip.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o))) return false;
+  const [a, b] = octets;
+  if (a === 0) return true; // 0.0.0.0/8 unspecified ("this network")
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 10) return true; // 10.0.0.0/8 private
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + metadata
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  return false;
+}
+
+/**
+ * Operator escape hatch. Some deployments genuinely need agents to tunnel to an
+ * internal host (a self-hosted vendor on the same LAN, for example). Blocked by
+ * default; set ONEGATE_ALLOW_INTERNAL_PASSTHROUGH=1 to opt back in to the old
+ * unrestricted behaviour.
+ */
+function internalPassthroughAllowed(): boolean {
+  const raw = process.env.ONEGATE_ALLOW_INTERNAL_PASSTHROUGH?.trim().toLowerCase();
+  return raw === "1" || raw === "true";
+}
+
 export function pipeUpstreamResponse(
   upRes: http.IncomingMessage,
   res: http.ServerResponse,
