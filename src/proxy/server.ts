@@ -17,7 +17,7 @@ import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import type { Duplex } from "node:stream";
-import type { Ca } from "../ca.js";
+import type { Ca, LeafCert } from "../ca.js";
 import type { Store } from "../store/db.js";
 import { evaluate, normalizeRequestPath } from "../policy.js";
 import type { Agent, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
@@ -329,7 +329,10 @@ export class GatewayProxy {
     // which accounts and URLs it can reach (see #5438, #5450). It is served
     // locally over a MITM leaf, never forwarded upstream.
     if (host.toLowerCase() === DISCOVERY_HOST && port === 443) {
-      this.terminateDiscovery(agent, host, socket, head);
+      // Fire and forget: the TLS-terminating paths are async because the leaf
+      // keygen runs off the event loop, and they own their own failure handling
+      // (see leafOrDestroy), so there is nothing for onConnect to await on.
+      void this.terminateDiscovery(agent, host, socket, head);
       return;
     }
 
@@ -347,7 +350,7 @@ export class GatewayProxy {
       this.passthrough(agent, host, port, socket, head);
       return;
     }
-    this.terminate(agent, integration, host, port, socket, head);
+    void this.terminate(agent, integration, host, port, socket, head);
   }
 
   /**
@@ -447,16 +450,17 @@ export class GatewayProxy {
   }
 
   /** MITM path: terminate TLS with our leaf cert and parse the inner HTTP. */
-  private terminate(
+  private async terminate(
     agent: Agent,
     integration: Integration,
     host: string,
     port: number,
     socket: Duplex,
     head: Buffer,
-  ): void {
+  ): Promise<void> {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    const leaf = this.opts.ca.leafFor(host);
+    const leaf = await this.leafOrDestroy(host, socket);
+    if (!leaf) return;
     const tlsSocket = new tls.TLSSocket(socket as net.Socket, {
       isServer: true,
       key: leaf.key,
@@ -469,14 +473,43 @@ export class GatewayProxy {
   }
 
   /**
+   * Resolves the leaf for an already-accepted CONNECT, or tears the tunnel down.
+   *
+   * Minting is asynchronous (the RSA keygen runs off the event loop), so the
+   * client may go away, or the mint may fail, between the 200 and the TLS
+   * handshake. In either case there is no way to signal an error in-band -- the
+   * success line is already on the wire and the client is waiting to speak TLS
+   * -- so the only correct move is to destroy the socket rather than leave a
+   * half-open tunnel hanging until it times out.
+   */
+  private async leafOrDestroy(host: string, socket: Duplex): Promise<LeafCert | null> {
+    try {
+      const leaf = await this.opts.ca.leafForAsync(host);
+      // The client may have hung up while the key was being generated; using a
+      // destroyed socket would throw inside the TLSSocket constructor.
+      if (socket.destroyed) return null;
+      return leaf;
+    } catch {
+      socket.destroy();
+      return null;
+    }
+  }
+
+  /**
    * MITM path for the agent-facing discovery endpoint. Same TLS termination
    * as terminate(), but the inner request is served locally (no upstream) by
    * handleDiscovery(). The bot trusts our root CA, so the leaf for the
    * sentinel host validates.
    */
-  private terminateDiscovery(agent: Agent, host: string, socket: Duplex, head: Buffer): void {
+  private async terminateDiscovery(
+    agent: Agent,
+    host: string,
+    socket: Duplex,
+    head: Buffer,
+  ): Promise<void> {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    const leaf = this.opts.ca.leafFor(host);
+    const leaf = await this.leafOrDestroy(host, socket);
+    if (!leaf) return;
     const tlsSocket = new tls.TLSSocket(socket as net.Socket, {
       isServer: true,
       key: leaf.key,
