@@ -561,3 +561,84 @@ describe("credential wizard (non-oauth integrations)", () => {
     expect(retry.status).toBe(200);
   });
 });
+
+// ---- security: single-use links must be claimed atomically ----
+
+describe("onboarding link single-use is atomic (no double redemption)", () => {
+  it("claimOnboardingLink claims exactly once, even when called repeatedly", () => {
+    const link = store.createOnboardingLink({ agentId, integrationId: "github" });
+    // First claim wins.
+    expect(store.claimOnboardingLink(link.token)).toBe(true);
+    // Every later claim loses: the link is already used.
+    expect(store.claimOnboardingLink(link.token)).toBe(false);
+    expect(store.claimOnboardingLink(link.token)).toBe(false);
+    // And the stored used_at is not overwritten by the losing racers.
+    expect(store.isOnboardingLinkValid(store.getOnboardingLink(link.token))).toBe(false);
+  });
+
+  it("does not claim an unknown link", () => {
+    expect(store.claimOnboardingLink("not-a-real-token")).toBe(false);
+  });
+
+  it("concurrent credential redemptions of one link create exactly one connection", async () => {
+    const mint = await api("POST", "/api/onboarding-links", {
+      agentId,
+      integrationId: "github",
+      connectionName: "race-cred",
+    });
+    const token = mint.json.token;
+
+    // Fire both redemptions without awaiting in between, so they interleave.
+    const [a, b] = await Promise.all([
+      postForm(`/connect/github/${token}/submit`, { pat: "first" }),
+      postForm(`/connect/github/${token}/submit`, { pat: "second" }),
+    ]);
+
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 410]);
+
+    // Exactly ONE connection came out of the single-use link.
+    const conns = store.listConnections().filter((c) => c.name === "race-cred");
+    expect(conns.length).toBe(1);
+  });
+
+  it("concurrent OAuth redemptions of one link create exactly one connection", async () => {
+    // Slow token endpoint: both callbacks sit inside the async exchange at the
+    // same time, which is exactly the TOCTOU window the fix closes.
+    const prev = tokenRespond;
+    tokenRespond = () => ({
+      status: 200,
+      body: { access_token: "gl_at_race", refresh_token: "gl_rt_race", expires_in: 3600, scope: "api" },
+    });
+
+    const mint = await api("POST", "/api/onboarding-links", {
+      agentId,
+      integrationId: "gitlab",
+      connectionName: "race-oauth",
+    });
+    const token = mint.json.token;
+
+    // Two holders of the same link both begin consent.
+    const [s1, s2] = await Promise.all([
+      postForm(`/connect/gitlab/${token}/start`, { clientId: "cid", clientSecret: "csec" }),
+      postForm(`/connect/gitlab/${token}/start`, { clientId: "cid", clientSecret: "csec" }),
+    ]);
+
+    // Only one of them may proceed to the provider; the other is turned away
+    // BEFORE any credential is entered.
+    const startStatuses = [s1.status, s2.status].sort();
+    expect(startStatuses).toEqual([302, 410]);
+
+    // Drive the winner's callback through the async exchange.
+    const winner = s1.status === 302 ? s1 : s2;
+    const state = new URL(winner.location!).searchParams.get("state");
+    const cb = await get(`/oauth/gitlab/callback?state=${state}&code=race_code`);
+    expect(cb.status).toBe(200);
+
+    // Exactly ONE connection, one grant, from the single-use link.
+    const conns = store.listConnections().filter((c) => c.name === "race-oauth");
+    expect(conns.length).toBe(1);
+
+    tokenRespond = prev;
+  });
+});

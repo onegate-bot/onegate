@@ -344,16 +344,26 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   /**
    * Connect-wizard auto-wire. Runs only when the pending entry carries a wizard
-   * token + agent. Grants the freshly created connection to the agent, ensures
-   * an agent-scoped allow rule for the integration exists, and marks the link
-   * used. Best-effort per step, but any real failure surfaces to the caller.
+   * token + agent. Atomically claims the onboarding link FIRST, then grants the
+   * freshly created connection to the agent and ensures an agent-scoped allow
+   * rule for the integration exists.
+   *
+   * Returns false without wiring anything when the link was already claimed (a
+   * concurrent or replayed redemption). The claim is the gate: a losing racer
+   * must not create a second grant + allow rule off one single-use link.
+   *
+   * `alreadyClaimed` is set by flows that claimed the link earlier in the same
+   * redemption (the OAuth flow claims at consent-start, so the claim is not held
+   * open across the async provider round-trip).
    */
   function autowireWizardConnection(
     integration: Integration,
     agentId: string,
     connectionId: string | null,
     wizardToken: string,
-  ): void {
+    alreadyClaimed = false,
+  ): boolean {
+    if (!alreadyClaimed && !store.claimOnboardingLink(wizardToken)) return false;
     if (connectionId) store.grantConnection(connectionId, "agent", agentId);
     // Resolve the effective access lease for this integration/connection: the
     // owner's per-connection override (chosen in the wizard) wins over the
@@ -392,7 +402,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         });
       }
     }
-    store.markOnboardingLinkUsed(wizardToken);
+    return true;
   }
 
   function finishWizard(
@@ -401,7 +411,15 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     connectionId: string | null,
   ): void {
     if (!pending.wizardToken || !pending.wizardAgentId) return;
-    autowireWizardConnection(integration, pending.wizardAgentId, connectionId, pending.wizardToken);
+    // The link was already claimed at /start, before the async token exchange,
+    // so the OAuth branch never re-claims here.
+    autowireWizardConnection(
+      integration,
+      pending.wizardAgentId,
+      connectionId,
+      pending.wizardToken,
+      true,
+    );
   }
 
   // ---- public routes ----
@@ -810,6 +828,17 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     let scopes = [...scopeSet];
     if (!scopes.length) scopes = link!.scopes && link!.scopes.length ? link!.scopes : oauth.defaultScopes;
 
+    // Claim the single-use link HERE, before handing the user off to the
+    // provider. The callback's token exchange is async, so claiming there would
+    // leave the whole consent round-trip as a TOCTOU window in which a second
+    // holder of the same link could start and finish a parallel redemption,
+    // wiring up a duplicate connection + grant + allow rule. Losing that race
+    // now costs only a 410 before any credential is entered.
+    if (!store.claimOnboardingLink(link!.token)) {
+      invalidLinkPage(res);
+      return;
+    }
+
     const state = randomBytes(16).toString("hex");
     let redirectUri = `${publicBase()}/oauth/${integration.id}/callback`;
     if (oauth.fragmentCallback) redirectUri += `?state=${state}`;
@@ -876,6 +905,12 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           .send(resultPage("Missing details", `Please check the form and try again: ${esc(err)}.`));
         return;
       }
+      // Claim before creating anything: a second redemption of the same link
+      // must not leave a duplicate connection behind.
+      if (!store.claimOnboardingLink(link!.token)) {
+        invalidLinkPage(res);
+        return;
+      }
       const conn = store.createConnection({
         kind: "app",
         vendor: integration.id,
@@ -885,7 +920,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         isDefault: false,
         leaseTtlSeconds: parseLeaseOverride(form),
       });
-      autowireWizardConnection(integration, link!.agentId, conn.id, link!.token);
+      autowireWizardConnection(integration, link!.agentId, conn.id, link!.token, true);
       const agent = store.getAgent(link!.agentId);
       const who = agent ? esc(agent.name) : "Your bot";
       res.send(
@@ -941,12 +976,17 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       invalidLinkPage(res);
       return;
     }
+    // Claim before renewing: a replayed renewal link must not stack a second
+    // lease period onto the rule.
+    if (!store.claimOnboardingLink(link!.token)) {
+      invalidLinkPage(res);
+      return;
+    }
     const renewed = store.renewRule(link!.ruleId);
     if (!renewed) {
       invalidLinkPage(res);
       return;
     }
-    store.markOnboardingLinkUsed(link!.token);
     const integration = registry.get(link!.integrationId);
     const title = integration ? esc(integration.title) : esc(link!.integrationId);
     const agent = store.getAgent(link!.agentId);
