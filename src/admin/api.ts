@@ -18,6 +18,7 @@ import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
 import { buildAuthUrl, exchangeCode } from "../integrations/oauth.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
+import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
 import type { Agent } from "../types.js";
@@ -2175,12 +2176,25 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       leaseTtl = Math.floor(Number(ttlSeconds));
       expiresAt = new Date(Date.now() + leaseTtl * 1000).toISOString();
     }
+    // Canonicalize the verbs before persisting. An un-normalized method can
+    // never match (the matcher compares against an uppercase method), which
+    // would store a rule that reads back correctly but is silently inert.
+    let normalizedMethods: string[];
+    try {
+      normalizedMethods = normalizeMethods(methods == null ? null : (methods as string[]));
+    } catch (err) {
+      if (err instanceof InvalidMethodError) {
+        res.status(400).json({ error: "invalid_methods", message: err.message });
+        return;
+      }
+      throw err;
+    }
     res.status(201).json(
       store.createRule({
         scope,
         subjectId,
         integrationId,
-        methods: Array.isArray(methods) && methods.length ? methods : ["*"],
+        methods: normalizedMethods,
         pathGlob: pathGlob || "/**",
         effect,
         expiresAt,

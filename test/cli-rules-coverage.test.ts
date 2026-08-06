@@ -720,3 +720,45 @@ describe("cli rules: rm and dispatch", () => {
     expect(err).toContain("unknown rules command");
   });
 });
+
+/**
+ * The CLI splits `--methods` on commas and forwards the result. Because the
+ * policy matcher only ever compares against an uppercase method, a lowercase
+ * or misspelled verb produced a rule that could never match: a deny rule
+ * stored that way was silently inert. The CLI now normalizes and validates
+ * before the call (the server does the same).
+ */
+describe("rules add --methods normalization", () => {
+  it("uppercases and trims lowercase verbs", async () => {
+    const rule = await addRule(
+      "--scope", "agent", "--subject", agentId, "--integration", "github",
+      "--effect", "deny", "--methods", " post , put ",
+    );
+    expect(rule.methods).toEqual(["POST", "PUT"]);
+  });
+
+  it("keeps the wildcard default", async () => {
+    const rule = await addRule(
+      "--scope", "agent", "--subject", agentId, "--integration", "github", "--effect", "allow",
+    );
+    expect(rule.methods).toEqual(["*"]);
+  });
+
+  it("tolerates a trailing comma", async () => {
+    const rule = await addRule(
+      "--scope", "agent", "--subject", agentId, "--integration", "github",
+      "--effect", "deny", "--methods", "get,",
+    );
+    expect(rule.methods).toEqual(["GET"]);
+  });
+
+  it("rejects an unknown verb with a clear error instead of storing it", async () => {
+    const { err, exit } = await run(
+      "rules", "add", "--scope", "agent", "--subject", agentId, "--integration", "github",
+      "--effect", "deny", "--methods", "GTE",
+    );
+    expect(exit).toBe(1);
+    expect(err).toContain('invalid --methods "GTE"');
+    expect(err).toContain("unsupported HTTP method");
+  });
+});

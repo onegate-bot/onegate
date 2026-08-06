@@ -8,6 +8,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SecretBox, loadSecretKey } from "./secret-box.js";
+import { normalizeMethods } from "../util/methods.js";
 import type {
   Agent,
   AgentAppConfig,
@@ -1845,7 +1846,10 @@ export class Store {
     const r: Rule = {
       id: newId("rl"),
       ...input,
-      methods: input.methods.map((m) => m.toUpperCase()),
+      // Canonicalize (and reject unmatchable verbs) at the last write boundary,
+      // so a caller that bypasses the admin API cannot persist a silently inert
+      // rule. See src/util/methods.ts.
+      methods: normalizeMethods(input.methods),
       createdAt: now(),
       expiresAt: input.expiresAt ?? null,
       leaseTtlSeconds: input.leaseTtlSeconds ?? null,

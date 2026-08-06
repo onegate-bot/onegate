@@ -9,6 +9,7 @@
 
 import { parseArgs } from "node:util";
 import { emit, table } from "../output.js";
+import { normalizeMethods } from "../../util/methods.js";
 import type { CliContext } from "../context.js";
 
 interface Rule {
@@ -97,10 +98,16 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
   if (values.connection && connectionScope == null) {
     throw new Error("--connection requires --connection-scope only|except");
   }
-  const methods = (values.methods as string)
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean);
+  // Normalize locally too (the server does the same), so a typo like
+  // `--methods GTE` fails here with a clear message instead of travelling to
+  // the API. Without this a lowercase verb would reach the matcher in a form
+  // that can never match, leaving the rule silently inert.
+  let methods: string[];
+  try {
+    methods = normalizeMethods((values.methods as string).split(","));
+  } catch (err) {
+    throw new Error(`invalid --methods "${values.methods as string}": ${(err as Error).message}`);
+  }
   const ttlSeconds = values.ttl != null ? parseTtl(values.ttl as string) : undefined;
   const rule = (await ctx.client().post("/api/rules", {
     scope: values.scope,
