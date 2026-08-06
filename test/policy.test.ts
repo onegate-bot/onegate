@@ -65,6 +65,87 @@ describe("ruleMatches", () => {
   });
 });
 
+describe("case sensitivity is asymmetric: deny folds case, allow does not", () => {
+  const PIN = "/repos/onegate-bot/onegate/**";
+
+  it("a DENY glob catches a re-cased path (GitHub serves any casing of owner/repo)", () => {
+    const deny = rule({ id: "rl_deny", pathGlob: PIN, effect: "deny" });
+    for (const path of [
+      "/repos/OneGate-Bot/onegate/pulls",
+      "/repos/onegate-bot/OneGate/pulls",
+      "/repos/ONEGATE-BOT/ONEGATE/pulls",
+    ]) {
+      expect(ruleMatches(deny, { integrationId: "github", method: "GET", path })).toBe(true);
+    }
+  });
+
+  it("a DENY glob still does not over-match an unrelated repo", () => {
+    const deny = rule({ id: "rl_deny", pathGlob: PIN, effect: "deny" });
+    expect(
+      ruleMatches(deny, {
+        integrationId: "github",
+        method: "GET",
+        path: "/repos/zivisaiah/nanoclaw/pulls",
+      }),
+    ).toBe(false);
+  });
+
+  it("an ALLOW glob stays case-sensitive (never widened onto a different object)", () => {
+    // S3 keys / Drive ids / base64 identifiers are genuinely case-sensitive, so
+    // folding case on an allow would grant access to a DIFFERENT resource.
+    const allow = rule({ integrationId: "s3", pathGlob: "/files/AbC", effect: "allow" });
+    expect(ruleMatches(allow, { integrationId: "s3", method: "GET", path: "/files/AbC" })).toBe(true);
+    expect(ruleMatches(allow, { integrationId: "s3", method: "GET", path: "/files/abc" })).toBe(false);
+    expect(ruleMatches(allow, { integrationId: "s3", method: "GET", path: "/files/ABC" })).toBe(false);
+  });
+
+  it("a re-cased path pinned by a deny no longer escapes through a broad allow", () => {
+    const rules = [
+      rule({ id: "rl_allow", pathGlob: "/**", effect: "allow" }),
+      rule({ id: "rl_deny", pathGlob: PIN, effect: "deny" }),
+    ];
+    const res = evaluate(agent(), rules, {
+      integrationId: "github",
+      method: "GET",
+      path: "/repos/OneGate-Bot/onegate/pulls",
+    });
+    expect(res).toEqual({ effect: "deny", ruleId: "rl_deny" });
+  });
+
+  it("trailing /** keeps covering the bare prefix under BOTH case modes", () => {
+    const sensitive = globToRegExp("/repos/x/y/**");
+    const insensitive = globToRegExp("/repos/x/y/**", true);
+    for (const g of [sensitive, insensitive]) {
+      expect(g.test("/repos/x/y")).toBe(true);
+      expect(g.test("/repos/x/y/")).toBe(true);
+      expect(g.test("/repos/x/y/z")).toBe(true);
+      expect(g.test("/repos/x/yy")).toBe(false);
+    }
+    // Only the insensitive variant folds case, including on the bare prefix.
+    expect(insensitive.test("/repos/X/Y")).toBe(true);
+    expect(insensitive.test("/repos/X/Y/z")).toBe(true);
+    expect(sensitive.test("/repos/X/Y")).toBe(false);
+    expect(sensitive.test("/repos/X/Y/z")).toBe(false);
+  });
+
+  it("the glob cache does not cross-contaminate the two case modes", () => {
+    // Same glob text, compiled both ways, in either order: each caller must get
+    // its own variant back rather than whichever was cached first.
+    const g = "/cache/probe/Mixed/**";
+    const first = globToRegExp(g);
+    const second = globToRegExp(g, true);
+    const firstAgain = globToRegExp(g);
+    const secondAgain = globToRegExp(g, true);
+    expect(first.flags).toBe("");
+    expect(second.flags).toBe("i");
+    expect(firstAgain).toBe(first);
+    expect(secondAgain).toBe(second);
+    expect(first).not.toBe(second);
+    expect(firstAgain.test("/cache/probe/mixed/x")).toBe(false);
+    expect(secondAgain.test("/cache/probe/mixed/x")).toBe(true);
+  });
+});
+
 describe("evaluate", () => {
   const req = { integrationId: "github", method: "DELETE", path: "/repos/z/r" };
 
