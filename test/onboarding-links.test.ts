@@ -13,6 +13,78 @@ function rawLinkRows(store: Store): Array<Record<string, unknown>> {
     .all();
 }
 
+interface RawDb {
+  exec(sql: string): void;
+  prepare(sql: string): {
+    run(...a: unknown[]): void;
+    all(): Array<Record<string, unknown>>;
+    get(...a: unknown[]): Record<string, unknown> | undefined;
+  };
+}
+
+/** The Store's private node:sqlite handle, for shaping legacy fixtures. */
+function rawDb(store: Store): RawDb {
+  return (store as unknown as { db: RawDb }).db;
+}
+
+function tableExists(store: Store, name: string): boolean {
+  return (
+    rawDb(store)
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(name) !== undefined
+  );
+}
+
+function columns(store: Store, table: string): Set<string> {
+  return new Set(
+    rawDb(store)
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((r) => String(r.name)),
+  );
+}
+
+/**
+ * Replaces onboarding_links with the pre-hash legacy shape: a cleartext `token`
+ * PRIMARY KEY and no token_hash. integration_id is deliberately nullable here
+ * (the rebuilt table declares it NOT NULL) so a test can force a constraint
+ * failure part way through the copy loop.
+ */
+function makeLegacyTable(store: Store): string {
+  const raw = rawDb(store);
+  raw.exec("DROP TABLE IF EXISTS onboarding_links");
+  raw.exec(`CREATE TABLE onboarding_links (
+    token TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    integration_id TEXT,
+    scopes TEXT,
+    connection_name TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    rule_id TEXT
+  )`);
+  return "a".repeat(48);
+}
+
+function insertLegacyRow(store: Store, token: string, agentId: string): void {
+  rawDb(store)
+    .prepare(
+      "INSERT INTO onboarding_links (token, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      token,
+      agentId,
+      "google",
+      null,
+      null,
+      new Date().toISOString(),
+      new Date(Date.now() + 86_400_000).toISOString(),
+      null,
+      null,
+    );
+}
+
 let store: Store;
 
 beforeEach(() => {
@@ -219,6 +291,100 @@ describe("onboarding links", () => {
       const got = store.getOnboardingLink(legacyToken);
       expect(got).not.toBeNull();
       expect(got!.agentId).toBe("ag_legacy");
+    });
+
+    it("rolls the whole rebuild back when it fails part way, losing no rows and leaving no plaintext legacy table", () => {
+      const raw = rawDb(store);
+      const tokens = [makeLegacyTable(store), "b".repeat(48), "c".repeat(48)];
+      insertLegacyRow(store, tokens[0], "ag_one");
+      insertLegacyRow(store, tokens[1], "ag_two");
+      insertLegacyRow(store, tokens[2], "ag_three");
+
+      // Simulate the process dying mid-rebuild: let the copy loop insert the
+      // first row, then make the very next insert blow up. Everything the
+      // migration did before that point (the RENAME, the CREATE, the rows
+      // already copied) is uncommitted work that must not survive.
+      const realPrepare = raw.prepare.bind(raw);
+      let inserts = 0;
+      raw.prepare = (sql: string) => {
+        const stmt = realPrepare(sql);
+        if (!sql.startsWith("INSERT OR IGNORE INTO onboarding_links")) return stmt;
+        const realRun = stmt.run.bind(stmt);
+        return {
+          ...stmt,
+          run: (...args: unknown[]) => {
+            if (++inserts > 1) throw new Error("simulated crash mid-migration");
+            return realRun(...args);
+          },
+        };
+      };
+      try {
+        expect(() =>
+          (store as unknown as { hashCapabilityTokensAtRest(): void }).hashCapabilityTokensAtRest(),
+        ).toThrow(/simulated crash/);
+      } finally {
+        raw.prepare = realPrepare;
+      }
+
+      // All-or-nothing: the rebuild is fully undone. The legacy table is still
+      // the live one, holding every original row, and no half-built table with
+      // a subset of the data survives.
+      const legacyRows = raw
+        .prepare("SELECT token, agent_id FROM onboarding_links")
+        .all() as Array<Record<string, unknown>>;
+      expect(legacyRows.length).toBe(3);
+      expect(legacyRows.map((r) => r.token).sort()).toEqual([...tokens].sort());
+      expect(tableExists(store, "onboarding_links_legacy")).toBe(false);
+      // Still legacy-shaped, so the guard fires again on the next open.
+      expect(columns(store, "onboarding_links").has("token")).toBe(true);
+      expect(columns(store, "onboarding_links").has("token_hash")).toBe(false);
+    });
+
+    it("finishes a half-migrated database left with an orphaned plaintext legacy table", () => {
+      const raw = rawDb(store);
+      const legacyToken = "d".repeat(48);
+      // Reproduce exactly what a crash between the RENAME and the DROP left
+      // behind under the old non-transactional migration: a new token_hash
+      // table (here already holding one copied row) plus a surviving
+      // onboarding_links_legacy still holding cleartext tokens.
+      makeLegacyTable(store);
+      insertLegacyRow(store, legacyToken, "ag_orphan");
+      raw.exec("ALTER TABLE onboarding_links RENAME TO onboarding_links_legacy");
+      raw.exec(`CREATE TABLE onboarding_links (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        integration_id TEXT NOT NULL,
+        scopes TEXT,
+        connection_name TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        rule_id TEXT
+      )`);
+
+      // The old guard (`token` present && no `token_hash`) is false here, so
+      // this only completes if the guard also keys off the legacy table.
+      (store as unknown as { hashCapabilityTokensAtRest(): void }).hashCapabilityTokensAtRest();
+
+      // The stranded row is carried over as a hash and the plaintext table is gone.
+      expect(tableExists(store, "onboarding_links_legacy")).toBe(false);
+      const rows = rawLinkRows(store);
+      expect(rows.length).toBe(1);
+      expect(rows[0].token).toBeUndefined();
+      expect(rows[0].token_hash).toBe(sha256(legacyToken));
+      const got = store.getOnboardingLink(legacyToken);
+      expect(got).not.toBeNull();
+      expect(got!.agentId).toBe("ag_orphan");
+    });
+
+    it("is a no-op on an already migrated database", () => {
+      const link = store.createOnboardingLink({ agentId: "ag_done", integrationId: "google" });
+      (store as unknown as { hashCapabilityTokensAtRest(): void }).hashCapabilityTokensAtRest();
+      const rows = rawLinkRows(store);
+      expect(rows.length).toBe(1);
+      expect(rows[0].token_hash).toBe(sha256(link.token));
+      expect(tableExists(store, "onboarding_links_legacy")).toBe(false);
+      expect(store.getOnboardingLink(link.token)).not.toBeNull();
     });
   });
 });
