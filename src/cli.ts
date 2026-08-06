@@ -194,7 +194,7 @@ Local commands (operate the data dir directly):
 Admin API commands (talk to a running gateway over --host + admin token):
   onegate connections list
   onegate connections add --vendor <v> --name <n> [--api-key|--auth-token|--auth-json|--secret-stdin] [--default]   (LLM)
-  onegate connections add --kind app --integration <id> --name <n> --data k=v [--data k=v...] [--agent <id>] [--default]
+  onegate connections add --kind app --integration <id> --name <n> (--data-stdin | --data k=v...) [--agent <id>] [--default]
   onegate connections set-default <id>
   onegate connections rm <id>
   onegate connections grants --id <conn>                                     list grants on an app connection
@@ -206,12 +206,18 @@ Admin API commands (talk to a running gateway over --host + admin token):
   onegate agents notify get <agentId>|set <agentId> --url <webhookUrl>|clear <agentId>
   onegate rules list|add|rm
   onegate integrations list
-  onegate integrations connect <id> --client-id X --client-secret Y --redirect-base URL
-  onegate credentials set <integrationId> --name N --data k=v [--data k=v...]
+  onegate integrations connect <id> --client-id X --client-secret-stdin --redirect-base URL
+  onegate credentials set <integrationId> --name N (--data-stdin [key] | --data k=v...)
   onegate credentials rm <integrationId>
   onegate audit [--agent <id>] [--limit N]
   onegate usage [--since ISO] [--until ISO] [--limit N]
   onegate projects list|add <name>|rm <id>
+
+Secrets:
+  Pipe secret material in on stdin: --secret-stdin, --client-secret-stdin, --data-stdin.
+  The argv forms (--api-key, --auth-token, --client-secret, --data k=v) still work but are
+  insecure: the value is visible in ps, in /proc/<pid>/cmdline and in shell history.
+    printf %s "$TOKEN" | onegate credentials set stripe --name prod --data-stdin apiKey
 
 Global flags (admin API commands):
   --host <url>     admin API base URL (default http://localhost:8080, or ONEGATE_ADMIN_URL)
