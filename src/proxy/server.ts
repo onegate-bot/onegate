@@ -51,6 +51,12 @@ interface LlmRoute {
   connections: Connection[];
 }
 
+/** One upstream LLM attempt: the response plus the request that produced it. */
+interface UpstreamAttempt {
+  upRes: http.IncomingMessage;
+  upstream: http.ClientRequest;
+}
+
 /** Statuses that trigger strategy error handling and the failover retry. */
 function isRetryableStatus(status: number | undefined): boolean {
   return status === 429 || (status !== undefined && status >= 500);
@@ -194,68 +200,38 @@ export function isValidConnectHost(host: string): boolean {
 }
 
 /**
- * Hostnames that always name the local machine regardless of what the resolver
- * says. `localhost` is normally a loopback A/AAAA record and would be caught by
- * the resolved-address check below, but a poisoned or unusual resolver could
- * map it elsewhere; either way an agent has no business tunnelling to it.
- */
-const LOCAL_HOSTNAMES = new Set(["localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"]);
 
-/**
- * True when `ip` is a literal address OneGate must never open a passthrough
- * tunnel to. The gateway runs alongside private infrastructure (in the fleet
- * deployment the OneGate admin API itself binds 172.17.0.1:8080), so an
- * unrestricted CONNECT tunnel turns any authenticated agent into an SSRF pivot
- * onto the admin plane, the docker bridge, and cloud metadata.
+ * Pipes an upstream response body back to the agent, with both ends' failures
+ * handled.
  *
- * Blocked: loopback (127/8, ::1), link-local (169.254/16, fe80::/10, which
- * covers cloud metadata at 169.254.169.254), RFC1918 private (10/8, 172.16/12,
- * 192.168/16), IPv6 unique-local (fc00::/7), CGNAT (100.64/10) and the
- * unspecified addresses (0.0.0.0, ::). IPv4-mapped IPv6 forms
- * (`::ffff:127.0.0.1`) are unwrapped first so they cannot smuggle a blocked v4
- * address past the v6 checks.
+ * Response headers are already sent by the time the body flows, so a mid-body
+ * failure cannot be turned into a clean 502. The only correct move is to tear
+ * the other side down so the agent sees a truncated response rather than a
+ * silently short one.
  *
- * A non-address string returns false: this helper only judges IPs. Hostnames
- * are handled by resolving them and re-checking the result (see resolveTarget).
+ * Without the `upRes` listener a mid-body upstream failure (RST, premature
+ * close, TLS teardown) emits an 'error' with no handler, which Node escalates
+ * to an uncaught exception. There is no process-level `uncaughtException`
+ * handler, so that kills the single shared proxy process and drops every
+ * agent's traffic at once.
+ *
+ * The `res` listener covers the reverse direction: when the agent goes away
+ * mid-body the upstream request is destroyed, instead of being left streaming
+ * into a dead socket and leaking its connection.
  */
-export function isBlockedDestination(ip: string): boolean {
-  const family = net.isIP(ip);
-  if (family === 0) return false;
+export function pipeUpstreamResponse(
+  upRes: http.IncomingMessage,
+  res: http.ServerResponse,
+  upstream: { destroy: (err?: Error) => void },
+  onError?: (err: Error) => void,
+): void {
+  upRes.on("error", (err: Error) => {
+    onError?.(err);
+    res.destroy();
+  });
+  res.on("error", () => upstream.destroy());
+  upRes.pipe(res);
 
-  if (family === 6) {
-    const v6 = ip.toLowerCase().split("%")[0]; // strip any zone index
-    // Unwrap IPv4-mapped/compatible forms (::ffff:127.0.0.1, ::127.0.0.1) and
-    // re-judge as IPv4, otherwise ::ffff:169.254.169.254 would sail through.
-    const mapped = /^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
-    if (mapped) return isBlockedDestination(mapped[1]);
-    if (v6 === "::1" || v6 === "::") return true;
-    if (/^fe[89ab]/.test(v6)) return true; // fe80::/10 link-local
-    if (/^f[cd]/.test(v6)) return true; // fc00::/7 unique-local
-    return false;
-  }
-
-  const octets = ip.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o))) return false;
-  const [a, b] = octets;
-  if (a === 0) return true; // 0.0.0.0/8 unspecified ("this network")
-  if (a === 127) return true; // 127.0.0.0/8 loopback
-  if (a === 10) return true; // 10.0.0.0/8 private
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
-  if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
-  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local + metadata
-  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-  return false;
-}
-
-/**
- * Operator escape hatch. Some deployments genuinely need agents to tunnel to an
- * internal host (a self-hosted vendor on the same LAN, for example). Blocked by
- * default; set ONEGATE_ALLOW_INTERNAL_PASSTHROUGH=1 to opt back in to the old
- * unrestricted behaviour.
- */
-function internalPassthroughAllowed(): boolean {
-  const raw = process.env.ONEGATE_ALLOW_INTERNAL_PASSTHROUGH?.trim().toLowerCase();
-  return raw === "1" || raw === "true";
 }
 
 export class GatewayProxy {
@@ -1239,7 +1215,9 @@ export class GatewayProxy {
           if (!HOP_BY_HOP.has(k)) outHeaders[k] = v;
         }
         res.writeHead(upRes.statusCode ?? 502, outHeaders);
-        upRes.pipe(res);
+        pipeUpstreamResponse(upRes, res, upstream, (err) => {
+          this.log(`upstream response stream error for ${host}: ${err.message}`);
+        });
       },
     );
     upstream.on("error", (err) => {
@@ -1421,7 +1399,9 @@ export class GatewayProxy {
     // One upstream attempt with the given connection. Resolves with the
     // upstream response (any status) or rejects on a connection-level or
     // injection failure.
-    const attempt = (conn: Connection): Promise<http.IncomingMessage> =>
+    // Carries the originating ClientRequest alongside the response so the
+    // relay can destroy the upstream socket if the agent disconnects mid-body.
+    const attempt = (conn: Connection): Promise<UpstreamAttempt> =>
       new Promise((resolve, reject) => {
         const headers = forwardHeaders(req.headers);
         headers.host = host;
@@ -1457,7 +1437,7 @@ export class GatewayProxy {
                 agent: this.upstreamAgent,
                 ...this.opts.upstreamTls,
               },
-              resolve,
+              (upRes) => resolve({ upRes, upstream }),
             );
             upstream.on("error", reject);
             upstream.end(body);
@@ -1465,13 +1445,15 @@ export class GatewayProxy {
           .catch(reject);
       });
 
-    const streamBack = (upRes: http.IncomingMessage) => {
+    const streamBack = (upRes: http.IncomingMessage, upstream: http.ClientRequest) => {
       const outHeaders: http.OutgoingHttpHeaders = {};
       for (const [k, v] of Object.entries(upRes.headers)) {
         if (!HOP_BY_HOP.has(k)) outHeaders[k] = v;
       }
       res.writeHead(upRes.statusCode ?? 502, outHeaders);
-      upRes.pipe(res);
+      pipeUpstreamResponse(upRes, res, upstream, (err) => {
+        this.log(`llm upstream response stream error for ${host}: ${err.message}`);
+      });
     };
 
     // Marks the attempt's error in the strategy state and returns the
@@ -1492,8 +1474,9 @@ export class GatewayProxy {
       // dispatching upstream. A denied connection never reaches the vendor.
       if (denyIfConnectionScoped(conn)) return;
       let upRes: http.IncomingMessage;
+      let upstream: http.ClientRequest;
       try {
-        upRes = await attempt(conn);
+        ({ upRes, upstream } = await attempt(conn));
       } catch (err) {
         this.log(`llm upstream error for ${host} via ${conn.id}: ${(err as Error).message}`);
         recordUsage(conn, failover, true, null);
@@ -1526,7 +1509,7 @@ export class GatewayProxy {
           continue;
         }
         finalAudit(conn, failover, status ?? null);
-        streamBack(upRes);
+        streamBack(upRes, upstream);
         return;
       }
       finalAudit(conn, failover, status ?? null);
@@ -1537,7 +1520,7 @@ export class GatewayProxy {
       const scanner = createUsageScanner(upRes.headers);
       if (!scanner) {
         recordUsage(conn, failover, false, status ?? null);
-        streamBack(upRes);
+        streamBack(upRes, upstream);
         return;
       }
       let usageRecorded = false;
@@ -1551,7 +1534,7 @@ export class GatewayProxy {
       // row is written before the client observes the end of the response.
       upRes.once("end", finishUsage);
       upRes.once("close", finishUsage);
-      streamBack(upRes);
+      streamBack(upRes, upstream);
       return;
     }
   }
