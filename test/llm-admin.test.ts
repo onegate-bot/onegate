@@ -347,6 +347,74 @@ describe("anthropic auth-token connections", () => {
     expect(explicitNoKey.status).toBe(400);
     expect(explicitNoKey.json.message).toContain("apiKey");
   });
+
+  // The api-key-vs-subscription-token mix-up is the ONE Anthropic credential
+  // confusion that is locally detectable (distinct prefixes). The two
+  // subscription token types both start with sk-ant-oat and are NOT separable,
+  // so nothing below tries to tell them apart.
+  it("rejects a credential pasted into the wrong Anthropic field", async () => {
+    const keyAsToken = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "x",
+      data: { authMode: "auth_token", authToken: "sk-ant-api03-AAAABBBB" },
+    });
+    expect(keyAsToken.status).toBe(400);
+    expect(keyAsToken.json.error).toBe("invalid_data");
+    expect(keyAsToken.json.message).toContain("API key");
+
+    const tokenAsKey = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "x",
+      data: { authMode: "api_key", apiKey: "sk-ant-oat01-AAAABBBB" },
+    });
+    expect(tokenAsKey.status).toBe(400);
+    expect(tokenAsKey.json.error).toBe("invalid_data");
+    expect(tokenAsKey.json.message).toContain("subscription auth token");
+
+    // Untagged payloads are judged by the field the value landed in.
+    const untagged = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "x",
+      data: { apiKey: "sk-ant-oat01-AAAABBBB" },
+    });
+    expect(untagged.status).toBe(400);
+    expect(untagged.json.message).toContain("subscription auth token");
+  });
+
+  it("accepts valid credentials in their correct field, and never blocks an unknown prefix", async () => {
+    // A real setup-token value must NOT be rejected: a false rejection of a
+    // valid credential is worse than the warning copy.
+    const realToken = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "Anthropic - real sub token",
+      data: { authMode: "auth_token", authToken: `sk-ant-oat01-${"A".repeat(80)}` },
+    });
+    expect(realToken.status).toBe(201);
+    store.deleteConnection(realToken.json.id);
+
+    const realKey = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "Anthropic - real key",
+      data: { authMode: "api_key", apiKey: "sk-ant-api03-AAAABBBB" },
+    });
+    expect(realKey.status).toBe(201);
+    store.deleteConnection(realKey.json.id);
+
+    // Anthropic may mint new prefixes at any time, so unknown must pass.
+    const future = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "anthropic",
+      name: "Anthropic - future prefix",
+      data: { authMode: "auth_token", authToken: "sk-ant-future99-XYZ" },
+    });
+    expect(future.status).toBe(201);
+    store.deleteConnection(future.json.id);
+  });
 });
 
 describe("per-agent LLM config", () => {
