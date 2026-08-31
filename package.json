@@ -22,7 +22,7 @@
     "node": ">=22.13"
   },
   "dependencies": {
-    "express": "^4.22.2",
+    "express": "^5.2.1",
     "node-forge": "^1.4.0"
   },
   "devDependencies": {
