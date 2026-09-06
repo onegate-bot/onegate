@@ -214,6 +214,20 @@ export interface Integration {
   needsBody?: boolean;
   /** Present on LLM vendor integrations, enables per-agent connection routing. */
   llm?: LlmMeta;
+  /**
+   * True when this integration also ships as a self-managed deployment, so a
+   * connection may carry an owner-supplied `instanceOrigin` (an https origin
+   * like https://gitlab.acme.example). Host resolution then treats that
+   * origin's host as belonging to this integration, and the proxy injects
+   * exactly the connection that declared it.
+   *
+   * Only set this for integrations whose self-hosted API is compatible with
+   * the SaaS one, since `inject` is shared between them. Owner-supplied
+   * origins are validated (https, no IP literals, no internal ranges) and can
+   * never claim a host a builtin integration already owns: see
+   * util/instance-origin.ts.
+   */
+  supportsInstanceOrigin?: boolean;
   /** True for integrations loaded from the community drop-in directory. */
   community?: boolean;
   /**
@@ -294,14 +308,59 @@ function bestClaim(integration: Integration, host: string): number | null {
  * connected credential (see resolveHostCandidates), so an exact-host overlap
  * between these is expected rather than a configuration error.
  */
-const INTENTIONAL_HOST_SHARERS = new Set(["github github-app", "confluence jira"]);
+const INTENTIONAL_HOST_SHARERS = new Set(["github\x00github-app", "confluence\x00jira"]);
 
 function sharerKey(a: string, b: string): string {
-  return a < b ? `${a} ${b}` : `${b} ${a}`;
+  return a < b ? `${a}\x00${b}` : `${b}\x00${a}`;
 }
+
+/**
+ * One owner-supplied instance-origin claim: a connection saying "this host is
+ * my self-managed deployment of this integration". Supplied to the Registry by
+ * the store so host resolution can consult live connection data without the
+ * registry depending on the database.
+ */
+export interface InstanceOriginClaim {
+  /** Lowercased hostname of the claimed origin (no scheme, no port). */
+  host: string;
+  /** The integration the claiming connection belongs to. */
+  integrationId: string;
+  /** The claiming connection's id, so the proxy can pin injection to it. */
+  connectionId: string;
+}
+
+/** Supplies the current set of instance-origin claims, newest state each call. */
+export type InstanceOriginClaimLookup = (host: string) => InstanceOriginClaim | null;
 
 export class Registry {
   private byId = new Map<string, Integration>();
+  private originClaims: InstanceOriginClaimLookup | null = null;
+
+  /**
+   * Installs the owner-supplied instance-origin lookup. Called once at wiring
+   * time with a store-backed function. Until it is installed (and for every
+   * host with no claim) resolution behaves exactly as before.
+   */
+  setInstanceOriginLookup(lookup: InstanceOriginClaimLookup | null): void {
+    this.originClaims = lookup;
+  }
+
+  /**
+   * Returns the owner-supplied claim for `host`, or null. Builtin host claims
+   * always win: `resolveHostCandidates` checks static hosts first and only
+   * falls back here, so an instance origin can never displace a builtin (the
+   * admin API also refuses to store such an origin in the first place, this is
+   * the defence in depth for rows written before a builtin grew a new host).
+   */
+  instanceOriginClaim(host: string): InstanceOriginClaim | null {
+    if (!this.originClaims) return null;
+    const claim = this.originClaims(host.toLowerCase());
+    if (!claim) return null;
+    // A claim is only honoured while its integration still declares support.
+    const integration = this.byId.get(claim.integrationId);
+    if (!integration?.supportsInstanceOrigin) return null;
+    return claim;
+  }
 
   register(integration: Integration): void {
     if (this.byId.has(integration.id)) {
@@ -314,18 +373,6 @@ export class Registry {
   /**
    * Rejects a new integration that claims the exact same host as an existing
    * one, unless the pair is a known intentional sharer.
-   *
-   * Why throw rather than warn: an exact-host collision means two integrations
-   * would inject different credentials into the same vendor's traffic, and
-   * which one wins is not derivable from specificity. For the builtin catalog
-   * that is a developer error, and throwing surfaces it in CI on the first test
-   * run instead of silently re-routing a host once someone reorders BUILTINS.
-   * Only genuinely ambiguous *exact* overlap throws. Suffix overlap is not a
-   * collision at all: it is resolved deterministically by specificity (an exact
-   * host beats a suffix, a longer suffix beats a shorter one), which is exactly
-   * how google/gemini sit inside gcp's `.googleapis.com` claim. So a community
-   * integration adding a narrower or broader suffix still loads fine, and a
-   * running deployment is only refused on the unresolvable case.
    */
   private assertNoExactHostCollision(integration: Integration): void {
     const incoming = new Set(
@@ -363,20 +410,14 @@ export class Registry {
   }
 
   /**
-   * All integrations claiming `host`, most specific first. Specificity, not
-   * registration order, decides: an exact host claim outranks a dot-suffix
-   * claim, and a longer suffix outranks a shorter one. So google's explicit
-   * `gmail.googleapis.com` beats gcp's `.googleapis.com` regardless of where
-   * either sits in BUILTINS, and reordering the array (or dropping in a
-   * community integration) can no longer silently re-route a host to a
-   * different integration and therefore a different injected credential.
+   * Integrations claiming `host` via their DECLARED static hosts only, ignoring
+   * owner-supplied instance origins.
    *
-   * Equally specific claims (two integrations naming the same exact host, e.g.
-   * api.github.com for both github and github-app) keep registration order
-   * relative to each other, so the existing "connected credential wins, else
-   * the first registered" behaviour in the proxy is unchanged.
+   * Callers validating a proposed instance origin must use this: asking the
+   * full resolver would also see instance-origin claims, so a host would appear
+   * "already claimed" by the very connection being validated.
    */
-  resolveHostCandidates(host: string): Integration[] {
+  resolveStaticHostCandidates(host: string): Integration[] {
     const h = host.toLowerCase();
     const matches: { integration: Integration; rank: number; order: number }[] = [];
     let order = 0;
@@ -388,5 +429,21 @@ export class Registry {
     // Stable by construction: ties fall back to registration order.
     matches.sort((a, b) => b.rank - a.rank || a.order - b.order);
     return matches.map((m) => m.integration);
+  }
+
+  resolveHostCandidates(host: string): Integration[] {
+    const h = host.toLowerCase();
+    const out = this.resolveStaticHostCandidates(h);
+    // Static host claims take precedence, always. Only when no builtin owns
+    // this host do we consult owner-supplied instance origins, so a connection
+    // can never hijack api.github.com even if a stale row claims it.
+    if (out.length === 0) {
+      const claim = this.instanceOriginClaim(h);
+      if (claim) {
+        const integration = this.byId.get(claim.integrationId);
+        if (integration) out.push(integration);
+      }
+    }
+    return out;
   }
 }
