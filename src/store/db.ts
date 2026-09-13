@@ -862,6 +862,18 @@ export class Store {
     }
   }
 
+  /**
+   * Deletes every setting whose key starts with the given prefix. Callers pass
+   * literal prefixes, so the LIKE metacharacters (% _ and the escape itself)
+   * are escaped rather than treated as wildcards.
+   */
+  deleteSettingsByPrefix(prefix: string): void {
+    const escaped = prefix.replace(/[\\%_]/g, (c) => `\\${c}`);
+    this.db
+      .prepare("DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'")
+      .run(`${escaped}%`);
+  }
+
   // ---- projects ----
 
   createProject(name: string): Project {
@@ -1343,6 +1355,10 @@ export class Store {
     // (or, with grants cascaded off, in a half-torn state). Run both together.
     this.tx(() => {
       this.db.prepare("DELETE FROM connections WHERE id = ?").run(id);
+      this.deleteSetting(`oauth_access_token:${cur.vendor}:${id}`);
+      this.deleteSetting(`docker_hub_jwt:${id}`);
+      this.deleteSetting(`github_app_token:${id}`);
+      this.deleteSettingsByPrefix(`gcp_access_token:${id}:`);
       if (cur.isDefault) {
         const next = this.listConnections({
           kind: cur.kind,
