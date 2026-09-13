@@ -183,14 +183,42 @@ export interface LlmMeta {
   inject(ctx: InjectionContext): void | Promise<void>;
 }
 
+/**
+ * A host claim narrowed to a path prefix. Lets two integrations with different
+ * auth modes share one hostname: the vendor exposes both OAuth product APIs and
+ * simple key-based APIs on the same host (www.googleapis.com serves Workspace
+ * OAuth APIs and the API-key-only YouTube Data API).
+ *
+ * `path` must be an absolute, glob-free prefix (e.g. "/youtube/v3"). It matches
+ * the prefix itself and anything beneath it, on SEGMENT boundaries only, so
+ * "/youtube/v3" matches "/youtube/v3" and "/youtube/v3/search" but never
+ * "/youtube/v31".
+ */
+export interface PathScopedHost {
+  host: string;
+  path: string;
+}
+
+/**
+ * One entry in `Integration.hosts`: a bare hostname (claims the whole host, the
+ * long-standing form) or a host narrowed to a path prefix.
+ */
+export type HostClaim = string | PathScopedHost;
+
 export interface Integration {
   id: string;
   title: string;
   /**
    * Hostnames this integration owns. An entry starting with "." matches any
    * subdomain (".googleapis.com" matches "gmail.googleapis.com").
+   *
+   * An entry may instead be `{ host, path }` to claim only a path prefix of that
+   * host (see PathScopedHost). A path-scoped claim is MORE SPECIFIC than a bare
+   * host claim: it wins for requests under its prefix while the bare claim keeps
+   * serving the rest of the host. Two path-scoped claims on one host resolve
+   * longest-prefix-first.
    */
-  hosts: string[];
+  hosts: HostClaim[];
   /** Fields the admin UI should collect when connecting this integration. */
   credentialFields: CredentialField[];
   /** Grouping label for the admin UI integration list. */
@@ -228,6 +256,13 @@ export interface Integration {
   inject(ctx: InjectionContext): void | Promise<void>;
 }
 
+/** Normalizes a claim into its object form. */
+function claimParts(entry: HostClaim): { host: string; path: string | null } {
+  return typeof entry === "string"
+    ? { host: entry, path: null }
+    : { host: entry.host, path: entry.path };
+}
+
 /**
  * How an agent-scoped self-service connect link should let an owner connect
  * this integration, or null when there is no self-service path:
@@ -256,19 +291,20 @@ export function connectFlowKind(integration: Integration): "oauth" | "credential
  *
  * Returns null when `entry` does not claim `host` at all.
  */
-function claimSpecificity(entry: string, host: string): number | null {
-  if (entry.startsWith(".")) {
-    // ".make.com" claims "eu1.make.com" and the bare apex "make.com". The
-    // leading dot anchors the match, so "evilmake.com" is not captured.
-    if (host.endsWith(entry) || host === entry.slice(1)) {
-      // Suffix claims rank below every exact claim, longest suffix first.
-      return entry.length;
+function claimSpecificity(entry: HostClaim, host: string): number | null {
+  const { host: pattern, path: prefix } = claimParts(entry);
+  const p = pattern.toLowerCase();
+  const h = host.toLowerCase();
+  if (p.startsWith(".")) {
+    if (h.endsWith(p) || h === p.slice(1)) {
+      return p.length;
     }
     return null;
   }
-  // Exact claims all share one rank above any suffix claim: two integrations
-  // naming the same host are equally specific by definition.
-  return host === entry ? EXACT_RANK : null;
+  if (h === p) {
+    return prefix === null ? EXACT_RANK : EXACT_RANK - 1;
+  }
+  return null;
 }
 
 /** Above any possible suffix length, so exact claims always sort first. */
@@ -282,10 +318,33 @@ const EXACT_RANK = Number.MAX_SAFE_INTEGER;
 function bestClaim(integration: Integration, host: string): number | null {
   let best: number | null = null;
   for (const entry of integration.hosts) {
-    const rank = claimSpecificity(entry.toLowerCase(), host);
+    const rank = claimSpecificity(entry, host);
     if (rank !== null && (best === null || rank > best)) best = rank;
   }
   return best;
+}
+
+/**
+ * Whether a path-scoped claim's prefix covers `path`.
+ *
+ * `path` MUST already be canonical (see normalizeRequestPath in policy.ts:
+ * percent-decoded once, dot-segments and duplicate slashes collapsed). This
+ * function deliberately does NOT normalize: re-normalizing would peel a second
+ * percent-decode layer the proxy never applied and never forwards upstream, so a
+ * double-encoded path could be scoped to one integration while the vendor serves
+ * another. Matching the forwarded path verbatim is what keeps credential
+ * injection aligned with the request actually made.
+ *
+ * Matching is on SEGMENT boundaries: "/youtube/v3" covers "/youtube/v3",
+ * "/youtube/v3/" and "/youtube/v3/search", but not "/youtube/v31".
+ */
+export function pathScopeMatches(prefix: string, path: string): boolean {
+  const bare = path.split("?")[0];
+  const p = prefix.length > 1 && prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
+  if (p === "/" || p === "") return true;
+  if (!bare.startsWith(p)) return false;
+  const next = bare.charAt(p.length);
+  return next === "" || next === "/";
 }
 
 /**
@@ -294,10 +353,14 @@ function bestClaim(integration: Integration, host: string): number | null {
  * connected credential (see resolveHostCandidates), so an exact-host overlap
  * between these is expected rather than a configuration error.
  */
-const INTENTIONAL_HOST_SHARERS = new Set(["github github-app", "confluence jira"]);
+const INTENTIONAL_HOST_SHARERS = new Set([
+  "github\x00github-app",
+  "confluence\x00jira",
+  "google\x00youtube",
+]);
 
 function sharerKey(a: string, b: string): string {
-  return a < b ? `${a} ${b}` : `${b} ${a}`;
+  return a < b ? `${a}\x00${b}` : `${b}\x00${a}`;
 }
 
 export class Registry {
@@ -314,29 +377,21 @@ export class Registry {
   /**
    * Rejects a new integration that claims the exact same host as an existing
    * one, unless the pair is a known intentional sharer.
-   *
-   * Why throw rather than warn: an exact-host collision means two integrations
-   * would inject different credentials into the same vendor's traffic, and
-   * which one wins is not derivable from specificity. For the builtin catalog
-   * that is a developer error, and throwing surfaces it in CI on the first test
-   * run instead of silently re-routing a host once someone reorders BUILTINS.
-   * Only genuinely ambiguous *exact* overlap throws. Suffix overlap is not a
-   * collision at all: it is resolved deterministically by specificity (an exact
-   * host beats a suffix, a longer suffix beats a shorter one), which is exactly
-   * how google/gemini sit inside gcp's `.googleapis.com` claim. So a community
-   * integration adding a narrower or broader suffix still loads fine, and a
-   * running deployment is only refused on the unresolvable case.
    */
   private assertNoExactHostCollision(integration: Integration): void {
     const incoming = new Set(
-      integration.hosts.filter((h) => !h.startsWith(".")).map((h) => h.toLowerCase()),
+      integration.hosts
+        .map(claimParts)
+        .filter(({ host, path }) => path === null && !host.startsWith("."))
+        .map(({ host }) => host.toLowerCase()),
     );
     if (incoming.size === 0) return;
     for (const existing of this.byId.values()) {
       if (INTENTIONAL_HOST_SHARERS.has(sharerKey(existing.id, integration.id))) continue;
       for (const entry of existing.hosts) {
-        if (entry.startsWith(".")) continue;
-        const host = entry.toLowerCase();
+        const { host: existingHost, path: existingPath } = claimParts(entry);
+        if (existingPath !== null || existingHost.startsWith(".")) continue;
+        const host = existingHost.toLowerCase();
         if (incoming.has(host)) {
           throw new Error(
             `Integration "${integration.id}" claims host "${host}" already owned by ` +
@@ -365,16 +420,12 @@ export class Registry {
   /**
    * All integrations claiming `host`, most specific first. Specificity, not
    * registration order, decides: an exact host claim outranks a dot-suffix
-   * claim, and a longer suffix outranks a shorter one. So google's explicit
-   * `gmail.googleapis.com` beats gcp's `.googleapis.com` regardless of where
-   * either sits in BUILTINS, and reordering the array (or dropping in a
-   * community integration) can no longer silently re-route a host to a
-   * different integration and therefore a different injected credential.
+   * claim, and a longer suffix outranks a shorter one.
    *
-   * Equally specific claims (two integrations naming the same exact host, e.g.
-   * api.github.com for both github and github-app) keep registration order
-   * relative to each other, so the existing "connected credential wins, else
-   * the first registered" behaviour in the proxy is unchanged.
+   * PATH-SCOPED CLAIMS: this is the host-only view, used at CONNECT time when no
+   * path is known yet. An integration whose only claim on this host is path-scoped
+   * IS included here, so the host still terminates. Narrowing to the one integration
+   * that owns the request's path happens later: see resolveHostPathCandidates.
    */
   resolveHostCandidates(host: string): Integration[] {
     const h = host.toLowerCase();
@@ -388,5 +439,46 @@ export class Registry {
     // Stable by construction: ties fall back to registration order.
     matches.sort((a, b) => b.rank - a.rank || a.order - b.order);
     return matches.map((m) => m.integration);
+  }
+
+  /**
+   * Candidates for `host` narrowed by the request `path`, most specific first.
+   *
+   * Resolution rule:
+   *  - A path-scoped claim matching `path` is MORE SPECIFIC than a bare host
+   *    claim and sorts ahead of it.
+   *  - Two matching path-scoped claims sort longest-prefix-first.
+   *  - Bare host claims keep their relative specificity and serve everything
+   *    a path-scoped claim did not match.
+   *  - A path-scoped claim that does NOT match `path` is dropped entirely.
+   */
+  resolveHostPathCandidates(host: string, path: string): Integration[] {
+    const h = host.toLowerCase();
+    const scored: { integration: Integration; specificity: number; hostRank: number; order: number }[] = [];
+    let order = 0;
+    for (const integration of this.byId.values()) {
+      const idx = order++;
+      let bestPathScore: number | null = null;
+      let bestHostRank: number | null = null;
+      for (const entry of integration.hosts) {
+        const { host: pattern, path: prefix } = claimParts(entry);
+        const hostRank = claimSpecificity(pattern.toLowerCase(), h);
+        if (hostRank === null) continue;
+        if (bestHostRank === null || hostRank > bestHostRank) bestHostRank = hostRank;
+
+        if (prefix == null) {
+          if (bestPathScore === null) bestPathScore = 0;
+          continue;
+        }
+        if (!pathScopeMatches(prefix, path)) continue;
+        const score = prefix.length;
+        if (bestPathScore === null || score > bestPathScore) bestPathScore = score;
+      }
+      if (bestPathScore !== null && bestHostRank !== null) {
+        scored.push({ integration, specificity: bestPathScore, hostRank: bestHostRank, order: idx });
+      }
+    }
+    scored.sort((a, b) => b.specificity - a.specificity || b.hostRank - a.hostRank || a.order - b.order);
+    return scored.map((s) => s.integration);
   }
 }

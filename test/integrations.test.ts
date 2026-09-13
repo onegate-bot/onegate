@@ -1611,7 +1611,10 @@ describe("host claim resolution is specificity-ordered, not registration-ordered
 
     for (const [host, owner] of OVERLAPS) {
       expect(reversed.resolveHost(host)?.id, `${host} (reversed)`).toBe(
-        host === "api.github.com" || host === "github.com" || host === "api.atlassian.com"
+        host === "api.github.com" ||
+          host === "github.com" ||
+          host === "api.atlassian.com" ||
+          host === "youtube.googleapis.com"
           ? // Equally specific exact claims tie, so the tiebreak follows the
             // (now reversed) registration order. Specificity cannot separate
             // them, which is exactly why they are declared intentional pairs.
@@ -1619,7 +1622,14 @@ describe("host claim resolution is specificity-ordered, not registration-ordered
           : owner,
       );
       // For everything decided by specificity the two registries must agree.
-      if (!["api.github.com", "github.com", "api.atlassian.com"].includes(host)) {
+      if (
+        ![
+          "api.github.com",
+          "github.com",
+          "api.atlassian.com",
+          "youtube.googleapis.com",
+        ].includes(host)
+      ) {
         expect(reversed.resolveHost(host)?.id, `${host} (reversed)`).toBe(
           forward.resolveHost(host)?.id,
         );
@@ -1631,7 +1641,13 @@ describe("host claim resolution is specificity-ordered, not registration-ordered
     const base = await buildRegistry();
     const integrations = base.list();
     const specificityDecided = OVERLAPS.filter(
-      ([h]) => !["api.github.com", "github.com", "api.atlassian.com"].includes(h),
+      ([h]) =>
+        ![
+          "api.github.com",
+          "github.com",
+          "api.atlassian.com",
+          "youtube.googleapis.com",
+        ].includes(h),
     );
     let seed = 42;
     const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
