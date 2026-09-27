@@ -125,6 +125,9 @@ CREATE TABLE IF NOT EXISTS connections (
   owner_agent_id TEXT,
   is_default INTEGER NOT NULL DEFAULT 0,
   lease_ttl_seconds INTEGER,
+  inactive_at TEXT,
+  inactive_reason TEXT,
+  auth_failures INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -469,6 +472,14 @@ function rowToCredential(r: Row, box: SecretBox): Credential | null {
   };
 }
 
+/**
+ * Consecutive upstream 401s after which a connection is taken out of rotation.
+ * More than one, so a single odd response cannot bench a good credential; low
+ * enough that a revoked key stops costing a failed request on every rotation.
+ * Only 401 counts: 429 and 5xx are transient and keep the ordinary failover.
+ */
+export const AUTH_FAILURE_DEACTIVATE_AFTER = 3;
+
 function rowToConnection(r: Row, box: SecretBox): Connection | null {
   const data = safeOpen(box, r.data, r.id);
   if (data === null) return null;
@@ -481,6 +492,8 @@ function rowToConnection(r: Row, box: SecretBox): Connection | null {
     ownerAgentId: r.owner_agent_id ?? null,
     isDefault: r.is_default === 1,
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
+    // Only present when inactive, so an active connection's shape is unchanged.
+    ...(r.inactive_at ? { inactiveAt: r.inactive_at, inactiveReason: r.inactive_reason ?? null } : {}),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -698,6 +711,13 @@ export class Store {
       this.db.exec("ALTER TABLE rules ADD COLUMN action TEXT CHECK (action IN ('require_approval'))");
     if (!connCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE connections ADD COLUMN lease_ttl_seconds INTEGER");
+    // Inactive-connection columns. NULL inactive_at = active, so every existing
+    // connection stays in rotation exactly as before; auth_failures starts at 0.
+    if (!connCols.has("inactive_at")) this.db.exec("ALTER TABLE connections ADD COLUMN inactive_at TEXT");
+    if (!connCols.has("inactive_reason"))
+      this.db.exec("ALTER TABLE connections ADD COLUMN inactive_reason TEXT");
+    if (!connCols.has("auth_failures"))
+      this.db.exec("ALTER TABLE connections ADD COLUMN auth_failures INTEGER NOT NULL DEFAULT 0");
     const linkCols = new Set(
       (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) => String(r.name)),
     );
@@ -1165,6 +1185,59 @@ export class Store {
   }
 
   /**
+   * Records how a connection's credential fared upstream. `ok` resets the
+   * consecutive-failure count; an auth failure (a 401) increments it, and the
+   * AUTH_FAILURE_DEACTIVATE_AFTER-th in a row takes the connection out of
+   * rotation. Returns true only on the call that deactivated it, so the caller
+   * audits the event once.
+   */
+  recordConnectionAuthOutcome(id: string, ok: boolean, status?: number | null): boolean {
+    if (ok) {
+      this.db.prepare("UPDATE connections SET auth_failures = 0 WHERE id = ? AND auth_failures > 0").run(id);
+      return false;
+    }
+    let deactivated = false;
+    this.tx(() => {
+      this.db.prepare("UPDATE connections SET auth_failures = auth_failures + 1 WHERE id = ?").run(id);
+      const r = this.db
+        .prepare("SELECT auth_failures, inactive_at FROM connections WHERE id = ?")
+        .get(id) as Row | undefined;
+      if (r && !r.inactive_at && Number(r.auth_failures) >= AUTH_FAILURE_DEACTIVATE_AFTER) {
+        const ts = now();
+        this.db
+          .prepare("UPDATE connections SET inactive_at = ?, inactive_reason = ?, updated_at = ? WHERE id = ?")
+          .run(ts, `upstream returned ${status ?? 401} on ${r.auth_failures} consecutive requests`, ts, id);
+        deactivated = true;
+      }
+    });
+    return deactivated;
+  }
+
+  /**
+   * Admin control. `active: true` clears the inactive state and the failure
+   * count, putting the connection back into rotation to be retried.
+   * `active: false` takes it out of rotation by hand. Returns null if unknown.
+   */
+  setConnectionActive(id: string, active: boolean, reason?: string): Connection | null {
+    if (!this.getConnection(id)) return null;
+    const ts = now();
+    if (active) {
+      this.db
+        .prepare(
+          "UPDATE connections SET inactive_at = NULL, inactive_reason = NULL, auth_failures = 0, updated_at = ? WHERE id = ?",
+        )
+        .run(ts, id);
+    } else {
+      this.db
+        .prepare(
+          "UPDATE connections SET inactive_at = COALESCE(inactive_at, ?), inactive_reason = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(ts, `deactivated by admin${reason?.trim() ? `: ${reason.trim()}` : ""}`, ts, id);
+    }
+    return this.getConnection(id);
+  }
+
+  /**
    * Lists connections. `ownerAgentId` filters by the owner bucket: omit it for
    * all rows, pass `null` for only tenant-wide rows, or an agent id for that
    * agent's bucket.
@@ -1533,8 +1606,16 @@ export class Store {
     | { connection: Connection }
     | { error: "unknown_connection" }
     | { error: "connection_not_granted" }
+    | { error: "connection_inactive"; connections: Array<{ id: string; name: string }> }
     | null {
-    const candidates = this.listAppConnectionsForAgent(agentId, integrationId);
+    const granted = this.listAppConnectionsForAgent(agentId, integrationId);
+    // Inactive connections are never selected; a saved choice or a default that
+    // went inactive falls through to the next granted connection.
+    const candidates = granted.filter((c) => !c.inactiveAt);
+    const inactiveError = (conns: Connection[]) => ({
+      error: "connection_inactive" as const,
+      connections: conns.map((c) => ({ id: c.id, name: c.name })),
+    });
     // Any named app connection for this integration at all (across every agent).
     const anyForIntegration =
       this.listConnections({ kind: "app", vendor: integrationId }).length > 0;
@@ -1543,6 +1624,9 @@ export class Store {
       const wanted = headerValue.trim();
       const match = candidates.find((c) => c.id === wanted || c.name === wanted);
       if (match) return { connection: match };
+      // Named explicitly but inactive: say so rather than silently substituting.
+      const inactiveMatch = granted.find((c) => c.id === wanted || c.name === wanted);
+      if (inactiveMatch) return inactiveError([inactiveMatch]);
       // Distinguish "exists but not granted" from "names nothing".
       const existsSomewhere = this.listConnections({ kind: "app", vendor: integrationId }).some(
         (c) => c.id === wanted || c.name === wanted,
@@ -1563,6 +1647,10 @@ export class Store {
       // Multiple granted, none default, none chosen: pick the oldest (stable).
       return { connection: candidates[0] };
     }
+
+    // Granted connections exist but every one is inactive: never fall through to
+    // the legacy credential or report "not granted" -- the fix is a reactivation.
+    if (granted.length > 0) return inactiveError(granted);
 
     // No granted candidates. Fall through to legacy ONLY if there are no named
     // app connections for this integration at all (back-compat, Gaty path).

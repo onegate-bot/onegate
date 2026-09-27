@@ -100,6 +100,8 @@ onegate connections grants --id <connId>                       # who this connec
 onegate connections grant  --id <connId> --agent <agentId>     # grant to one agent
 onegate connections grant  --id <connId> --project <projectId> # grant to every agent in a project
 onegate connections revoke --id <connId> --agent <agentId>     # revoke a grant
+onegate connections activate <connId>                          # put an inactive connection back into rotation (retries it)
+onegate connections deactivate <connId> [--reason <text>]      # take a connection out of rotation by hand
 onegate connections revoke --id <connId> --project <projectId>
 ```
 

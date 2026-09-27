@@ -1424,6 +1424,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     ownerAgentId?: string | null;
     isDefault: boolean;
     leaseTtlSeconds?: number | null;
+    inactiveAt?: string | null;
+    inactiveReason?: string | null;
     createdAt: string;
     updatedAt: string;
   }) {
@@ -1451,6 +1453,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       ownerAgentId,
       ownerAgentName: ownerAgentId ? (store.getAgent(ownerAgentId)?.name ?? null) : null,
       isDefault: c.isDefault,
+      // Inactive connections are skipped by routing and app resolution; the
+      // fields are present only while inactive, so active rows are unchanged.
+      ...(c.inactiveAt ? { inactiveAt: c.inactiveAt, inactiveReason: c.inactiveReason ?? null } : {}),
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
       hasSecret: Object.values(data).some((v) => typeof v === "string" && v.trim() !== ""),
@@ -1723,6 +1728,31 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
    * carries a resolved subjectName for display. Per-connection side of the
    * bidirectional allocation view.
    */
+  // Put a connection back into rotation (clears inactive + the failure count so
+  // it is retried), or take it out by hand. Both return the updated connection.
+  app.post("/api/connections/:id/activate", (req, res) => {
+    const conn = store.setConnectionActive(req.params.id, true);
+    if (!conn) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json(publicConnection(conn));
+  });
+
+  app.post("/api/connections/:id/deactivate", (req, res) => {
+    const reason = req.body?.reason;
+    if (reason !== undefined && typeof reason !== "string") {
+      res.status(400).json({ error: "invalid_reason" });
+      return;
+    }
+    const conn = store.setConnectionActive(req.params.id, false, reason);
+    if (!conn) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json(publicConnection(conn));
+  });
+
   app.get("/api/connections/:id/grants", (req, res) => {
     const conn = store.getConnection(req.params.id);
     if (!conn || conn.kind !== "app") {

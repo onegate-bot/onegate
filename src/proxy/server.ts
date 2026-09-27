@@ -47,8 +47,10 @@ type InnerCtx = SocketCtx | DiscoveryCtx;
 interface LlmRoute {
   vendor: string;
   strategy: LlmStrategy;
-  /** The agent's enabled connections of this vendor, in configured order. */
+  /** The agent's ACTIVE connections of this vendor, in configured order. */
   connections: Connection[];
+  /** Configured connections of this vendor that are inactive (skipped). */
+  inactive: Connection[];
 }
 
 /** One upstream LLM attempt: the response plus the request that produced it. */
@@ -60,6 +62,17 @@ interface UpstreamAttempt {
 /** Statuses that trigger strategy error handling and the failover retry. */
 function isRetryableStatus(status: number | undefined): boolean {
   return status === 429 || (status !== undefined && status >= 500);
+}
+
+/**
+ * A 401 means the injected credential was rejected: another connection may
+ * well succeed, so the LLM path fails over on it, and consecutive 401s take the
+ * connection out of rotation (see AUTH_FAILURE_DEACTIVATE_AFTER). 403 is left
+ * out on purpose: vendors use it for permission and policy refusals that a
+ * different key would not fix.
+ */
+function isAuthFailureStatus(status: number | undefined): boolean {
+  return status === 401;
 }
 
 /** Dedup window for proactive owner deny-notifications: 24 hours in ms. */
@@ -1064,6 +1077,10 @@ export class GatewayProxy {
       // (unknown_connection, 400) or it exists but is not granted to this agent
       // or its project (connection_not_granted, 403). Never silently fall
       // through to the legacy credential. Both outcomes are audited.
+      if (resolved.error === "connection_inactive") {
+        this.respondAllInactive(res, agent, integration, host, method, path, resolved.connections);
+        return { sent: true };
+      }
       if (resolved.error === "unknown_connection") {
         this.opts.store.audit({
           agentId: agent.id,
@@ -1495,6 +1512,12 @@ export class GatewayProxy {
           connectionId: selectedConnection?.id ?? null,
           connectionName: selectedConnection?.name ?? null,
         });
+        // App requests are not retried (their body may be streamed), but the
+        // outcome still counts, so a revoked app credential is benched and the
+        // next request resolves to the next granted connection.
+        if (selectedConnection) {
+          this.noteCredentialOutcome(selectedConnection, upRes.statusCode, agent, integration, host, method, path);
+        }
         const outHeaders: http.OutgoingHttpHeaders = {};
         for (const [k, v] of Object.entries(upRes.headers)) {
           if (!HOP_BY_HOP.has(k)) outHeaders[k] = v;
@@ -1527,18 +1550,90 @@ export class GatewayProxy {
    * enabled, and at least one of its configured connections belongs to the
    * vendor being called.
    */
+  /**
+   * Feeds an upstream status into the connection's auth-failure count. A 2xx/3xx
+   * resets it, a 401 increments it, anything else leaves it alone. When this
+   * call benches the connection, the event is audited and logged once.
+   */
+  private noteCredentialOutcome(
+    conn: Connection,
+    status: number | undefined,
+    agent: Agent,
+    integration: Integration,
+    host: string,
+    method: string,
+    path: string,
+  ): void {
+    if (status === undefined) return;
+    const ok = status < 400;
+    if (!ok && !isAuthFailureStatus(status)) return;
+    const deactivated = this.opts.store.recordConnectionAuthOutcome(conn.id, ok, status);
+    if (!deactivated) return;
+    this.log(`connection "${conn.name}" (${conn.id}) deactivated after repeated ${status} responses from ${host}`);
+    this.opts.store.audit({
+      agentId: agent.id,
+      agentName: agent.name,
+      integrationId: integration.id,
+      host,
+      method,
+      path,
+      decision: "connection_deactivated",
+      status,
+      connectionId: conn.id,
+      connectionName: conn.name,
+    });
+  }
+
+  /** 503 when every connection that could serve this request is inactive. */
+  private respondAllInactive(
+    res: http.ServerResponse,
+    agent: Agent,
+    integration: Integration,
+    host: string,
+    method: string,
+    path: string,
+    inactive: Array<{ id: string; name: string }>,
+  ): void {
+    this.opts.store.audit({
+      agentId: agent.id,
+      agentName: agent.name,
+      integrationId: integration.id,
+      host,
+      method,
+      path,
+      decision: "connection_inactive",
+      status: 503,
+    });
+    const names = inactive.map((c) => `"${c.name}" (${c.id})`).join(", ");
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: "onegate_connection_inactive",
+        message: `Every connection for "${integration.id}" available to agent "${agent.name}" is inactive: ${names}. An admin can put one back into rotation with \`onegate connections activate <id>\`.`,
+        inactive_connections: inactive.map((c) => ({ id: c.id, name: c.name })),
+      }),
+    );
+  }
+
   private resolveLlmRoute(agent: Agent, integration: Integration): LlmRoute | null {
     if (!integration.llm) return null;
     const cfg = this.opts.store.getAgentLlmConfig(agent.id);
     if (!cfg?.enabled) return null;
     const vendor = integration.llm.vendor;
-    const connections: Connection[] = [];
+    const configured: Connection[] = [];
     for (const id of cfg.connectionIds) {
       const conn = this.opts.store.getConnection(id);
-      if (conn && conn.kind === "llm" && conn.vendor === vendor) connections.push(conn);
+      if (conn && conn.kind === "llm" && conn.vendor === vendor) configured.push(conn);
     }
-    if (connections.length === 0) return null;
-    return { vendor, strategy: cfg.vendorStrategies?.[vendor] ?? cfg.strategy, connections };
+    if (configured.length === 0) return null;
+    // Inactive connections stay routed (so an all-inactive agent gets a clear
+    // 503 instead of silently falling to the legacy path) but are never selected.
+    return {
+      vendor,
+      strategy: cfg.vendorStrategies?.[vendor] ?? cfg.strategy,
+      connections: configured.filter((c) => !c.inactiveAt),
+      inactive: configured.filter((c) => c.inactiveAt),
+    };
   }
 
   /**
@@ -1564,6 +1659,10 @@ export class GatewayProxy {
     // onInnerRequest) so the executed LLM request equals the matched request.
     const path = normalizeRequestPath(req.url ?? "/");
     const llm = integration.llm!;
+    if (route.connections.length === 0) {
+      this.respondAllInactive(res, agent, integration, host, method, path, route.inactive);
+      return;
+    }
     const ids = route.connections.map((c) => c.id);
 
     // Phase-2 connection-scoped policy check for the LLM path. Phase-1 ran
@@ -1780,7 +1879,8 @@ export class GatewayProxy {
         return;
       }
       const status = upRes.statusCode;
-      if (isRetryableStatus(status)) {
+      this.noteCredentialOutcome(conn, status, agent, integration, host, method, path);
+      if (isRetryableStatus(status) || isAuthFailureStatus(status)) {
         recordUsage(conn, failover, true, status ?? null);
         const next = failover ? null : failOver(index);
         if (next) {

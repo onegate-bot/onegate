@@ -197,6 +197,8 @@ Admin API commands (talk to a running gateway over --host + admin token):
   onegate connections add --vendor <v> --name <n> [--api-key|--auth-token|--auth-json|--secret-stdin] [--default]   (LLM)
   onegate connections add --kind app --integration <id> --name <n> (--data-stdin | --data k=v...) [--agent <id>] [--default]
   onegate connections set-default <id>
+  onegate connections activate <id>                                          put an inactive connection back into rotation (retry it)
+  onegate connections deactivate <id> [--reason <text>]                      take a connection out of rotation
   onegate connections rm <id>
   onegate connections grants --id <conn>                                     list grants on an app connection
   onegate connections grant  --id <conn> (--agent <id> | --project <id>)     grant a named app connection (default-deny)
