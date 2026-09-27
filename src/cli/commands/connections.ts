@@ -96,6 +96,13 @@ interface PublicConnection {
   isDefault: boolean;
   hasSecret?: boolean;
   authMode?: string;
+  inactiveAt?: string | null;
+  inactiveReason?: string | null;
+}
+
+/** "active", or "INACTIVE since <date>: <reason>" for a benched connection. */
+function statusOf(c: PublicConnection): string {
+  return c.inactiveAt ? `INACTIVE since ${c.inactiveAt.slice(0, 16).replace("T", " ")}: ${c.inactiveReason ?? ""}` : "active";
 }
 
 interface AppConnection extends PublicConnection {
@@ -116,13 +123,14 @@ async function list(ctx: CliContext): Promise<void> {
       console.log("LLM connections:");
       console.log(
         table(
-          res.llm as unknown as Array<Record<string, unknown>>,
+          res.llm.map((c) => ({ ...c, status: statusOf(c) })) as unknown as Array<Record<string, unknown>>,
           [
             ["ID", "id"],
             ["VENDOR", "vendor"],
             ["NAME", "name"],
             ["DEFAULT", "isDefault"],
             ["MODE", "authMode"],
+            ["STATUS", "status"],
           ],
         ),
       );
@@ -143,6 +151,7 @@ async function list(ctx: CliContext): Promise<void> {
           ? `agent: ${a.ownerAgentName ?? a.ownerAgentId}`
           : "tenant-wide",
       isDefault: a.isDefault,
+      status: statusOf(a),
     }));
     console.log(
       table(appRows, [
@@ -151,6 +160,7 @@ async function list(ctx: CliContext): Promise<void> {
         ["NAME", "name"],
         ["SCOPE", "scope"],
         ["DEFAULT", "isDefault"],
+        ["STATUS", "status"],
       ]),
     );
   });
@@ -296,6 +306,29 @@ async function setDefault(ctx: CliContext, args: string[]): Promise<void> {
   emit(conn, () => console.log(`"${conn.name}" (${conn.id}) is now the default for ${conn.vendor}.`));
 }
 
+async function activate(ctx: CliContext, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) throw new Error("usage: onegate connections activate <id>");
+  const conn = (await ctx.client().post(`/api/connections/${encodeURIComponent(id)}/activate`, {})) as PublicConnection;
+  emit(conn, () => console.log(`"${conn.name}" (${conn.id}) is active again and back in rotation.`));
+}
+
+async function deactivate(ctx: CliContext, args: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { reason: { type: "string" } },
+  });
+  const id = positionals[0];
+  if (!id) throw new Error("usage: onegate connections deactivate <id> [--reason <text>]");
+  const body = values.reason !== undefined ? { reason: values.reason } : {};
+  const conn = (await ctx.client().post(
+    `/api/connections/${encodeURIComponent(id)}/deactivate`,
+    body,
+  )) as PublicConnection;
+  emit(conn, () => console.log(`"${conn.name}" (${conn.id}) is inactive and will not be selected.`));
+}
+
 async function remove(ctx: CliContext, args: string[]): Promise<void> {
   const id = args[0];
   if (!id) throw new Error("usage: onegate connections rm <id>");
@@ -424,8 +457,10 @@ export async function connectionsCommand(ctx: CliContext, sub: string, args: str
   if (sub === "grants") return grantsList(ctx, args);
   if (sub === "grant") return grant(ctx, args);
   if (sub === "revoke") return revoke(ctx, args);
+  if (sub === "activate") return activate(ctx, args);
+  if (sub === "deactivate") return deactivate(ctx, args);
   throw new Error(
-    `unknown connections command "${sub ?? ""}". Try: list, add, set-default, rm, grants, grant, revoke`,
+    `unknown connections command "${sub ?? ""}". Try: list, add, set-default, rm, grants, grant, revoke, activate, deactivate`,
   );
 }
 

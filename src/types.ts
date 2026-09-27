@@ -164,6 +164,17 @@ export interface Connection {
   /** Exactly one default per (kind, vendor, owner-bucket), enforced by the store. */
   isDefault: boolean;
   /**
+   * When this connection was taken out of rotation, or absent while it is
+   * active. An inactive connection is never selected: LLM strategies skip it
+   * and app resolution moves on to the next granted connection. It is set
+   * automatically after AUTH_FAILURE_DEACTIVATE_AFTER consecutive upstream 401s
+   * (a revoked or invalid credential) or by an admin, and cleared only by an
+   * admin (`onegate connections activate`), which retries the connection.
+   */
+  inactiveAt?: string | null;
+  /** Why the connection is inactive; absent while it is active. */
+  inactiveReason?: string | null;
+  /**
    * The owner's access-lease override chosen at connect time, for time-boxed
    * integrations. NULL = inherit the integration default. 0 = always-on
    * (infinite time box, i.e. not time-boxed at all). >0 = custom lease seconds.
@@ -293,7 +304,11 @@ export type Decision =
   | "no_credential"
   | "unknown_connection"
   | "connection_not_granted"
-  | "body_too_large";
+  | "body_too_large"
+  /** Every usable connection for the request is inactive (see Connection.inactiveAt). */
+  | "connection_inactive"
+  /** Not a request outcome: a connection was just taken out of rotation. */
+  | "connection_deactivated";
 
 export interface AuditEntry {
   id: number;
