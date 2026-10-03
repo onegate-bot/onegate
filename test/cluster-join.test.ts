@@ -202,7 +202,13 @@ describe("the join payload on the wire", () => {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
-        const up = http.request(new URL(req.url!, a.url), { method: req.method, headers: req.headers }, (upRes) => {
+        // Only the join route is relayed, by a constant path: forwarding the
+        // incoming req.url verbatim is what CodeQL flags as request forgery.
+        if (req.url !== "/cluster/v1/join") {
+          res.writeHead(404).end();
+          return;
+        }
+        const up = http.request(new URL("/cluster/v1/join", a.url), { method: req.method, headers: req.headers }, (upRes) => {
           const out: Buffer[] = [];
           upRes.on("data", (c) => out.push(c));
           upRes.on("end", () => {
