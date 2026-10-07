@@ -373,3 +373,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `GET /api/0/organizations/<org>/issues/**` and `GET /api/0/projects/<org>/**` for triage, add `PUT /api/0/organizations/<org>/issues/**` to resolve or assign.
 - **Limitations:** sentry.io SaaS only. Self-hosted Sentry needs a community integration with the instance host.
 
+### hubspot
+
+- **Credential:** a private app (legacy app) access token (`pat-na1-...`, `pat-eu1-...`), injected as `Bearer`.
+- **Hosts:** `api.hubapi.com`.
+- **Suggested policy:** `GET /crm/v3/objects/**` plus `POST /crm/v3/objects/*/search` for read-only agents, add `POST`/`PATCH` on `/crm/v3/objects/**` for writers.
+- **Limitations:** private app tokens only. A public OAuth app flow is not implemented yet. Scopes are fixed on the private app, keep them narrow.
+

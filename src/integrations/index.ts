@@ -47,6 +47,7 @@ import { jfrogArtifactory } from "./jfrog-artifactory.js";
 import { githubApp } from "./github-app.js";
 import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
+import { hubspot } from "./hubspot.js";
 import { sentry } from "./sentry.js";
 
 /**
@@ -106,6 +107,7 @@ const BUILTINS: Integration[] = [
   githubApp,
   elevenlabs,
   make,
+  hubspot,
   sentry,
 ];
 

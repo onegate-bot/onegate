@@ -16,6 +16,7 @@ import { buildRegistry } from "../src/integrations/index.js";
 import { composeLlmHelpPrompt } from "../src/integrations/llm-help.js";
 import { buildAuthUrl } from "../src/integrations/oauth.js";
 import type { Integration } from "../src/integrations/types.js";
+import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
 import { INTEGRATION_LOGOS } from "../src/admin/logos.js";
 import { Store } from "../src/store/db.js";
@@ -32,6 +33,7 @@ function ctxFor(host: string, credential: Credential, store: Store, headers: Inc
 }
 
 const BATCH: Integration[] = [
+  hubspot,
   sentry,
 ];
 
@@ -39,6 +41,7 @@ describe("batch 8 registry claims", () => {
   it("resolves every new host to its integration", async () => {
     const registry = await buildRegistry();
     const expected: Record<string, string> = {
+      "api.hubapi.com": "hubspot",
       "sentry.io": "sentry",
       "us.sentry.io": "sentry",
       "de.sentry.io": "sentry",
@@ -84,6 +87,7 @@ describe("batch 8 registry claims", () => {
 describe("batch 8 static token integrations", () => {
   const store = new Store(":memory:");
   const cases: [Integration, string, Record<string, string>, string][] = [
+    [hubspot, "api.hubapi.com", { token: "pat-na1-x" }, "Bearer pat-na1-x"],
     [sentry, "us.sentry.io", { token: "sntryu_x" }, "Bearer sntryu_x"],
   ];
 

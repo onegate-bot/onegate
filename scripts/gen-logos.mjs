@@ -18,6 +18,7 @@ const SLUGS = {
   docker: "docker", "jfrog-artifactory": "jfrog", "github-app": "github",
   elevenlabs: "elevenlabs", make: "make", flyio: "flydotio", hetzner: "hetzner",
   youtube: "youtube",
+  hubspot: "hubspot",
   sentry: "sentry",
 };
 
