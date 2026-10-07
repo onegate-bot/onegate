@@ -1312,16 +1312,18 @@ describe("batch 7 integrations (mongodb-atlas, docker, jfrog, github-app)", () =
 
 import { gemini } from "../src/integrations/gemini.js";
 import { openrouter } from "../src/integrations/openrouter.js";
+import { typesafe } from "../src/integrations/typesafe.js";
 
 describe("llm vendor integrations", () => {
   const store = new Store(":memory:");
 
-  it("anthropic, openai, gemini and openrouter declare llm metadata and needsBody", () => {
+  it("anthropic, openai, gemini, openrouter and typesafe declare llm metadata and needsBody", () => {
     expect(anthropic.llm?.vendor).toBe("anthropic");
     expect(openai.llm?.vendor).toBe("openai");
     expect(gemini.llm?.vendor).toBe("gemini");
     expect(openrouter.llm?.vendor).toBe("openrouter");
-    for (const integ of [anthropic, openai, gemini, openrouter]) expect(integ.needsBody).toBe(true);
+    expect(typesafe.llm?.vendor).toBe("typesafe");
+    for (const integ of [anthropic, openai, gemini, openrouter, typesafe]) expect(integ.needsBody).toBe(true);
   });
 
   it("anthropic llm inject sets x-api-key from the selected connection", () => {
@@ -1429,6 +1431,26 @@ describe("llm vendor integrations", () => {
   it("openrouter resolves openrouter.ai in the registry", async () => {
     const registry = await buildRegistry();
     expect(registry.resolveHost("openrouter.ai")?.id).toBe("openrouter");
+  });
+
+  it("typesafe replaces the placeholder with a Bearer apiKey (app and llm paths)", () => {
+    for (const inject of [typesafe.inject, typesafe.llm!.inject]) {
+      const ctx = ctxFor("api.typesafe.ai", cred({ apiKey: "ts-conn-key" }), store);
+      ctx.headers.authorization = "Bearer placeholder";
+      inject(ctx);
+      expect(ctx.headers.authorization).toBe("Bearer ts-conn-key");
+    }
+    expect(() => typesafe.inject(ctxFor("h", cred({}), store))).toThrow(/apiKey/);
+    expect(() => typesafe.llm!.inject(ctxFor("h", cred({}), store))).toThrow(/apiKey/);
+  });
+
+  it("typesafe resolves api.typesafe.ai in the registry and ships an llm help prompt", async () => {
+    const registry = await buildRegistry();
+    expect(registry.resolveHost("api.typesafe.ai")?.id).toBe("typesafe");
+    expect(registry.resolveHost("typesafe.ai")).toBeNull();
+    const prompt = composeLlmHelpPrompt(typesafe);
+    expect(prompt).toContain("https://console.typesafe.ai/keys");
+    expect(prompt).toContain("Bearer");
   });
 
   it("gemini injects x-goog-api-key (app and llm paths)", () => {

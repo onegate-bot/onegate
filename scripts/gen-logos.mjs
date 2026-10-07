@@ -29,6 +29,7 @@ const FALLBACK = {
   monday: { title: "monday", hex: "FF3D57" },
   linkedin: { title: "LinkedIn", hex: "0A66C2" },
   tavily: { title: "Tavily", hex: "3B82F6" },
+  typesafe: { title: "TypeSafe", hex: "334155" },
 };
 
 const exportFor = (slug) => "si" + slug.charAt(0).toUpperCase() + slug.slice(1);

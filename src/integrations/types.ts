@@ -177,7 +177,7 @@ export interface InjectionContext {
  * connection's data), so it must not assume the app credentials table.
  */
 export interface LlmMeta {
-  /** Vendor id used for connections, strategy state and usage (anthropic|openai|gemini). */
+  /** Vendor id used for connections, strategy state and usage (anthropic|openai|gemini|openrouter|typesafe). */
   vendor: string;
   /** Injects the selected connection's secret into the request. */
   inject(ctx: InjectionContext): void | Promise<void>;

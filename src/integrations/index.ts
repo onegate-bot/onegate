@@ -17,6 +17,7 @@ import { aws } from "./aws.js";
 import { slack } from "./slack.js";
 import { openai } from "./openai.js";
 import { openrouter } from "./openrouter.js";
+import { typesafe } from "./typesafe.js";
 import { anthropic } from "./anthropic.js";
 import { jira } from "./jira.js";
 import { notion } from "./notion.js";
@@ -75,6 +76,7 @@ const BUILTINS: Integration[] = [
   slack,
   openai,
   openrouter,
+  typesafe,
   anthropic,
   jira,
   notion,

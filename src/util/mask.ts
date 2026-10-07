@@ -87,6 +87,8 @@ export function llmPreferredSecretKeys(vendor: string): string[] {
       return ["apiKey"];
     case "openrouter":
       return ["apiKey"];
+    case "typesafe":
+      return ["apiKey"];
     default:
       return ["apiKey", "token", "accessToken", "authToken"];
   }

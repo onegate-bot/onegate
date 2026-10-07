@@ -8,6 +8,7 @@
  *
  * Detection is shape based rather than vendor based, so it covers:
  * - anthropic JSON:        { usage: { input_tokens, output_tokens } }
+ *                          (also TypeSafe Jev evaluations, which share the shape)
  * - anthropic SSE:         message_start carries message.usage.input_tokens,
  *                          message_delta events carry usage.output_tokens
  *                          (cumulative, last one wins)
