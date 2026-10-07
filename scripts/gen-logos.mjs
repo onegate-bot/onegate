@@ -21,6 +21,7 @@ const SLUGS = {
   hubspot: "hubspot",
   sentry: "sentry",
   posthog: "posthog",
+  airtable: "airtable",
 };
 
 // Brands simple-icons no longer ships: monogram fallback (title + brand hex).

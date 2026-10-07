@@ -395,3 +395,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `GET /v2/**` plus `POST /v2/objects/*/records/query` for read-only agents.
 - **Limitations:** API key only (Attio's OAuth app flow is not implemented). Scope the key per area (records, lists, notes, tasks) at the vendor side.
 
+### airtable
+
+- **Credential:** a personal access token (`pat...`), injected as `Bearer`.
+- **Hosts:** `api.airtable.com`, `content.airtable.com` (attachment uploads).
+- **Suggested policy:** `GET /v0/<baseId>/**`, add `POST`/`PATCH` on the same glob for writers.
+- **Limitations:** none notable. Limit the token to specific bases and scopes when creating it.
+
