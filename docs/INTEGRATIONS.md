@@ -402,3 +402,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `GET /v0/<baseId>/**`, add `POST`/`PATCH` on the same glob for writers.
 - **Limitations:** none notable. Limit the token to specific bases and scopes when creating it.
 
+### asana
+
+- **Credential:** a personal access token, injected as `Bearer`.
+- **Hosts:** `app.asana.com`.
+- **Suggested policy:** `GET /api/1.0/**`, add `POST /api/1.0/tasks` and `PUT /api/1.0/tasks/*` for writers. The host also serves the web app, keep rules under `/api/1.0/`.
+- **Limitations:** a personal access token carries the user's full access in every workspace, so OneGate rules (or a dedicated Asana user) are the only narrowing.
+

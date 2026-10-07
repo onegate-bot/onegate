@@ -52,6 +52,7 @@ import { sentry } from "./sentry.js";
 import { posthog } from "./posthog.js";
 import { attio } from "./attio.js";
 import { airtable } from "./airtable.js";
+import { asana } from "./asana.js";
 
 /**
  * Built-ins. Array order does NOT decide which integration owns a host:
@@ -115,6 +116,7 @@ const BUILTINS: Integration[] = [
   posthog,
   attio,
   airtable,
+  asana,
 ];
 
 /**

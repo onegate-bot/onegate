@@ -22,6 +22,7 @@ const SLUGS = {
   sentry: "sentry",
   posthog: "posthog",
   airtable: "airtable",
+  asana: "asana",
 };
 
 // Brands simple-icons no longer ships: monogram fallback (title + brand hex).

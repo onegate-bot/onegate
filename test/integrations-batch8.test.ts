@@ -21,6 +21,7 @@ import { sentry } from "../src/integrations/sentry.js";
 import { posthog } from "../src/integrations/posthog.js";
 import { attio } from "../src/integrations/attio.js";
 import { airtable } from "../src/integrations/airtable.js";
+import { asana } from "../src/integrations/asana.js";
 import { INTEGRATION_LOGOS } from "../src/admin/logos.js";
 import { Store } from "../src/store/db.js";
 import { initCa } from "../src/ca.js";
@@ -41,6 +42,7 @@ const BATCH: Integration[] = [
   posthog,
   attio,
   airtable,
+  asana,
 ];
 
 describe("batch 8 registry claims", () => {
@@ -57,6 +59,7 @@ describe("batch 8 registry claims", () => {
       "api.attio.com": "attio",
       "api.airtable.com": "airtable",
       "content.airtable.com": "airtable",
+      "app.asana.com": "asana",
     };
     for (const [host, id] of Object.entries(expected)) {
       expect(registry.resolveHostCandidates(host).map((i) => i.id), host).toEqual([id]);
@@ -104,6 +107,7 @@ describe("batch 8 static token integrations", () => {
     [posthog, "eu.posthog.com", { apiKey: "phx_x" }, "Bearer phx_x"],
     [attio, "api.attio.com", { apiKey: "attio_x" }, "Bearer attio_x"],
     [airtable, "content.airtable.com", { token: "patX.y" }, "Bearer patX.y"],
+    [asana, "app.asana.com", { token: "2/123/456:abc" }, "Bearer 2/123/456:abc"],
   ];
 
   for (const [integration, host, data, expected] of cases) {
