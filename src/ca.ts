@@ -18,7 +18,7 @@ import {
   statSync,
   rmSync,
 } from "node:fs";
-import { generateKeyPair as generateKeyPairCb } from "node:crypto";
+import { generateKeyPair as generateKeyPairCb, X509Certificate } from "node:crypto";
 import { promisify } from "node:util";
 import { join } from "node:path";
 
@@ -119,6 +119,8 @@ function makeRootCa(commonName: string): LeafCert {
 
 export class Ca {
   private rootCert: forge.pki.Certificate;
+  /** The root parsed by node:crypto, used to verify cached leaves with OpenSSL. */
+  private rootX509: X509Certificate;
   private rootKey: forge.pki.PrivateKey;
   readonly rootPem: string;
   /**
@@ -146,6 +148,7 @@ export class Ca {
   constructor(rootCertPem: string, rootKeyPem: string, certsDir: string) {
     this.rootPem = rootCertPem;
     this.rootCert = forge.pki.certificateFromPem(rootCertPem);
+    this.rootX509 = new X509Certificate(rootCertPem);
     this.rootKey = forge.pki.privateKeyFromPem(rootKeyPem);
     this.certsDir = certsDir;
     this.maxEntries = leafCacheMax();
@@ -350,7 +353,10 @@ export class Ca {
       const cert = forge.pki.certificateFromPem(certPem);
       // Re-mint when within 7 days of expiry or signed by a different root.
       if (cert.validity.notAfter.getTime() - Date.now() < 7 * 86_400_000) return null;
-      if (!this.rootCert.verify(cert)) return null;
+      // Signature check via node:crypto (OpenSSL), not forge: node-forge's RSA
+      // PKCS#1 v1.5 verification accepts malformed DigestInfo (GHSA-86w9-cpqp-85rv).
+      const leaf = new X509Certificate(certPem);
+      if (!leaf.checkIssued(this.rootX509) || !leaf.verify(this.rootX509.publicKey)) return null;
       return { cert: certPem, key: readFileSync(keyPath, "utf8") };
     } catch {
       return null;
