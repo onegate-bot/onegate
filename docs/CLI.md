@@ -27,6 +27,8 @@ onegate --json connections list
 
 The client uses Node's `http`/`https` with a dedicated agent and ignores any proxy environment, so it always reaches the local admin API directly.
 
+`ONEGATE_ADMIN_URL` is where the CLI reaches the admin API. It is separate from the gateway's own `ONEGATE_PUBLIC_URL`, which `onegate start` reads to build the approve, connect and renew links it sends to owners (default `http://<ONEGATE_BIND or localhost>:<ONEGATE_ADMIN_PORT>`, with a startup warning; a malformed value stops startup). See [DEPLOY.md](DEPLOY.md#environment-variables) for the gateway's environment variables.
+
 ## LLM connections and per-agent routing
 
 A connection holds one vendor credential. Each vendor (anthropic, openai, gemini, openrouter, typesafe) can have several connections and exactly one default. A per-agent route picks which connections an agent uses and in what order.

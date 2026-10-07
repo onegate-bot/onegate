@@ -20,6 +20,7 @@ import { buildAuthUrl, exchangeCode, pickTokenFields } from "../integrations/oau
 import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
+import { publicBaseUrlFromEnv } from "../util/public-url.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
 import type { Agent } from "../types.js";
@@ -99,6 +100,13 @@ export interface AdminApiOptions {
    *  ONEGATE_OAUTH_{AUTH,TOKEN}_URL_<ID> env vars). */
   googleAuthUrl?: string;
   googleTokenUrl?: string;
+  /**
+   * Base URL for owner-facing links and the OAuth redirect URI, already
+   * validated and without a trailing slash. `onegate start` resolves it once
+   * (see src/util/public-url.ts). When omitted it is resolved from the
+   * environment on each use.
+   */
+  publicBaseUrl?: string;
 }
 
 /** Minimal HTML escaping for the OAuth result pages. */
@@ -582,7 +590,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   /** Base URL the wizard links and redirect URIs are built against. */
   function publicBase(): string {
-    return (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+    return opts.publicBaseUrl ?? publicBaseUrlFromEnv().url;
   }
 
   /** Friendly page for an invalid, expired, or already-used wizard link. */
@@ -1037,7 +1045,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           `<h1>Allow ${who} to run this ${title} request?</h1>` +
           `<p class="og-muted">${who} tried to call <code>${esc(approval.method)} ${esc(approval.path)}</code> ` +
           `on your ${title} account. The request was <strong>not</strong> sent. It is waiting for your decision. ` +
-          `Approving lets ${who} retry it. Your credential is never shown to ${who}.</p>` +
+          `Approving lets ${who} retry this exact request once. Your credential is never shown to ${who}.</p>` +
           `<form method="post" action="${publicBase()}/approve/${esc(req.params.token)}">` +
           `<button class="og-btn" type="submit" name="decision" value="approve">Approve</button> ` +
           `<button class="og-btn secondary" type="submit" name="decision" value="reject">Reject</button>` +
@@ -1066,7 +1074,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     const who = agent ? esc(agent.name) : "Your bot";
     if (status === "approved") {
       res.send(
-        resultPage(`Approved ${CHECK_SVG}`, `${who} can retry that ${title} request. You can close this tab.`),
+        resultPage(`Approved ${CHECK_SVG}`, `${who} can retry that ${title} request once. You can close this tab.`),
       );
       return;
     }
@@ -2455,7 +2463,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       connectionName: typeof connectionName === "string" && connectionName.trim() ? connectionName.trim() : undefined,
       ttlDays: typeof ttlDays === "number" && ttlDays > 0 ? ttlDays : undefined,
     });
-    const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+    const base = publicBase();
     res.status(201).json({
       token: link.token,
       url: `${base}/connect/${integration.id}/${link.token}`,

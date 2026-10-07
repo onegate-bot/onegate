@@ -269,6 +269,16 @@ describe("cli local: init and print-ca guards", () => {
     expect(err).toContain("not initialized");
   });
 
+  it("start refuses a malformed ONEGATE_PUBLIC_URL before binding anything", async () => {
+    const saved = process.env.ONEGATE_PUBLIC_URL;
+    process.env.ONEGATE_PUBLIC_URL = "app.example.com/onegate";
+    const { err, exit } = await run("start");
+    if (saved === undefined) delete process.env.ONEGATE_PUBLIC_URL;
+    else process.env.ONEGATE_PUBLIC_URL = saved;
+    expect(exit).toBe(1);
+    expect(err).toContain("ONEGATE_PUBLIC_URL must be an absolute http(s) URL");
+  });
+
   it("start fails clearly when the data dir is not initialized", async () => {
     const empty = mkdtempSync(join(tmpdir(), "onegate-clicore-nostart-"));
     const saved = process.env.ONEGATE_DATA;
@@ -326,6 +336,11 @@ describe("cli local: start boots the gateway and shuts down cleanly", () => {
     expect(started.out).toContain("admin:  http://127.0.0.1:");
     expect(started.out).toContain(`data:   ${dir}`);
     expect(started.out).toContain("integrations: ");
+    // No ONEGATE_PUBLIC_URL: owner links fall back to the admin listener, with
+    // a warning that they only work locally.
+    expect(started.out).toContain("links:  http://127.0.0.1:0");
+    expect(started.err).toContain("ONEGATE_PUBLIC_URL is not set");
+    expect(started.err).toContain("will only work locally");
 
     // Drive the shutdown handler `start` registered. It calls process.exit(0),
     // which the exit spy converts into the __exit__ sentinel.

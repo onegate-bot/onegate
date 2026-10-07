@@ -12,12 +12,16 @@
  *     (the LLM mode badge, discovery, the admin UI) reads it as a block.
  *  4. Approval tokens are unguessable hex and single-use, and a pending
  *     approval expires.
+ *  5. An approved approval lets the identical request through exactly once:
+ *     redemption is atomic and bound to agent, integration, rule, method, path
+ *     and body hash. (The proxy round trip is in require-approval-proxy.test.ts.)
  */
 
 import { describe, it, expect } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { evaluate } from "../src/policy.js";
 import { Store } from "../src/store/db.js";
 import { vendorAllowed } from "../src/llm/mode.js";
@@ -252,9 +256,26 @@ describe("approvals store", () => {
     expect(store.activeApprovalFor(a.id, "github", "POST", "/x", now)?.id).toBe(first.id);
     // A different request is a different decision.
     expect(store.activeApprovalFor(a.id, "github", "DELETE", "/x", now)).toBeNull();
-    // Once decided, it is no longer live, so the next attempt starts fresh.
+    // Once decided it is no longer PENDING, so it is not reused as a pending
+    // hold. An approved row is spent through redeemApproval instead.
     store.decideApproval(first.id, "approved", now);
     expect(store.activeApprovalFor(a.id, "github", "POST", "/x", now)).toBeNull();
+  });
+
+  it("reuses a pending approval only for the same body", () => {
+    const store = newStore();
+    const { agent: a } = store.createAgent("bot");
+    const first = store.createApproval({
+      agentId: a.id,
+      integrationId: "github",
+      ruleId: "rl_gate",
+      method: "POST",
+      path: "/x",
+      bodyHash: "aa",
+    });
+    const now = Date.now();
+    expect(store.activeApprovalFor(a.id, "github", "POST", "/x", now, "aa")?.id).toBe(first.id);
+    expect(store.activeApprovalFor(a.id, "github", "POST", "/x", now, "bb")).toBeNull();
   });
 
   it("scopes the list to one agent", () => {
@@ -272,5 +293,121 @@ describe("approvals store", () => {
     }
     expect(store.listApprovals().length).toBe(2);
     expect(store.listApprovals(a.id).map((x) => x.agentId)).toEqual([a.id]);
+  });
+});
+
+describe("approval redemption", () => {
+  const req = (agentId: string, over: Partial<Parameters<Store["redeemApproval"]>[0]> = {}) => ({
+    agentId,
+    integrationId: "github",
+    ruleId: "rl_gate",
+    method: "POST",
+    path: "/repos/x/issues",
+    bodyHash: "h1",
+    ...over,
+  });
+
+  function approved(store: Store, agentId: string, ttlSeconds?: number) {
+    const ap = store.createApproval({ ...req(agentId), ttlSeconds });
+    store.decideApproval(ap.id, "approved", Date.now());
+    return ap;
+  }
+
+  it("lets the identical request through exactly once", () => {
+    const store = newStore();
+    const { agent: a } = store.createAgent("bot");
+    const ap = approved(store, a.id);
+    const redeemed = store.redeemApproval(req(a.id));
+    expect(redeemed?.id).toBe(ap.id);
+    expect(redeemed?.usedAt).not.toBeNull();
+    expect(store.redeemApproval(req(a.id))).toBeNull();
+  });
+
+  it("is bound to agent, integration, rule, method, path and body", () => {
+    const store = newStore();
+    const { agent: a } = store.createAgent("bot");
+    const { agent: b } = store.createAgent("other");
+    approved(store, a.id);
+    for (const over of [
+      { agentId: b.id },
+      { integrationId: "gitlab" },
+      { ruleId: "rl_other" },
+      { method: "PUT" },
+      { path: "/repos/y/issues" },
+      { path: "/repos/x/issues?force=1" },
+      { bodyHash: "h2" },
+    ]) {
+      expect(store.redeemApproval(req(a.id, over))).toBeNull();
+    }
+    // Lowercase method still matches: methods are stored uppercase.
+    expect(store.redeemApproval(req(a.id, { method: "post" }))).not.toBeNull();
+  });
+
+  it("never redeems a pending, rejected or expired approval", () => {
+    const store = newStore();
+    const { agent: a } = store.createAgent("bot");
+    store.createApproval(req(a.id));
+    expect(store.redeemApproval(req(a.id))).toBeNull();
+
+    const rejected = store.createApproval(req(a.id));
+    store.decideApproval(rejected.id, "rejected", Date.now());
+    expect(store.redeemApproval(req(a.id))).toBeNull();
+
+    const late = approved(store, a.id, 60);
+    expect(store.redeemApproval(req(a.id), Date.parse(late.expiresAt) + 1000)).toBeNull();
+    expect(store.getApproval(late.id)?.usedAt).toBeNull();
+  });
+
+  it("loses cleanly when another writer claims the row between lookup and claim", () => {
+    // Two gateway processes on one database. Store `first` is interrupted after
+    // it found the candidate but before its guarded UPDATE runs, and `second`
+    // redeems in that gap. The guard must leave `first` with zero changes.
+    const file = join(mkdtempSync(join(tmpdir(), "og-approval-race-")), "onegate.db");
+    const first = new Store(file);
+    const second = new Store(file);
+    const { agent: a } = first.createAgent("bot");
+    const ap = approved(first, a.id);
+
+    const raw = (first as unknown as { db: DatabaseSync }).db;
+    const prepare = raw.prepare.bind(raw);
+    let interleaved = false;
+    raw.prepare = ((sql: string) => {
+      if (sql.startsWith("UPDATE approvals SET used_at") && !interleaved) {
+        interleaved = true;
+        expect(second.redeemApproval(req(a.id))?.id).toBe(ap.id);
+      }
+      return prepare(sql);
+    }) as typeof raw.prepare;
+
+    expect(first.redeemApproval(req(a.id))).toBeNull();
+    expect(interleaved).toBe(true);
+    first.close();
+    second.close();
+  });
+
+  it("migrates a legacy approvals table and never redeems its rows", () => {
+    const file = join(mkdtempSync(join(tmpdir(), "og-approval-legacy-")), "onegate.db");
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`CREATE TABLE approvals (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, integration_id TEXT NOT NULL,
+      rule_id TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','expired')),
+      created_at TEXT NOT NULL, expires_at TEXT NOT NULL, decided_at TEXT)`);
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    legacy
+      .prepare("INSERT INTO approvals VALUES ('apr_old', 'ag_1', 'github', 'rl_gate', 'POST', '/x', 'h', 'approved', ?, ?, ?)")
+      .run(new Date().toISOString(), future, new Date().toISOString());
+    legacy.close();
+
+    const store = new Store(file);
+    const old = store.getApproval("apr_old")!;
+    expect(old.bodyHash).toBeNull();
+    expect(old.usedAt).toBeNull();
+    // No recorded body hash: fails closed, whatever the retry sends.
+    expect(
+      store.redeemApproval({ agentId: "ag_1", integrationId: "github", ruleId: "rl_gate", method: "POST", path: "/x", bodyHash: "" }),
+    ).toBeNull();
+    store.close();
   });
 });

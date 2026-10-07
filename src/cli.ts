@@ -10,6 +10,7 @@
  *
  * Data directory: $ONEGATE_DATA or ~/.onegate
  * Ports: $ONEGATE_PROXY_PORT (default 8443), $ONEGATE_ADMIN_PORT (default 8080)
+ * Owner link base: $ONEGATE_PUBLIC_URL (default http://<bind or localhost>:<admin port>)
  */
 
 import { parseArgs } from "node:util";
@@ -23,6 +24,7 @@ import { Store } from "./store/db.js";
 import { buildRegistry } from "./integrations/index.js";
 import { GatewayProxy } from "./proxy/server.js";
 import { createAdminApp, ensureAdminToken, resetAdminToken } from "./admin/api.js";
+import { resolvePublicBaseUrl, type PublicBaseUrl } from "./util/public-url.js";
 import { createContext } from "./cli/context.js";
 import { setJsonMode } from "./cli/output.js";
 import { ApiError } from "./cli/client.js";
@@ -82,23 +84,45 @@ async function cmdStart(): Promise<void> {
   const proxyPort = Number(process.env.ONEGATE_PROXY_PORT ?? 8443);
   const adminPort = Number(process.env.ONEGATE_ADMIN_PORT ?? 8080);
   const bindHost = process.env.ONEGATE_BIND ?? "0.0.0.0";
+  // Owner-facing links (approve, connect, renew) carry one-time tokens, so
+  // they must point at this gateway. Resolved once; a malformed value stops
+  // startup rather than minting broken links later.
+  let publicBase: PublicBaseUrl;
+  try {
+    publicBase = resolvePublicBaseUrl({ publicUrl: process.env.ONEGATE_PUBLIC_URL, bind: bindHost, adminPort });
+  } catch (err) {
+    fail((err as Error).message);
+  }
 
   const ca = loadCa(dir);
   const store = new Store(dbPath());
   const communityDir = process.env.ONEGATE_COMMUNITY_DIR ?? join(dir, "integrations");
   const registry = await buildRegistry(communityDir);
 
-  const proxy = new GatewayProxy({ ca, store, registry, log: (l) => console.error(`[proxy] ${l}`) });
+  const proxy = new GatewayProxy({
+    ca,
+    store,
+    registry,
+    publicBaseUrl: publicBase.url,
+    log: (l) => console.error(`[proxy] ${l}`),
+  });
   await proxy.listen(proxyPort, bindHost);
 
-  const app = createAdminApp({ store, registry, ca, version: version() });
+  const app = createAdminApp({ store, registry, ca, version: version(), publicBaseUrl: publicBase.url });
   const adminServer = http.createServer(app);
   await new Promise<void>((resolve) => adminServer.listen(adminPort, bindHost, resolve));
 
   console.log(`OneGate ${version()}`);
   console.log(`  proxy:  http://${bindHost}:${proxyPort}  (agents: HTTPS_PROXY=http://agent:<token>@host:${proxyPort})`);
   console.log(`  admin:  http://${bindHost}:${adminPort}  (UI + API; root CA at /ca.pem)`);
+  console.log(`  links:  ${publicBase.url}  (approve/connect/renew links sent to owners)`);
   console.log(`  data:   ${dir}`);
+  if (publicBase.fallback) {
+    console.error(
+      `onegate: ONEGATE_PUBLIC_URL is not set, so owner links use ${publicBase.url} and will only work locally. ` +
+        "Set ONEGATE_PUBLIC_URL to the URL owners reach this gateway's admin listener on.",
+    );
+  }
   console.log(`  integrations: ${registry.list().map((i) => i.id).join(", ")}`);
 
   let shuttingDown = false;
