@@ -5,3 +5,6 @@ data/
 .DS_Store
 .claude/
 coverage/
+# pnpm is the package manager (packageManager in package.json); an npm lockfile
+# would drift out of sync and only produce stale Dependabot alerts.
+package-lock.json
