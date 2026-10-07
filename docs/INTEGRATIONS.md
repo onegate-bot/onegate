@@ -413,10 +413,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 
 ### datadog
 
-- **Credential:** an API key and an optional application key, injected as the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, plus an optional non-secret **Site**: the `DD_SITE` value (e.g. `us5.datadoghq.com`), a site or API URL, or the short region name (`us1`, `us3`, `us5`, `eu`, `ap1`, `ap2`, `uk1`, `us1-fed`, `us2-fed`). An unknown site is rejected with `400 invalid_data` when the credential is saved.
+- **Credential:** an API key and an optional application key, injected as the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, plus a required non-secret **Site**: the `DD_SITE` value (e.g. `us5.datadoghq.com`), a site or API URL, or the short region name (`us1`, `us3`, `us5`, `eu`, `ap1`, `ap2`, `uk1`, `us1-fed`, `us2-fed`). A missing or unknown site is rejected with `400 invalid_data` when the credential is saved.
 - **Hosts:** `api.<site>` for every Datadog site: `api.datadoghq.com`, `api.us3.datadoghq.com`, `api.us5.datadoghq.com`, `api.datadoghq.eu`, `api.ap1.datadoghq.com`, `api.ap2.datadoghq.com`, `api.uk1.datadoghq.com`, `api.ddog-gov.com`, `api.us2.ddog-gov.com`. Intake hosts (logs, traces, RUM) are not claimed.
 - **Suggested policy:** `GET /api/v1/monitor/**`, `GET /api/v1/query`, `POST /api/v2/logs/events/search` for observability agents.
-- **Discovery summary:** `site` and `apiBaseUrl`. When Site is set the keys are bound to that site's API host, other regions are refused in the gateway.
+- **Discovery summary:** `site` and `apiBaseUrl`. The keys are bound to that site's API host, other regions are refused in the gateway.
 - **Limitations:** scope the application key (or use a service account's key) at the vendor side, the API key alone can submit data.
 
 ### zoom

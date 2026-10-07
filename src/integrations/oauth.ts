@@ -212,10 +212,11 @@ function applyCredentialDelta(
   if (!current) return false;
   if (Object.entries(delta).every(([k, v]) => current[k] === v)) return true;
   const data = { ...current, ...delta };
+  // keepTokenCache: the caller caches the token it just minted right after.
   if (isConnectionBacked(cred)) {
-    store.updateConnection(cred.id, { data });
+    store.updateConnection(cred.id, { data }, { keepTokenCache: true });
   } else {
-    store.setCredential(integrationId, cred.name, data);
+    store.setCredential(integrationId, cred.name, data, { keepTokenCache: true });
   }
   return true;
 }
@@ -397,6 +398,8 @@ export async function clientCredentialsToken(
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,
   };
-  store.setSecretSetting(key, fresh);
+  // A credential deleted while the grant was in flight (revoked connection)
+  // must not have its token cached.
+  if (currentOriginData(store, integrationId, cred)) store.setSecretSetting(key, fresh);
   return fresh.token;
 }

@@ -1192,7 +1192,7 @@ describe("batch 7 integrations (mongodb-atlas, docker, jfrog, github-app)", () =
   });
 
   it("mongodb-atlas mints a client_credentials token, injects Bearer and caches", async () => {
-    const c = cred({ clientId: "aid", clientSecret: "asecret" }, "mongodb-atlas");
+    const c = store.setCredential("mongodb-atlas", "t", { clientId: "aid", clientSecret: "asecret" });
     const ctx1 = ctxFor("cloud.mongodb.com", c, store);
     await mongodbAtlas.inject(ctx1);
     const ctx2 = ctxFor("cloud.mongodb.com", c, store);

@@ -272,6 +272,7 @@ describe("token endpoint flows", () => {
       await oauthBearerToken(integ(), c, store);
       const saved = store.getCredential("testx");
       expect(saved?.data.refreshToken).toBe("rt_rotated");
+      expect(store.getSecretSetting<{ token: string }>(`oauth_access_token:testx:${c.id}`)!.token).toBe("at_new");
     });
 
     it("assumes the descriptor's default lifetime when expires_in is absent (Salesforce style)", async () => {
@@ -390,6 +391,8 @@ describe("token endpoint flows", () => {
       const c: Credential = { id: conn.id, integrationId: "testx", name: conn.name, data: { ...conn.data }, createdAt: "" };
       expect(await oauthBearerToken(integ(), c, store)).toBe("at_c");
       expect(store.getConnection(conn.id)!.data.refreshToken).toBe("rt_c2");
+      // Writing the rotated refresh token must not purge the token just minted.
+      expect(store.getSecretSetting<{ token: string }>(`oauth_access_token:testx:${conn.id}`)!.token).toBe("at_c");
       expect(store.getCredential("testx")).toBeNull();
     });
 
@@ -466,7 +469,7 @@ describe("token endpoint flows", () => {
         return { status: 200, body: { access_token: "cc_at", expires_in: 3600 } };
       };
       const store = new Store(":memory:");
-      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      const c = store.setCredential("testx", "t", { clientId: "svc_id", clientSecret: "svc_secret" });
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(calls).toBe(1);

@@ -172,7 +172,7 @@ describe("datadog integration", () => {
   const store = new Store(":memory:");
 
   it("injects DD-API-KEY and DD-APPLICATION-KEY over agent placeholders", () => {
-    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi", appKey: "ddapp" }), store, {
+    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi", appKey: "ddapp", site: "datadoghq.com" }), store, {
       "dd-api-key": "placeholder",
       "dd-application-key": "placeholder",
     });
@@ -182,7 +182,7 @@ describe("datadog integration", () => {
   });
 
   it("drops an agent-sent application key placeholder when none is stored", () => {
-    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi" }), store, {
+    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi", site: "datadoghq.com" }), store, {
       "dd-application-key": "placeholder",
     });
     datadog.inject(ctx);
@@ -212,7 +212,10 @@ describe("datadog integration", () => {
     expect(normalizeDatadogSite(" EU ")).toBe("datadoghq.eu");
     expect(normalizeDatadogSite("US1-FED")).toBe("ddog-gov.com");
     expect(datadog.validateCredential!({ apiKey: "k", site: "US5" })).toBeNull();
-    expect(datadog.validateCredential!({ apiKey: "k" })).toBeNull();
+    expect(datadog.validateCredential!({ apiKey: "k" })).toMatch(/site is required/);
+    expect(datadog.validateCredential!({ apiKey: "k", site: "  " })).toMatch(/site is required/);
+    // Saved without a site some other way, inject still refuses to spray the keys.
+    expect(() => datadog.inject(ctxFor("api.datadoghq.com", cred({ apiKey: "k" }), store))).toThrow(/no "site"/);
     expect(datadog.validateCredential!({ apiKey: "k", site: "us9" })).toMatch(/not a Datadog site/);
     const ctx = ctxFor("api.us5.datadoghq.com", cred({ apiKey: "k", site: "us5" }), store);
     datadog.inject(ctx);
@@ -249,6 +252,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   let sfInstance = "https://acme.my.salesforce.com";
   let msRefreshes = 0;
   let lastZoom: { auth: string; params: URLSearchParams } | null = null;
+  let onZoomMint: () => void = () => {};
   let lastMs: URLSearchParams | null = null;
 
   beforeAll(async () => {
@@ -263,6 +267,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
         };
         if (req.url === "/zoom/token") {
           zoomGrants++;
+          onZoomMint();
           lastZoom = { auth: req.headers.authorization ?? "", params };
           if (lastZoom.auth !== "Basic " + Buffer.from("zcid:zsecret").toString("base64")) {
             json(401, { reason: "Invalid client_id or client_secret", error: "invalid_client" });
@@ -316,11 +321,12 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     sfInstance = "https://acme.my.salesforce.com";
     msRefreshes = 0;
     lastZoom = null;
+    onZoomMint = () => {};
     lastMs = null;
   });
 
   it("zoom mints an account_credentials token with Basic auth, injects Bearer and caches", async () => {
-    const c = cred({ accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" }, "zoom");
+    const c = store.setCredential("zoom", "t", { accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" });
     const ctx1 = ctxFor("api.zoom.us", c, store, { authorization: "Bearer og_placeholder" });
     await zoom.inject(ctx1);
     const ctx2 = ctxFor("api.zoom.us", c, store);
@@ -332,6 +338,30 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     expect(lastZoom!.params.get("account_id")).toBe("acct_1");
     // Client credentials ride in the Basic header, never the body.
     expect(lastZoom!.params.has("client_secret")).toBe(false);
+  });
+
+  it("zoom does not cache a token minted for a connection deleted mid-request", async () => {
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "zoom",
+      name: "zoom-work",
+      data: { accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" },
+    });
+    onZoomMint = () => store.deleteConnection(conn.id);
+    const c = { id: conn.id, integrationId: "zoom", name: conn.name, data: { ...conn.data }, createdAt: "" };
+    await zoom.inject(ctxFor("api.zoom.us", c, store));
+    expect(store.getSecretSetting(`oauth_access_token:zoom:${conn.id}`)).toBeNull();
+    expect(store.getCredential("zoom")).toBeNull();
+  });
+
+  it("zoom re-mints after the account ID is edited instead of reusing the old account's token", async () => {
+    store.setCredential("zoom", "t", { accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" });
+    await zoom.inject(ctxFor("api.zoom.us", store.getCredential("zoom")!, store));
+    store.setCredential("zoom", "t", { accountId: "acct_2", clientId: "zcid", clientSecret: "zsecret" });
+    const ctx = ctxFor("api.zoom.us", store.getCredential("zoom")!, store);
+    await zoom.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer zoom_at_2");
+    expect(lastZoom!.params.get("account_id")).toBe("acct_2");
   });
 
   it("zoom surfaces vendor rejections and requires an account id", async () => {
@@ -678,6 +708,39 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     const ctx = ctxFor("org-b.my.salesforce.com", c, store);
     await salesforce.inject(ctx);
     expect(ctx.headers.authorization).toBe("Bearer sf_at_B");
+  });
+
+  it("editing a connection's data drops its cached token, the next inject mints fresh", async () => {
+    tokenBody = { access_token: "sf_at_A", refresh_token: "sf_rt_A", instance_url: "https://org-a.my.salesforce.com" };
+    expect((await connect({ connectionName: "sf-edit" })).status).toBe(200);
+    const conn = store.listConnections().find((c) => c.name === "sf-edit")!;
+    const key = `oauth_access_token:salesforce:${conn.id}`;
+    store.setSecretSetting(key, { token: "cached_org_a", exp: Date.now() + 3_600_000 });
+
+    const edit = await request("PUT", `/api/connections/${conn.id}`, {
+      data: { clientId: "sfid", clientSecret: "sfsec", refreshToken: "sf_rt_A", instanceUrl: "https://org-b.my.salesforce.com" },
+    });
+    expect(edit.status).toBe(200);
+    expect(store.getSecretSetting(key)).toBeNull();
+
+    tokenBody = { access_token: "sf_at_fresh", instance_url: "https://org-b.my.salesforce.com" };
+    const fresh = store.getConnection(conn.id)!;
+    const ctx = ctxFor("org-b.my.salesforce.com", { id: fresh.id, integrationId: "salesforce", name: fresh.name, data: fresh.data, createdAt: "" }, store);
+    await salesforce.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer sf_at_fresh");
+    // The refresh's own write path keeps the token it just minted.
+    expect(store.getSecretSetting<{ token: string }>(key)!.token).toBe("sf_at_fresh");
+  });
+
+  it("editing the legacy credential through PUT /api/credentials drops its cached token", async () => {
+    store.setCredential("zoom", "t", { accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" });
+    const id = store.getCredential("zoom")!.id;
+    store.setSecretSetting(`oauth_access_token:zoom:${id}`, { token: "old", exp: Date.now() + 3_600_000 });
+    const r = await request("PUT", "/api/credentials/zoom", {
+      data: { accountId: "acct_2", clientId: "zcid", clientSecret: "zsecret" },
+    });
+    expect(r.status).toBe(200);
+    expect(store.getSecretSetting(`oauth_access_token:zoom:${id}`)).toBeNull();
   });
 
   it("re-connecting the legacy credential drops its cached token", async () => {
