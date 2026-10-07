@@ -74,7 +74,7 @@ export const microsoft: Integration = {
   ],
   connect: {
     method: "oauth",
-    hint: "Use a Microsoft Entra app registration (Web platform, any organizational directory and personal accounts) with a client secret.",
+    hint: "Use a multi-tenant Microsoft Entra app registration (Web platform, \"Accounts in any organizational directory and personal Microsoft accounts\") with a client secret. Single-tenant apps are not supported yet.",
   },
   oauth: {
     authUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
@@ -86,7 +86,7 @@ export const microsoft: Integration = {
     consoleUrl: "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
     steps: [
       "Open App registrations in the Microsoft Entra admin center at https://entra.microsoft.com (Identity, Applications, App registrations) and click New registration.",
-      "Under Supported account types choose \"Accounts in any organizational directory and personal Microsoft accounts\" (or your own directory only, for a single-tenant app).",
+      "Under Supported account types choose \"Accounts in any organizational directory and personal Microsoft accounts\". OneGate signs in through the common endpoint, so a single-tenant app (your own directory only) fails at consent with AADSTS50194.",
       "Under Redirect URI pick the Web platform and paste the redirect URI shown at the top of this page exactly. Click Register.",
       "Copy the Application (client) ID from the Overview page.",
       "Open Certificates and secrets, click New client secret and copy the secret Value (not the Secret ID).",
@@ -97,7 +97,7 @@ export const microsoft: Integration = {
     credentialType:
       "A Microsoft Entra (Azure AD) app registration's Application (client) ID and a client secret value. OneGate runs the OAuth consent against the common endpoint, stores the refresh token (Microsoft rotates it, OneGate keeps the newest) and injects short-lived access tokens as Bearer on graph.microsoft.com.",
     whereToCreate:
-      "Microsoft Entra admin center (https://entra.microsoft.com), Identity, Applications, App registrations, New registration. Supported account types: any organizational directory and personal Microsoft accounts. Redirect URI: Web platform, the URI shown in the OneGate connect dialog. Then Certificates and secrets, New client secret.",
+      "Microsoft Entra admin center (https://entra.microsoft.com), Identity, Applications, App registrations, New registration. Supported account types must be 'Accounts in any organizational directory and personal Microsoft accounts' (OneGate uses the common endpoint, single-tenant apps fail with AADSTS50194). Redirect URI: Web platform, the URI shown in the OneGate connect dialog. Then Certificates and secrets, New client secret.",
     scopes: [
       "Delegated Microsoft Graph permissions per product: Mail.ReadWrite and Mail.Send (Outlook mail), Calendars.ReadWrite (Outlook calendar), Files.ReadWrite (OneDrive), Notes.ReadWrite (OneNote). offline_access and User.Read are always requested.",
       "Work or school tenants may require an administrator to consent to these permissions before a user can.",

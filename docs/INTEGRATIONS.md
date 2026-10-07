@@ -92,6 +92,8 @@ inject(ctx) {
 
 **Provider extras in the token response.** Some providers return facts the gateway needs later alongside the tokens, such as Salesforce's per-org `instance_url`. List them in the descriptor's `persistTokenFields` (response key to credential data key, e.g. `{ instance_url: "instanceUrl" }`) and the OAuth callback stores the string values on the credential. Every refresh re-applies the mapping and persists a changed value the same way as a rotated refresh token. The engine's own keys (`clientId`, `clientSecret`, `accessToken`, `refreshToken`, `expiresAt`, `scopes`) are never overwritten. Providers whose token response carries no `expires_in` can set `defaultExpiresIn` (seconds, default 3600) so the engine refreshes before the real expiry. See `src/integrations/salesforce.ts`.
 
+**Connect-time validation.** `validateCredential(data)` *(optional)* runs after the generic `credentialFields` checks whenever a credential or app connection is saved (`PUT /api/credentials/:id`, `POST`/`PUT /api/connections`, the self-service paste wizard). Return a human-readable error string to reject the save with `400 invalid_data`, or `null` to accept. Use it for non-secret fields with a closed set of valid values, so a typo fails at connect time instead of at the first request. See `src/integrations/datadog.ts` (site) and `src/integrations/posthog.ts` (region).
+
 **Client-credentials variants.** `clientCredentialsToken` takes an optional form body for providers whose service-account grant is not plain `client_credentials` (Zoom Server-to-Server uses `grant_type=account_credentials` plus `account_id`). See `src/integrations/zoom.ts`.
 
 **URL-path credentials.** Some APIs carry the credential in the URL itself (Telegram puts the bot token in the path). `inject` may reassign `ctx.path` and the gateway forwards the rewritten path upstream. Policy evaluation and the audit log always use the original path the agent sent, so the real credential never shows up in rules or logs. See `src/integrations/telegram-bot.ts`. Request bodies can be read (`needsBody`, for payload signing) but not rewritten, an API that only accepts credentials inside the body cannot be injected by OneGate.
@@ -431,7 +433,7 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Hosts:** `graph.microsoft.com`.
 - **Scope picker:** Outlook mail (`Mail.ReadWrite`, `Mail.Send`), Outlook calendar (`Calendars.ReadWrite`), OneDrive (`Files.ReadWrite`) and OneNote (`Notes.ReadWrite`). Every pack also requests `offline_access` and `User.Read`.
 - **Suggested policy:** per product with path globs: `/v1.0/me/messages/**` and `POST /v1.0/me/sendMail` (mail), `/v1.0/me/events/**` and `/v1.0/me/calendarView` (calendar), `/v1.0/me/drive/**` (OneDrive), `/v1.0/me/onenote/**` (OneNote).
-- **Limitations:** one consent covers every selected product, per-product permissioning is path globs. Work or school tenants may need admin consent. Client secrets expire, reconnect with a new one.
+- **Limitations:** the app registration must support "Accounts in any organizational directory and personal Microsoft accounts". OneGate uses the `common` endpoints, so a single-tenant app fails at consent with AADSTS50194 (per-credential tenant endpoints are a follow-up). One consent covers every selected product, per-product permissioning is path globs. Work or school tenants may need admin consent. Client secrets expire, reconnect with a new one.
 
 ### salesforce
 

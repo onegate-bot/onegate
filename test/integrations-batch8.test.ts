@@ -346,10 +346,12 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   });
 
   it("salesforce refreshes, injects Bearer on its own instance and assumes a short lifetime", async () => {
-    const c = cred(
-      { clientId: "sfid", clientSecret: "sfsec", refreshToken: "sf_rt", instanceUrl: "https://acme.my.salesforce.com" },
-      "salesforce",
-    );
+    const c = store.setCredential("salesforce", "Salesforce OAuth", {
+      clientId: "sfid",
+      clientSecret: "sfsec",
+      refreshToken: "sf_rt",
+      instanceUrl: "https://acme.my.salesforce.com",
+    });
     const ctx = ctxFor("acme.my.salesforce.com", c, store, { authorization: "Bearer og_placeholder" });
     await salesforce.inject(ctx);
     expect(ctx.headers.authorization).toBe("Bearer sf_at_1");
@@ -526,11 +528,12 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     });
   }
 
-  async function connect(): Promise<{ status: number; text: string }> {
+  async function connect(extra: Record<string, unknown> = {}): Promise<{ status: number; text: string }> {
     const start = await request("POST", "/api/integrations/salesforce/oauth/start", {
       clientId: "sfid",
       clientSecret: "sfsec",
       redirectBase: `http://127.0.0.1:${port}`,
+      ...extra,
     });
     expect(start.status).toBe(200);
     const url = new URL(JSON.parse(start.text).url);
@@ -656,6 +659,36 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     const ok = await request("PUT", "/api/credentials/posthog", { data: { apiKey: "phx_x", region: "EU" } });
     expect(ok.status).toBe(200);
     expect(posthog.validateCredential!({ apiKey: "phx_x" })).toBeNull();
+  });
+
+  it("re-authorizing a connection to another org drops the old org's cached token", async () => {
+    tokenBody = { access_token: "sf_at_A", refresh_token: "sf_rt_A", instance_url: "https://org-a.my.salesforce.com" };
+    expect((await connect({ connectionName: "sf-reauth" })).status).toBe(200);
+    const conn = store.listConnections().find((c) => c.name === "sf-reauth")!;
+    const key = `oauth_access_token:salesforce:${conn.id}`;
+    // A token minted earlier for org A is still cached.
+    store.setSecretSetting(key, { token: "cached_org_a", exp: Date.now() + 3_600_000 });
+
+    tokenBody = { access_token: "sf_at_B", refresh_token: "sf_rt_B", instance_url: "https://org-b.my.salesforce.com" };
+    expect((await connect({ connectionId: conn.id })).status).toBe(200);
+    expect(store.getSecretSetting(key)).toBeNull();
+
+    const fresh = store.getConnection(conn.id)!;
+    const c = { id: fresh.id, integrationId: "salesforce", name: fresh.name, data: fresh.data, createdAt: "" };
+    const ctx = ctxFor("org-b.my.salesforce.com", c, store);
+    await salesforce.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer sf_at_B");
+  });
+
+  it("re-connecting the legacy credential drops its cached token", async () => {
+    tokenBody = { access_token: "sf_at_1", refresh_token: "sf_rt_1", instance_url: "https://acme.my.salesforce.com" };
+    expect((await connect()).status).toBe(200);
+    const id = store.getCredential("salesforce")!.id;
+    store.setSecretSetting(`oauth_access_token:salesforce:${id}`, { token: "stale", exp: Date.now() + 3_600_000 });
+    tokenBody = { access_token: "sf_at_2", refresh_token: "sf_rt_2", instance_url: "https://acme.my.salesforce.com" };
+    expect((await connect()).status).toBe(200);
+    expect(store.getCredential("salesforce")!.id).toBe(id);
+    expect(store.getSecretSetting(`oauth_access_token:salesforce:${id}`)).toBeNull();
   });
 
   it("ignores a non-string instance_url instead of storing junk", async () => {

@@ -227,7 +227,7 @@ interface CachedToken {
 }
 
 interface RefreshResult extends CachedToken {
-  /** False when the credential's connection was deleted during the refresh. */
+  /** False when the credential's origin row was deleted during the refresh. */
   live: boolean;
 }
 
@@ -303,9 +303,9 @@ async function refreshAccessToken(
   if (json.refresh_token && json.refresh_token !== refreshToken) {
     delta.refreshToken = json.refresh_token;
   }
-  const stored = applyCredentialDelta(store, integrationId, cred, delta);
-  // A revoked connection's freshly minted token must not be cached either.
-  const live = stored || !isConnectionBacked(cred);
+  // A credential whose origin row vanished (revoked connection, deleted
+  // legacy credential) must not have its freshly minted token cached either.
+  const live = applyCredentialDelta(store, integrationId, cred, delta);
   return {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? oauth.defaultExpiresIn ?? 3600) * 1000,
@@ -354,7 +354,7 @@ export async function oauthBearerToken(
     if (raced) return { token: raced, exp: Date.now() + EXPIRY_MARGIN_MS };
     const { live, ...minted } = await refreshAccessToken(integration.id, oauth, cred, store);
     // Persisted by the flight owner only, so a stale result from an earlier
-    // attempt can never overwrite a newer token. A connection deleted
+    // attempt can never overwrite a newer token. A credential deleted
     // mid-refresh (revoked) is never cached.
     if (live) store.setSecretSetting(key, minted);
     return minted;

@@ -1114,7 +1114,13 @@ export class Store {
   }
 
   deleteCredential(integrationId: string): void {
-    this.db.prepare("DELETE FROM credentials WHERE integration_id = ?").run(integrationId);
+    const cur = this.getCredential(integrationId);
+    this.tx(() => {
+      this.db.prepare("DELETE FROM credentials WHERE integration_id = ?").run(integrationId);
+      // Like deleteConnection: drop the cached OAuth access token too, so a
+      // deleted credential's live token cannot outlive it.
+      if (cur) this.deleteSetting(`oauth_access_token:${integrationId}:${cur.id}`);
+    });
   }
 
   // ---- connections (multi-credential) ----

@@ -325,6 +325,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   ): string | null {
     if (pending.connectionId) {
       store.updateConnection(pending.connectionId, { data });
+      // Re-authorize may switch accounts (even orgs): never serve the previous
+      // consent's cached access token for the new data.
+      store.deleteSetting(`oauth_access_token:${integration.id}:${pending.connectionId}`);
       return pending.connectionId;
     }
     if (pending.connectionName) {
@@ -339,7 +342,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       });
       return conn.id;
     }
-    store.setCredential(integration.id, `${integration.title} OAuth`, data);
+    const cred = store.setCredential(integration.id, `${integration.title} OAuth`, data);
+    store.deleteSetting(`oauth_access_token:${integration.id}:${cred.id}`);
     return null;
   }
 

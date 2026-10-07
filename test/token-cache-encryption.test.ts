@@ -158,14 +158,15 @@ describe("integration token caches are sealed", () => {
     respond = () => ({ status: 200, body: { access_token: "at_PLAINTEXT", expires_in: 3600 } });
 
     const store = new Store(dbPath);
-    const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+    // A stored credential: refreshes of a credential with no origin row are not cached.
+    const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
     expect(await oauthBearerToken({ id: "testx", oauth: descriptor }, c, store)).toBe("at_PLAINTEXT");
     // Second call is served from the sealed cache (the server would answer the
     // same token anyway, so assert the row shape rather than the call count).
     expect(await oauthBearerToken({ id: "testx", oauth: descriptor }, c, store)).toBe("at_PLAINTEXT");
     store.close();
 
-    const raw = rawSetting("oauth_access_token:testx:cr_tc")!;
+    const raw = rawSetting(`oauth_access_token:testx:${c.id}`)!;
     expect(raw.startsWith("enc.v1:")).toBe(true);
     expect(raw).not.toContain("at_PLAINTEXT");
   });

@@ -251,7 +251,7 @@ describe("token endpoint flows", () => {
         return { status: 200, body: { access_token: `at_${calls}`, expires_in: 3600 } };
       };
       const stale = String(Math.floor(Date.now() / 1000) - 10);
-      const c = cred({
+      const c = store.setCredential("testx", "t", {
         clientId: "cid",
         clientSecret: "cs",
         accessToken: "old",
@@ -276,18 +276,18 @@ describe("token endpoint flows", () => {
 
     it("assumes the descriptor's default lifetime when expires_in is absent (Salesforce style)", async () => {
       respond = () => ({ status: 200, body: { access_token: "no_exp" } });
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
       expect(await oauthBearerToken(integ({ defaultExpiresIn: 600 }), c, store)).toBe("no_exp");
-      const cached = store.getSecretSetting<{ exp: number }>("oauth_access_token:testx:cr_oauth")!;
+      const cached = store.getSecretSetting<{ exp: number }>(`oauth_access_token:testx:${c.id}`)!;
       expect(cached.exp - Date.now()).toBeLessThanOrEqual(600_000);
       expect(cached.exp - Date.now()).toBeGreaterThan(590_000);
     });
 
     it("falls back to an hour when neither expires_in nor a default is given", async () => {
       respond = () => ({ status: 200, body: { access_token: "no_exp" } });
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
       await oauthBearerToken(integ(), c, store);
-      const cached = store.getSecretSetting<{ exp: number }>("oauth_access_token:testx:cr_oauth")!;
+      const cached = store.getSecretSetting<{ exp: number }>(`oauth_access_token:testx:${c.id}`)!;
       expect(cached.exp - Date.now()).toBeGreaterThan(3_590_000);
     });
 
@@ -310,6 +310,27 @@ describe("token endpoint flows", () => {
       const saved = store.getCredential("testx")!.data;
       expect(saved.instanceUrl).toBe("https://new.example");
       expect(saved.clientSecret).toBe("cs");
+    });
+
+    it("does not cache the token of a legacy credential deleted mid-refresh", async () => {
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      respond = () => {
+        store.deleteCredential("testx");
+        return { status: 200, body: { access_token: "at_deleted", refresh_token: "rt2", expires_in: 3600 } };
+      };
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getCredential("testx")).toBeNull();
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+    });
+
+    it("deleteCredential purges the credential's cached access token", async () => {
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      respond = () => ({ status: 200, body: { access_token: "at_live", expires_in: 3600 } });
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).not.toBeNull();
+      store.deleteCredential("testx");
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+      store.deleteCredential("testx"); // no row: a no-op
     });
 
     it("never resurrects a deleted legacy credential from a refresh", async () => {
