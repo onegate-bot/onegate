@@ -27,15 +27,31 @@ export const DATADOG_SITES = [
   "us2.ddog-gov.com",
 ] as const;
 
+/** Datadog's short region names (as shown in the UI and docs) -> DD_SITE. */
+const REGION_ALIASES: Record<string, string> = {
+  us1: "datadoghq.com",
+  us3: "us3.datadoghq.com",
+  us5: "us5.datadoghq.com",
+  eu: "datadoghq.eu",
+  eu1: "datadoghq.eu",
+  ap1: "ap1.datadoghq.com",
+  ap2: "ap2.datadoghq.com",
+  uk1: "uk1.datadoghq.com",
+  "us1-fed": "ddog-gov.com",
+  "us2-fed": "us2.ddog-gov.com",
+};
+
 /**
  * Normalizes a pasted site to a known DD_SITE value. Accepts the site
  * ("us5.datadoghq.com"), a site or API URL ("https://api.us5.datadoghq.com",
- * "https://app.datadoghq.eu") or nothing (null, meaning US1 by default but
- * unbound). Returns undefined for anything that is not a Datadog site.
+ * "https://app.datadoghq.eu"), a short region name ("us5", "EU") or nothing
+ * (null, meaning US1 by default but unbound). Returns undefined for anything
+ * that is not a Datadog site.
  */
 export function normalizeDatadogSite(raw: string | undefined | null): string | null | undefined {
   let s = (raw ?? "").trim().toLowerCase();
   if (!s) return null;
+  if (REGION_ALIASES[s]) return REGION_ALIASES[s];
   s = s.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
   s = s.replace(/^(api|app)\./, "");
   return (DATADOG_SITES as readonly string[]).includes(s) ? s : undefined;
@@ -49,7 +65,7 @@ export const datadog: Integration = {
   credentialFields: [
     { key: "apiKey", label: "API key", secret: true },
     { key: "appKey", label: "Application key", secret: true, optional: true },
-    { key: "site", label: "Site (e.g. datadoghq.com, us5.datadoghq.com, datadoghq.eu)", secret: false, optional: true },
+    { key: "site", label: "Site (e.g. datadoghq.com, us5.datadoghq.com, datadoghq.eu, or us5, eu)", secret: false, optional: true },
   ],
   connect: {
     method: "api_key",
@@ -65,7 +81,13 @@ export const datadog: Integration = {
       "Most read endpoints need both keys. Metric and event submission need only the API key.",
     ],
     notes:
-      'Fill "Site" with your DD_SITE value: datadoghq.com (US1), us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu (EU1), ap1.datadoghq.com, ap2.datadoghq.com, uk1.datadoghq.com, ddog-gov.com or us2.ddog-gov.com. The API base URL is https://api.<site>/api/.',
+      'Fill "Site" with your DD_SITE value: datadoghq.com (US1), us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu (EU1), ap1.datadoghq.com, ap2.datadoghq.com, uk1.datadoghq.com, ddog-gov.com or us2.ddog-gov.com (short names like us5 or eu work too). The API base URL is https://api.<site>/api/.',
+  },
+  /** Rejects an unknown site when the credential is saved, not at first use. */
+  validateCredential(data: Record<string, string>): string | null {
+    return normalizeDatadogSite(data.site) === undefined
+      ? `data.site "${data.site}" is not a Datadog site (use e.g. datadoghq.com, us5.datadoghq.com, datadoghq.eu or us5, eu)`
+      : null;
   },
   /** The site tells the agent which regional API host its keys live on. */
   accountSummary(cred: Credential): Record<string, string | null> {

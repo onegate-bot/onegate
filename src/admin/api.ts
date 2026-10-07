@@ -16,7 +16,7 @@ import type { Connection, OnboardingLink, LlmStrategy } from "../types.js";
 import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry } from "../integrations/types.js";
 import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
-import { buildAuthUrl, exchangeCode } from "../integrations/oauth.js";
+import { buildAuthUrl, exchangeCode, pickTokenFields } from "../integrations/oauth.js";
 import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
@@ -565,10 +565,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       if (lifetime) {
         data.expiresAt = String(Math.floor(Date.now() / 1000) + lifetime);
       }
-      for (const [from, to] of Object.entries(oauth.persistTokenFields ?? {})) {
-        const v = tokens[from];
-        if (typeof v === "string" && v) data[to] = v;
-      }
+      Object.assign(data, pickTokenFields(oauth, tokens));
       const grantedScopes = tokens.scope ?? pending.scopes.join(" ");
       if (grantedScopes) data.scopes = grantedScopes;
       const connId = persistOauthResult(integration, pending, data);
@@ -1329,6 +1326,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "data_required" });
       return;
     }
+    const invalid = registry.get(integrationId)!.validateCredential?.(data as Record<string, string>);
+    if (invalid) {
+      res.status(400).json({ error: "invalid_data", message: invalid });
+      return;
+    }
     const cred = store.setCredential(integrationId, name ?? integrationId, data);
     res.json({ id: cred.id, integrationId, name: cred.name });
   });
@@ -1508,7 +1510,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     if (fields.length > 0 && Object.values(d).every((v) => !v)) {
       return "data must carry at least one non-empty value";
     }
-    return null;
+    return integration.validateCredential?.(d as Record<string, string>) ?? null;
   }
 
   /**

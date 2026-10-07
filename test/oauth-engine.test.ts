@@ -3,6 +3,7 @@ import http from "node:http";
 import {
   buildAuthUrl,
   exchangeCode,
+  pickTokenFields,
   oauthBearerToken,
   clientCredentialsToken,
 } from "../src/integrations/oauth.js";
@@ -75,6 +76,37 @@ describe("buildAuthUrl", () => {
     expect(u.searchParams.get("return_url")).toBe(params.redirectUri);
     expect(u.searchParams.get("response_type")).toBe("token");
     expect(u.searchParams.get("callback_method")).toBe("fragment");
+  });
+});
+
+describe("pickTokenFields", () => {
+  it("maps string extras and skips reserved keys, empties and non-strings", () => {
+    const oauth: OAuthDescriptor = {
+      ...base,
+      persistTokenFields: {
+        instance_url: "instanceUrl",
+        a: "accessToken",
+        r: "refreshToken",
+        e: "expiresAt",
+        s: "scopes",
+        id: "clientId",
+        n: "num",
+        z: "empty",
+      },
+    };
+    expect(
+      pickTokenFields(oauth, {
+        instance_url: "https://x.example",
+        a: "1",
+        r: "2",
+        e: "3",
+        s: "4",
+        id: "5",
+        n: 7,
+        z: "",
+      }),
+    ).toEqual({ instanceUrl: "https://x.example" });
+    expect(pickTokenFields(base, { instance_url: "x" })).toEqual({});
   });
 });
 
@@ -259,6 +291,29 @@ describe("token endpoint flows", () => {
       expect(cached.exp - Date.now()).toBeGreaterThan(3_590_000);
     });
 
+    it("re-applies persistTokenFields on refresh but never overwrites reserved keys", async () => {
+      respond = () => ({
+        status: 200,
+        body: { access_token: "at_x", instance_url: "https://new.example", evil: "pwned" },
+      });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt", instanceUrl: "https://old.example" });
+      await oauthBearerToken(
+        integ({ persistTokenFields: { instance_url: "instanceUrl", evil: "clientSecret" } }),
+        c,
+        store,
+      );
+      const saved = store.getCredential("testx")!.data;
+      expect(saved.instanceUrl).toBe("https://new.example");
+      expect(saved.clientSecret).toBe("cs");
+    });
+
+    it("does not rewrite the credential when nothing changed", async () => {
+      respond = () => ({ status: 200, body: { access_token: "at_x", instance_url: "https://same.example" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt", instanceUrl: "https://same.example" });
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")).toBeNull();
+    });
+
     it("surfaces refresh failures", async () => {
       respond = () => ({ status: 401, body: { error: "invalid_client" } });
       const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
@@ -346,6 +401,15 @@ describe("token endpoint flows", () => {
           account_id: "acct",
         }),
       ).toBe("acct_at");
+    });
+
+    it("labels errors client_credentials when the body has no grant_type", async () => {
+      respond = () => ({ status: 401, body: { error: "invalid_client" } });
+      const store = new Store(":memory:");
+      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      await expect(
+        clientCredentialsToken("testx", url, c, store, { audience: "x" }),
+      ).rejects.toThrow(/testx client_credentials grant failed \(401\)/);
     });
 
     it("requires both client id and secret", async () => {

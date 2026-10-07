@@ -139,6 +139,55 @@ export async function exchangeCode(
   return parseTokenResponse(res, "Token exchange");
 }
 
+/**
+ * Credential data keys the engine itself owns. persistTokenFields may never
+ * write these, so a provider response cannot clobber the client secret or the
+ * tokens through a mapping.
+ */
+const RESERVED_DATA_KEYS = new Set([
+  "clientId",
+  "clientSecret",
+  "accessToken",
+  "refreshToken",
+  "expiresAt",
+  "scopes",
+]);
+
+/**
+ * The descriptor's persistTokenFields applied to a token response: response
+ * key -> credential data key, string values only, reserved engine keys
+ * skipped. Used by both the code exchange and every refresh.
+ */
+export function pickTokenFields(
+  oauth: OAuthDescriptor,
+  tokens: TokenResponse,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [from, to] of Object.entries(oauth.persistTokenFields ?? {})) {
+    if (RESERVED_DATA_KEYS.has(to)) continue;
+    const v = tokens[from];
+    if (typeof v === "string" && v) out[to] = v;
+  }
+  return out;
+}
+
+/**
+ * Writes updated credential data back where it came from: the connection row
+ * for a connection-backed credential, otherwise the legacy credentials table.
+ */
+function persistCredentialData(
+  store: Store,
+  integrationId: string,
+  cred: Credential,
+  data: Record<string, string>,
+): void {
+  if (store.getConnection(cred.id)) {
+    store.updateConnection(cred.id, { data });
+  } else {
+    store.setCredential(integrationId, cred.name, data);
+  }
+}
+
 interface CachedToken {
   token: string;
   /** Epoch ms expiry. */
@@ -209,17 +258,24 @@ async function refreshAccessToken(
   );
   const json = parseTokenResponse(res, `${integrationId} token refresh`);
   // Some providers rotate the refresh token on every use (GitLab). Persist
-  // the replacement or the next refresh would fail. A connection-backed
-  // credential (its id resolves to a connection row) is persisted on the
-  // connection; a legacy single credential keeps the credentials table.
+  // the replacement or the next refresh would fail. Mapped extras
+  // (persistTokenFields, e.g. Salesforce's instance_url) are refreshed the
+  // same way. A connection-backed credential (its id resolves to a connection
+  // row) is persisted on the connection; a legacy single credential keeps the
+  // credentials table.
+  const nextData: Record<string, string> = { ...cred.data };
+  let changed = false;
   if (json.refresh_token && json.refresh_token !== refreshToken) {
-    const nextData = { ...cred.data, refreshToken: json.refresh_token };
-    if (store.getConnection(cred.id)) {
-      store.updateConnection(cred.id, { data: nextData });
-    } else {
-      store.setCredential(integrationId, cred.name, nextData);
+    nextData.refreshToken = json.refresh_token;
+    changed = true;
+  }
+  for (const [k, v] of Object.entries(pickTokenFields(oauth, json))) {
+    if (nextData[k] !== v) {
+      nextData[k] = v;
+      changed = true;
     }
   }
+  if (changed) persistCredentialData(store, integrationId, cred, nextData);
   return {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? oauth.defaultExpiresIn ?? 3600) * 1000,
@@ -301,7 +357,10 @@ export async function clientCredentialsToken(
     accept: "application/json",
     authorization: "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
   });
-  const json = parseTokenResponse(res, `${integrationId} ${fields.grant_type} grant`);
+  const json = parseTokenResponse(
+    res,
+    `${integrationId} ${fields.grant_type ?? "client_credentials"} grant`,
+  );
   const fresh: CachedToken = {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,

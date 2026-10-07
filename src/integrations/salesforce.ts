@@ -49,8 +49,8 @@ export const salesforce: Integration = {
   credentialFields: [
     { key: "clientId", label: "Consumer key", secret: false },
     { key: "clientSecret", label: "Consumer secret", secret: true },
-    { key: "accessToken", label: "Access token (set by the connect flow)", secret: true },
-    { key: "refreshToken", label: "Refresh token (set by the connect flow)", secret: true, optional: true },
+    { key: "accessToken", label: "Access token (set by the connect flow)", secret: true, optional: true },
+    { key: "refreshToken", label: "Refresh token (set by the connect flow)", secret: true },
     { key: "instanceUrl", label: "Instance URL (set by the connect flow)", secret: false },
   ],
   connect: {

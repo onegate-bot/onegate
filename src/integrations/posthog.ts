@@ -9,6 +9,17 @@
 import type { Credential } from "../types.js";
 import type { Integration, InjectionContext } from "./types.js";
 
+/** Hosts serving each region. app.posthog.com is the legacy US host. */
+const REGION_HOSTS: Record<"us" | "eu", string[]> = {
+  us: ["us.posthog.com", "app.posthog.com"],
+  eu: ["eu.posthog.com"],
+};
+
+function posthogRegion(raw: string | undefined): "us" | "eu" | null {
+  const region = String(raw ?? "").trim().toLowerCase();
+  return region === "us" || region === "eu" ? region : null;
+}
+
 export const posthog: Integration = {
   id: "posthog",
   title: "PostHog",
@@ -31,17 +42,23 @@ export const posthog: Integration = {
       "Personal API keys are scoped per resource (query:read, insight:read, feature_flag:write, ...) and can be limited to specific projects or organizations. Grant only what the agent needs.",
     ],
     notes:
-      'Fill "Region" with us or eu so the agent knows which host to call (https://us.posthog.com or https://eu.posthog.com). Endpoints live under /api/projects/<project_id>/. Event capture uses the public project key and is not routed through OneGate.',
+      'Fill "Region" with us or eu so the agent knows which host to call (https://us.posthog.com or https://eu.posthog.com), OneGate then refuses the other region. Endpoints live under /api/projects/<project_id>/. Event capture uses the public project key and is not routed through OneGate.',
   },
   /** The region tells the agent which API host its key lives on. */
   accountSummary(cred: Credential): Record<string, string | null> {
-    const region = String(cred.data.region ?? "").trim().toLowerCase();
-    if (region !== "us" && region !== "eu") return { region: null, apiBaseUrl: null };
+    const region = posthogRegion(cred.data.region);
+    if (!region) return { region: null, apiBaseUrl: null };
     return { region, apiBaseUrl: `https://${region}.posthog.com` };
   },
   inject(ctx: InjectionContext): void {
     const apiKey = ctx.credential.data.apiKey;
     if (!apiKey) throw new Error('PostHog credential has no "apiKey" field');
+    // A key lives in one region. When the operator recorded it, refuse the
+    // other region's hosts so the key never travels there.
+    const region = posthogRegion(ctx.credential.data.region);
+    if (region && !REGION_HOSTS[region].includes(ctx.host.toLowerCase())) {
+      throw new Error(`PostHog credential is bound to the ${region} region, refusing to authenticate ${ctx.host}`);
+    }
     ctx.headers.authorization = `Bearer ${apiKey}`;
   },
 };

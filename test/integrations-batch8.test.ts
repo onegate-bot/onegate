@@ -140,6 +140,21 @@ describe("batch 8 static token integrations", () => {
     });
   }
 
+  it("posthog binds the key to its recorded region", async () => {
+    const eu = cred({ apiKey: "phx_x", region: "eu" });
+    const ok = ctxFor("EU.posthog.com", eu, store);
+    await posthog.inject(ok);
+    expect(ok.headers.authorization).toBe("Bearer phx_x");
+    for (const host of ["us.posthog.com", "app.posthog.com"]) {
+      const ctx = ctxFor(host, eu, store);
+      expect(() => posthog.inject(ctx)).toThrow(/bound to the eu region/);
+      expect(ctx.headers.authorization).toBeUndefined();
+    }
+    const us = cred({ apiKey: "phx_x", region: "us" });
+    for (const host of ["us.posthog.com", "app.posthog.com"]) posthog.inject(ctxFor(host, us, store));
+    expect(() => posthog.inject(ctxFor("eu.posthog.com", us, store))).toThrow(/bound to the us region/);
+  });
+
   it("posthog summarizes the region and API base, ignoring junk", () => {
     expect(posthog.accountSummary!(cred({ apiKey: "k", region: " EU " }))).toEqual({
       region: "eu",
@@ -192,6 +207,18 @@ describe("datadog integration", () => {
     expect(() => datadog.inject(ctxFor("api.datadoghq.com", cred({ appKey: "x" }), store))).toThrow(/apiKey/);
   });
 
+  it("accepts short region names and rejects unknown sites at connect time", () => {
+    expect(normalizeDatadogSite("us5")).toBe("us5.datadoghq.com");
+    expect(normalizeDatadogSite(" EU ")).toBe("datadoghq.eu");
+    expect(normalizeDatadogSite("US1-FED")).toBe("ddog-gov.com");
+    expect(datadog.validateCredential!({ apiKey: "k", site: "US5" })).toBeNull();
+    expect(datadog.validateCredential!({ apiKey: "k" })).toBeNull();
+    expect(datadog.validateCredential!({ apiKey: "k", site: "us9" })).toMatch(/not a Datadog site/);
+    const ctx = ctxFor("api.us5.datadoghq.com", cred({ apiKey: "k", site: "us5" }), store);
+    datadog.inject(ctx);
+    expect(ctx.headers["dd-api-key"]).toBe("k");
+  });
+
   it("normalizes pasted sites and URLs", () => {
     expect(normalizeDatadogSite("")).toBeNull();
     expect(normalizeDatadogSite(undefined)).toBeNull();
@@ -219,6 +246,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   let store: Store;
   let zoomGrants = 0;
   let sfRefreshes = 0;
+  let sfInstance = "https://acme.my.salesforce.com";
   let msRefreshes = 0;
   let lastZoom: { auth: string; params: URLSearchParams } | null = null;
   let lastMs: URLSearchParams | null = null;
@@ -248,7 +276,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
           // Salesforce omits expires_in on purpose.
           json(200, {
             access_token: `sf_at_${sfRefreshes}`,
-            instance_url: "https://acme.my.salesforce.com",
+            instance_url: sfInstance,
             token_type: "Bearer",
           });
           return;
@@ -285,6 +313,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     store = new Store(":memory:");
     zoomGrants = 0;
     sfRefreshes = 0;
+    sfInstance = "https://acme.my.salesforce.com";
     msRefreshes = 0;
     lastZoom = null;
     lastMs = null;
@@ -332,6 +361,40 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     expect(cached.exp - Date.now()).toBeGreaterThan(590_000);
     await salesforce.inject(ctxFor("acme.my.salesforce.com", c, store));
     expect(sfRefreshes).toBe(1);
+  });
+
+  it("salesforce re-persists a changed instance_url on refresh and rebinds to the new host", async () => {
+    sfInstance = "https://acme-renamed.my.salesforce.com";
+    const c = store.setCredential("salesforce", "Salesforce OAuth", {
+      clientId: "sfid",
+      clientSecret: "sfsec",
+      refreshToken: "sf_rt",
+      instanceUrl: "https://acme.my.salesforce.com",
+    });
+    await salesforce.inject(ctxFor("acme.my.salesforce.com", c, store));
+    const reloaded = store.getCredential("salesforce")!;
+    expect(reloaded.data.instanceUrl).toBe("https://acme-renamed.my.salesforce.com");
+    expect(reloaded.data.refreshToken).toBe("sf_rt");
+    const moved = ctxFor("acme-renamed.my.salesforce.com", reloaded, store);
+    await salesforce.inject(moved);
+    expect(moved.headers.authorization).toBe("Bearer sf_at_1");
+    await expect(salesforce.inject(ctxFor("acme.my.salesforce.com", reloaded, store))).rejects.toThrow(
+      /bound to acme-renamed\.my\.salesforce\.com/,
+    );
+  });
+
+  it("salesforce persists a changed instance_url onto a named connection", async () => {
+    sfInstance = "https://acme-renamed.my.salesforce.com";
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "salesforce",
+      name: "sf-work",
+      data: { clientId: "sfid", clientSecret: "sfsec", refreshToken: "sf_rt", instanceUrl: "https://acme.my.salesforce.com" },
+    });
+    const c = cred({ ...conn.data }, "salesforce", conn.id);
+    await salesforce.inject(ctxFor("acme.my.salesforce.com", c, store));
+    expect(store.getConnection(conn.id)!.data.instanceUrl).toBe("https://acme-renamed.my.salesforce.com");
+    expect(store.getCredential("salesforce")).toBeNull();
   });
 
   it("salesforce refuses any other org, even under the claimed suffix, before minting a token", async () => {
@@ -528,6 +591,31 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     const exp = Number(data.expiresAt);
     expect(exp).toBeGreaterThanOrEqual(before + 600);
     expect(exp).toBeLessThanOrEqual(before + 602);
+  });
+
+  it("rejects an unknown Datadog site with a clear 400 when saving", async () => {
+    const legacy = await request("PUT", "/api/credentials/datadog", { data: { apiKey: "k", site: "us9" } });
+    expect(legacy.status).toBe(400);
+    expect(JSON.parse(legacy.text)).toMatchObject({ error: "invalid_data" });
+    expect(legacy.text).toContain("not a Datadog site");
+    expect(store.getCredential("datadog")).toBeNull();
+    const conn = await request("POST", "/api/connections", {
+      kind: "app",
+      vendor: "datadog",
+      name: "dd",
+      data: { apiKey: "k", site: "us9" },
+    });
+    expect(conn.status).toBe(400);
+    expect(conn.text).toContain("not a Datadog site");
+    const good = await request("PUT", "/api/credentials/datadog", { data: { apiKey: "k", site: "us5" } });
+    expect(good.status).toBe(200);
+    const goodConn = await request("POST", "/api/connections", {
+      kind: "app",
+      vendor: "datadog",
+      name: "dd",
+      data: { apiKey: "k", site: "eu" },
+    });
+    expect(goodConn.status).toBe(201);
   });
 
   it("ignores a non-string instance_url instead of storing junk", async () => {
