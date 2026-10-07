@@ -361,3 +361,11 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `/api/v1/chat/completions`, `/api/v1/completions`.
 - **LLM vendor:** routable like anthropic, openai and gemini. OpenRouter is an OpenAI-compatible aggregator at `https://openrouter.ai/api/v1`, so point the client's base URL there and use OpenRouter model ids (e.g. `anthropic/claude-3.5-sonnet`). Create the key at https://openrouter.ai/keys.
 - **Limitations:** none notable. Cap the key with a credit limit on the OpenRouter dashboard. The client may send `HTTP-Referer` and `X-Title` for attribution, OneGate forwards them unchanged.
+
+### typesafe
+
+- **Credential:** TypeSafe API key, injected as `Bearer`. Create it at https://console.typesafe.ai/keys.
+- **Hosts:** `api.typesafe.ai`.
+- **Suggested policy:** `POST /v1/systemone`, `GET /v1/models`.
+- **LLM vendor:** routable like anthropic, openai and gemini (fallback / round-robin, in-request failover, token accounting). Jev is TypeSafe's "System One" model: a request is `{ state, model, questions }` with `model` set to `jev-latest`, `jev-preview` or a pinned version such as `jev-1.13.0`, and the response carries typed answers (noul / choice / score with probabilities) plus `usage.input_tokens` / `usage.output_tokens`, which OneGate records per connection. Point the SDK at the gateway with `TYPESAFE_API_KEY=placeholder` and leave `TYPESAFE_BASE_URL` at its default `https://api.typesafe.ai`.
+- **Limitations:** no streaming endpoint exists, so every call is a buffered JSON request. `429` (rate limit) and `529` (overloaded) count as retryable and fail over to the agent's next connection. A `401` fails over too and, after repeated consecutive 401s, benches the connection like any other LLM key. `422` (validation) is returned to the agent as-is.

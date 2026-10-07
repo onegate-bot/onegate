@@ -29,7 +29,7 @@ The client uses Node's `http`/`https` with a dedicated agent and ignores any pro
 
 ## LLM connections and per-agent routing
 
-A connection holds one vendor credential. Each vendor (anthropic, openai, gemini) can have several connections and exactly one default. A per-agent route picks which connections an agent uses and in what order.
+A connection holds one vendor credential. Each vendor (anthropic, openai, gemini, openrouter, typesafe) can have several connections and exactly one default. A per-agent route picks which connections an agent uses and in what order.
 
 ```bash
 # Add an Anthropic API-key connection and make it the default.
@@ -37,6 +37,9 @@ onegate connections add --vendor anthropic --name anth-1 --api-key sk-ant-... --
 
 # Add an Anthropic subscription auth-token connection (Bearer mode).
 onegate connections add --vendor anthropic --name anth-2 --auth-token sk-ant-oat-...
+
+# Add a TypeSafe (Jev) connection. Every LLM vendor takes --api-key / --secret-stdin.
+printf '%s' "$TYPESAFE_API_KEY" | onegate connections add --vendor typesafe --name jev-1 --secret-stdin
 
 # Read a secret from stdin instead of a flag (keeps it out of shell history).
 printf '%s' "$TOKEN" | onegate connections add --vendor anthropic --name anth-3 --secret-stdin --auth-token-stdin

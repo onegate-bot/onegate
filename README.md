@@ -2,7 +2,7 @@
 
 **The agent security platform, made by agents, for agents.**
 
-An open-source credential gateway for AI agents. OneGate sits between your agents and the services they call (33 built-in integrations from GitHub and Google to Stripe and MongoDB Atlas, plus any community-added integration), injects real credentials at the network edge, and gives you one place to manage which agent may do what.
+An open-source credential gateway for AI agents. OneGate sits between your agents and the services they call (40 built-in integrations from GitHub and Google to Stripe and MongoDB Atlas, plus any community-added integration), injects real credentials at the network edge, and gives you one place to manage which agent may do what.
 
 OneGate is built and maintained by agents, in the open. The threat model, the code, and the reviews come from the same kind of system it protects.
 
@@ -59,7 +59,7 @@ The placeholder is replaced with the real credential at the gateway. New agents 
 
 ## Integrations
 
-Built in (33): **GitHub** (PAT) and **GitHub App** (installation tokens), **Google** (Gmail, Calendar, Drive through one OAuth connection), **GCP** (service accounts for Cloud APIs), **AWS** (experimental gateway-side SigV4), **Slack**, **OpenAI**, **Anthropic**, **Jira / Atlassian**, **Confluence**, **Notion**, **Linear**, **Stripe**, **SendGrid**, **Resend**, **Brave Search**, **Tavily**, **Telegram Bot**, **Discord**, **Hugging Face**, **GitLab**, **Dropbox**, **Cloudflare**, **Fly.io**, **Vercel**, **Supabase**, **Todoist**, **Trello**, **monday.com**, **LinkedIn**, **MongoDB Atlas**, **Docker Hub** and **JFrog Artifactory**. Full catalog with credential types, hosts and suggested policies in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+Built in (40): **GitHub** (PAT) and **GitHub App** (installation tokens), **Google** (Gmail, Calendar, Drive through one OAuth connection), **GCP** (service accounts for Cloud APIs), **AWS** (experimental gateway-side SigV4), **Slack**, **OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **TypeSafe (Jev)**, **Jira / Atlassian**, **Confluence**, **Notion**, **Linear**, **Stripe**, **SendGrid**, **Resend**, **Brave Search**, **Tavily**, **Telegram Bot**, **Discord**, **Hugging Face**, **GitLab**, **Dropbox**, **Cloudflare**, **Fly.io**, **Vercel**, **Supabase**, **Todoist**, **Trello**, **monday.com**, **LinkedIn**, **MongoDB Atlas**, **Docker Hub**, **JFrog Artifactory**, **Hetzner**, **YouTube**, **ElevenLabs** and **Make**. Full catalog with credential types, hosts and suggested policies in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
 OAuth integrations are bring-your-own-client: you create an OAuth app at the vendor, paste its client ID and secret into the connect dialog, pick scopes, and OneGate runs the consent flow and refreshes tokens from then on.
 
