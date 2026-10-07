@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, statSync, renameSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, statSync, renameSync, copyFileSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
@@ -93,6 +94,25 @@ describe("leafFor", () => {
     const reloaded = loadCa(dir);
     const second = reloaded.leafFor("www.googleapis.com");
     expect(second.cert).toBe(first.cert);
+  });
+
+  it("re-mints a cached leaf that was signed by a different root", () => {
+    const otherDir = mkdtempSync(join(tmpdir(), "onegate-ca-other-"));
+    try {
+      const other = initCa(otherDir, "Other CA");
+      const foreign = other.leafFor("foreign.example.com");
+      // Plant the other root's leaf where this CA looks for its own cache.
+      const key = hostCacheKey("foreign.example.com");
+      for (const suffix of [".crt", ".key"]) {
+        copyFileSync(join(caPaths(otherDir).certsDir, `${key}${suffix}`), join(caPaths(dir).certsDir, `${key}${suffix}`));
+      }
+      const leaf = loadCa(dir).leafFor("foreign.example.com");
+      expect(leaf.cert).not.toBe(foreign.cert);
+      const x = new X509Certificate(leaf.cert);
+      expect(x.verify(new X509Certificate(ca.rootPem).publicKey)).toBe(true);
+    } finally {
+      rmSync(otherDir, { recursive: true, force: true });
+    }
   });
 
   it("leaf is accepted by node:tls when the root is trusted", async () => {
