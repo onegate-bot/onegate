@@ -48,6 +48,7 @@ import { githubApp } from "./github-app.js";
 import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
 import { hubspot } from "./hubspot.js";
+import { salesforce } from "./salesforce.js";
 import { sentry } from "./sentry.js";
 import { datadog } from "./datadog.js";
 import { posthog } from "./posthog.js";
@@ -115,6 +116,7 @@ const BUILTINS: Integration[] = [
   elevenlabs,
   make,
   hubspot,
+  salesforce,
   sentry,
   datadog,
   posthog,

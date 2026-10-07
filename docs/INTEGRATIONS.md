@@ -433,3 +433,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** per product with path globs: `/v1.0/me/messages/**` and `POST /v1.0/me/sendMail` (mail), `/v1.0/me/events/**` and `/v1.0/me/calendarView` (calendar), `/v1.0/me/drive/**` (OneDrive), `/v1.0/me/onenote/**` (OneNote).
 - **Limitations:** one consent covers every selected product, per-product permissioning is path globs. Work or school tenants may need admin consent. Client secrets expire, reconnect with a new one.
 
+### salesforce
+
+- **Credential:** a bring-your-own External Client App (or Connected App) consumer key and secret. The connect flow (login.salesforce.com) stores the refresh token and the org's `instance_url` as `instanceUrl`. Access tokens are refreshed at request time and injected as `Bearer`.
+- **Hosts:** `.my.salesforce.com` (any My Domain), but each credential is **bound to its own instance host**: a request to any other org under the suffix is refused before a token is minted. Anyone can register a My Domain, so the binding, not the claim, is what keeps the token in its org.
+- **Suggested policy:** `GET /services/data/*/query/**` and `GET /services/data/*/sobjects/**` for read-only agents, add `POST`/`PATCH` on `/services/data/*/sobjects/**` for writers.
+- **Discovery summary:** `instanceUrl` and `apiBaseUrl` (`<instanceUrl>/services/data`).
+- **Limitations:** production and Developer Edition orgs only (sandboxes log in at test.salesforce.com, not supported yet). OneGate sends no PKCE challenge, so untick "Require PKCE" on the app. Salesforce returns no `expires_in`, OneGate assumes ten minutes and refreshes early (session timeouts go down to 15 minutes).

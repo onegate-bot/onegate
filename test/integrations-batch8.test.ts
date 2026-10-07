@@ -17,6 +17,7 @@ import { composeLlmHelpPrompt } from "../src/integrations/llm-help.js";
 import { buildAuthUrl } from "../src/integrations/oauth.js";
 import type { Integration } from "../src/integrations/types.js";
 import { hubspot } from "../src/integrations/hubspot.js";
+import { salesforce, salesforceInstanceHost } from "../src/integrations/salesforce.js";
 import { sentry } from "../src/integrations/sentry.js";
 import { datadog, normalizeDatadogSite, DATADOG_SITES } from "../src/integrations/datadog.js";
 import { posthog } from "../src/integrations/posthog.js";
@@ -41,6 +42,7 @@ function ctxFor(host: string, credential: Credential, store: Store, headers: Inc
 
 const BATCH: Integration[] = [
   hubspot,
+  salesforce,
   sentry,
   datadog,
   posthog,
@@ -56,6 +58,8 @@ describe("batch 8 registry claims", () => {
     const registry = await buildRegistry();
     const expected: Record<string, string> = {
       "api.hubapi.com": "hubspot",
+      "acme.my.salesforce.com": "salesforce",
+      "acme--dev.sandbox.my.salesforce.com": "salesforce",
       "sentry.io": "sentry",
       "us.sentry.io": "sentry",
       "de.sentry.io": "sentry",
@@ -214,6 +218,7 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   let server: http.Server;
   let store: Store;
   let zoomGrants = 0;
+  let sfRefreshes = 0;
   let msRefreshes = 0;
   let lastZoom: { auth: string; params: URLSearchParams } | null = null;
   let lastMs: URLSearchParams | null = null;
@@ -238,6 +243,16 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
           json(200, { access_token: `zoom_at_${zoomGrants}`, token_type: "bearer", expires_in: 3599 });
           return;
         }
+        if (req.url === "/sf/token") {
+          sfRefreshes++;
+          // Salesforce omits expires_in on purpose.
+          json(200, {
+            access_token: `sf_at_${sfRefreshes}`,
+            instance_url: "https://acme.my.salesforce.com",
+            token_type: "Bearer",
+          });
+          return;
+        }
         if (req.url === "/ms/token") {
           msRefreshes++;
           lastMs = params;
@@ -255,18 +270,21 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     const port = (server.address() as { port: number }).port;
     process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM = `http://127.0.0.1:${port}/zoom/token`;
+    process.env.ONEGATE_OAUTH_TOKEN_URL_SALESFORCE = `http://127.0.0.1:${port}/sf/token`;
     process.env.ONEGATE_OAUTH_TOKEN_URL_MICROSOFT = `http://127.0.0.1:${port}/ms/token`;
   });
 
   afterAll(() => {
     server.close();
     delete process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM;
+    delete process.env.ONEGATE_OAUTH_TOKEN_URL_SALESFORCE;
     delete process.env.ONEGATE_OAUTH_TOKEN_URL_MICROSOFT;
   });
 
   beforeEach(() => {
     store = new Store(":memory:");
     zoomGrants = 0;
+    sfRefreshes = 0;
     msRefreshes = 0;
     lastZoom = null;
     lastMs = null;
@@ -298,10 +316,76 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     expect(zoom.accountSummary!(cred({}))).toEqual({ accountId: null });
   });
 
+  it("salesforce refreshes, injects Bearer on its own instance and assumes a short lifetime", async () => {
+    const c = cred(
+      { clientId: "sfid", clientSecret: "sfsec", refreshToken: "sf_rt", instanceUrl: "https://acme.my.salesforce.com" },
+      "salesforce",
+    );
+    const ctx = ctxFor("acme.my.salesforce.com", c, store, { authorization: "Bearer og_placeholder" });
+    await salesforce.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer sf_at_1");
+    const cached = store.getSecretSetting<{ token: string; exp: number }>(
+      `oauth_access_token:salesforce:${c.id}`,
+    )!;
+    // No expires_in in the response: the descriptor's 600 s default applies, not 3600.
+    expect(cached.exp - Date.now()).toBeLessThanOrEqual(600_000);
+    expect(cached.exp - Date.now()).toBeGreaterThan(590_000);
+    await salesforce.inject(ctxFor("acme.my.salesforce.com", c, store));
+    expect(sfRefreshes).toBe(1);
+  });
 
+  it("salesforce refuses any other org, even under the claimed suffix, before minting a token", async () => {
+    const c = cred(
+      { clientId: "sfid", clientSecret: "sfsec", refreshToken: "sf_rt", instanceUrl: "https://acme.my.salesforce.com" },
+      "salesforce",
+    );
+    const ctx = ctxFor("attacker.my.salesforce.com", c, store);
+    await expect(salesforce.inject(ctx)).rejects.toThrow(/bound to acme\.my\.salesforce\.com/);
+    expect(ctx.headers.authorization).toBeUndefined();
+    expect(sfRefreshes).toBe(0);
+  });
 
+  it("salesforce refuses a credential without a valid instance URL", async () => {
+    for (const instanceUrl of ["", "https://evil.example", "http://acme.my.salesforce.com"]) {
+      const c = cred({ accessToken: "at", instanceUrl }, "salesforce");
+      await expect(salesforce.inject(ctxFor("acme.my.salesforce.com", c, store))).rejects.toThrow(
+        /no valid "instanceUrl"/,
+      );
+    }
+  });
 
+  it("salesforce validates instance URLs strictly", () => {
+    expect(salesforceInstanceHost("https://acme.my.salesforce.com")).toBe("acme.my.salesforce.com");
+    expect(salesforceInstanceHost("https://ACME.my.salesforce.com/")).toBe("acme.my.salesforce.com");
+    expect(salesforceInstanceHost("https://acme--dev.sandbox.my.salesforce.com")).toBe(
+      "acme--dev.sandbox.my.salesforce.com",
+    );
+    for (const bad of [
+      undefined,
+      "",
+      "not a url",
+      "acme.my.salesforce.com",
+      "http://acme.my.salesforce.com",
+      "https://acme.my.salesforce.com:8443",
+      "https://user:pw@acme.my.salesforce.com",
+      "https://acme.my.salesforce.com/services",
+      "https://acme.my.salesforce.com/?x=1",
+      "https://acme.my.salesforce.com/#x",
+      "https://my.salesforce.com",
+      "https://acme.my.salesforce.com.evil.example",
+      "https://acme.salesforce.com",
+    ]) {
+      expect(salesforceInstanceHost(bad), String(bad)).toBeNull();
+    }
+  });
 
+  it("salesforce summarizes the instance URL for discovery", () => {
+    expect(salesforce.accountSummary!(cred({ instanceUrl: "https://acme.my.salesforce.com" }))).toEqual({
+      instanceUrl: "https://acme.my.salesforce.com",
+      apiBaseUrl: "https://acme.my.salesforce.com/services/data",
+    });
+    expect(salesforce.accountSummary!(cred({}))).toEqual({ instanceUrl: null, apiBaseUrl: null });
+  });
 
   it("microsoft refreshes against the token endpoint and persists the rotated refresh token", async () => {
     const c = store.setCredential("microsoft", "Microsoft 365 OAuth", {
@@ -338,3 +422,120 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   });
 });
 
+describe("OAuth callback persists Salesforce's instance_url (admin app, stub token endpoint)", () => {
+  let dir: string;
+  let store: Store;
+  let server: http.Server;
+  let tokenServer: http.Server;
+  let port: number;
+  let adminToken: string;
+  let tokenBody: Record<string, unknown>;
+
+  function request(
+    method: string,
+    path: string,
+    body?: unknown,
+    auth = true,
+  ): Promise<{ status: number; text: string }> {
+    return new Promise((resolve, reject) => {
+      const payload = body === undefined ? null : JSON.stringify(body);
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          method,
+          path,
+          agent: false,
+          headers: {
+            ...(payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : {}),
+            ...(auth ? { authorization: `Bearer ${adminToken}` } : {}),
+          },
+        },
+        (res) => {
+          let text = "";
+          res.on("data", (c) => (text += c));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+        },
+      );
+      req.on("error", reject);
+      if (payload) req.write(payload);
+      req.end();
+    });
+  }
+
+  async function connect(): Promise<{ status: number; text: string }> {
+    const start = await request("POST", "/api/integrations/salesforce/oauth/start", {
+      clientId: "sfid",
+      clientSecret: "sfsec",
+      redirectBase: `http://127.0.0.1:${port}`,
+    });
+    expect(start.status).toBe(200);
+    const url = new URL(JSON.parse(start.text).url);
+    expect(url.searchParams.get("scope")).toBe("api refresh_token");
+    const state = url.searchParams.get("state");
+    return request("GET", `/oauth/salesforce/callback?state=${state}&code=c1`, undefined, false);
+  }
+
+  beforeAll(async () => {
+    tokenServer = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(tokenBody));
+      });
+    });
+    await new Promise<void>((r) => tokenServer.listen(0, "127.0.0.1", r));
+    const tport = (tokenServer.address() as { port: number }).port;
+    process.env.ONEGATE_OAUTH_TOKEN_URL_SALESFORCE = `http://127.0.0.1:${tport}/token`;
+    process.env.ONEGATE_OAUTH_AUTH_URL_SALESFORCE = `http://127.0.0.1:${tport}/authorize`;
+
+    dir = mkdtempSync(join(tmpdir(), "onegate-b8-"));
+    store = new Store(":memory:");
+    const ca = initCa(dir);
+    const registry = await buildRegistry();
+    adminToken = ensureAdminToken(store)!;
+    server = http.createServer(createAdminApp({ store, registry, ca, version: "test" }));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    port = (server.address() as { port: number }).port;
+  });
+
+  afterAll(() => {
+    server.close();
+    tokenServer.close();
+    delete process.env.ONEGATE_OAUTH_TOKEN_URL_SALESFORCE;
+    delete process.env.ONEGATE_OAUTH_AUTH_URL_SALESFORCE;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("stores instanceUrl and a short assumed expiry from a response without expires_in", async () => {
+    tokenBody = {
+      access_token: "sf_at",
+      refresh_token: "sf_rt",
+      instance_url: "https://acme.my.salesforce.com",
+      id: "https://login.salesforce.com/id/00D/005",
+      token_type: "Bearer",
+      scope: "api refresh_token",
+    };
+    const before = Math.floor(Date.now() / 1000);
+    const cb = await connect();
+    expect(cb.status).toBe(200);
+    const data = store.getCredential("salesforce")!.data;
+    expect(data.instanceUrl).toBe("https://acme.my.salesforce.com");
+    expect(data.accessToken).toBe("sf_at");
+    expect(data.refreshToken).toBe("sf_rt");
+    // Unmapped extras are not stored.
+    expect(data.id).toBeUndefined();
+    const exp = Number(data.expiresAt);
+    expect(exp).toBeGreaterThanOrEqual(before + 600);
+    expect(exp).toBeLessThanOrEqual(before + 602);
+  });
+
+  it("ignores a non-string instance_url instead of storing junk", async () => {
+    tokenBody = { access_token: "sf_at2", refresh_token: "sf_rt2", instance_url: 42 };
+    const cb = await connect();
+    expect(cb.status).toBe(200);
+    const data = store.getCredential("salesforce")!.data;
+    expect(data.accessToken).toBe("sf_at2");
+    expect(data.instanceUrl).toBeUndefined();
+  });
+});
