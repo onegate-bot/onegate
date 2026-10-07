@@ -48,6 +48,16 @@ import { jfrogArtifactory } from "./jfrog-artifactory.js";
 import { githubApp } from "./github-app.js";
 import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
+import { hubspot } from "./hubspot.js";
+import { salesforce } from "./salesforce.js";
+import { sentry } from "./sentry.js";
+import { datadog } from "./datadog.js";
+import { posthog } from "./posthog.js";
+import { microsoft } from "./microsoft.js";
+import { zoom } from "./zoom.js";
+import { attio } from "./attio.js";
+import { airtable } from "./airtable.js";
+import { asana } from "./asana.js";
 
 /**
  * Built-ins. Array order does NOT decide which integration owns a host:
@@ -107,6 +117,16 @@ const BUILTINS: Integration[] = [
   githubApp,
   elevenlabs,
   make,
+  hubspot,
+  salesforce,
+  sentry,
+  datadog,
+  posthog,
+  microsoft,
+  zoom,
+  attio,
+  airtable,
+  asana,
 ];
 
 /**

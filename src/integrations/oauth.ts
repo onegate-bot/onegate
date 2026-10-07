@@ -72,6 +72,8 @@ export interface TokenResponse {
   scope?: string;
   error?: string;
   error_description?: string;
+  /** Provider-specific extras (Salesforce instance_url), see persistTokenFields. */
+  [extra: string]: unknown;
 }
 
 function tokenRequest(
@@ -137,10 +139,107 @@ export async function exchangeCode(
   return parseTokenResponse(res, "Token exchange");
 }
 
+/**
+ * Credential data keys the engine itself owns. persistTokenFields may never
+ * write these, so a provider response cannot clobber the client secret or the
+ * tokens through a mapping.
+ */
+const RESERVED_DATA_KEYS = new Set([
+  "clientId",
+  "clientSecret",
+  "accessToken",
+  "refreshToken",
+  "expiresAt",
+  "scopes",
+]);
+
+/**
+ * The descriptor's persistTokenFields applied to a token response: response
+ * key -> credential data key, string values only, reserved engine keys
+ * skipped. Used by both the code exchange and every refresh.
+ */
+export function pickTokenFields(
+  oauth: OAuthDescriptor,
+  tokens: TokenResponse,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [from, to] of Object.entries(oauth.persistTokenFields ?? {})) {
+    if (RESERVED_DATA_KEYS.has(to)) continue;
+    const v = tokens[from];
+    if (typeof v === "string" && v) out[to] = v;
+  }
+  return out;
+}
+
+/**
+ * Where a credential came from, decided by its id (connections are minted
+ * "conn_", legacy credentials "cr_"), never by what exists in the store now.
+ * A connection deleted mid-refresh must not fall through to the legacy
+ * credentials upsert: that would resurrect a revoked account's secrets as the
+ * tenant-wide credential every agent can use.
+ */
+function isConnectionBacked(cred: Credential): boolean {
+  return cred.id.startsWith("conn_");
+}
+
+/**
+ * The CURRENT stored data of the credential's origin row, or null when that
+ * row is gone (a deleted connection, or a legacy credential deleted or
+ * replaced by a different row).
+ */
+function currentOriginData(
+  store: Store,
+  integrationId: string,
+  cred: Credential,
+): Record<string, string> | null {
+  if (isConnectionBacked(cred)) return store.getConnection(cred.id)?.data ?? null;
+  const row = store.getCredential(integrationId);
+  return row && row.id === cred.id ? row.data : null;
+}
+
+/**
+ * Applies `delta` onto the origin row as it is NOW (so a concurrent admin edit
+ * of other fields is kept), writing only when something changes. Returns false,
+ * writing nothing, when the origin row no longer exists or its refresh token
+ * changed since this refresh started (a concurrent re-authorize or edit): the
+ * stale delta must not clobber the new account, and the caller must not cache
+ * a token minted for the old one.
+ */
+function applyCredentialDelta(
+  store: Store,
+  integrationId: string,
+  cred: Credential,
+  delta: Record<string, string>,
+): boolean {
+  const current = currentOriginData(store, integrationId, cred);
+  if (!current || current.refreshToken !== cred.data.refreshToken) return false;
+  if (Object.entries(delta).every(([k, v]) => current[k] === v)) return true;
+  const data = { ...current, ...delta };
+  // keepTokenCache: the caller caches the token it just minted right after.
+  if (isConnectionBacked(cred)) {
+    store.updateConnection(cred.id, { data }, { keepTokenCache: true });
+  } else {
+    store.setCredential(integrationId, cred.name, data, { keepTokenCache: true });
+  }
+  return true;
+}
+
+/** Order-independent equality of two credential data objects (null never matches). */
+function sameData(a: Record<string, string> | null, b: Record<string, string>): boolean {
+  if (!a) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
+}
+
 interface CachedToken {
   token: string;
   /** Epoch ms expiry. */
   exp: number;
+}
+
+interface RefreshResult extends CachedToken {
+  /** False when the credential's origin row was deleted during the refresh. */
+  live: boolean;
 }
 
 function cacheKey(integrationId: string, credId: string): string {
@@ -191,7 +290,7 @@ async function refreshAccessToken(
   oauth: OAuthDescriptor,
   cred: Credential,
   store: Store,
-): Promise<CachedToken> {
+): Promise<RefreshResult> {
   const { clientId, clientSecret, refreshToken } = cred.data;
   if (!clientId || !clientSecret || !refreshToken) {
     throw new Error(
@@ -207,20 +306,21 @@ async function refreshAccessToken(
   );
   const json = parseTokenResponse(res, `${integrationId} token refresh`);
   // Some providers rotate the refresh token on every use (GitLab). Persist
-  // the replacement or the next refresh would fail. A connection-backed
-  // credential (its id resolves to a connection row) is persisted on the
-  // connection; a legacy single credential keeps the credentials table.
+  // the replacement or the next refresh would fail. Mapped extras
+  // (persistTokenFields, e.g. Salesforce's instance_url) are refreshed the
+  // same way. Only this delta is applied, onto the origin row as it is now
+  // (connection row or legacy credential, chosen by the credential's id).
+  const delta = pickTokenFields(oauth, json);
   if (json.refresh_token && json.refresh_token !== refreshToken) {
-    const nextData = { ...cred.data, refreshToken: json.refresh_token };
-    if (store.getConnection(cred.id)) {
-      store.updateConnection(cred.id, { data: nextData });
-    } else {
-      store.setCredential(integrationId, cred.name, nextData);
-    }
+    delta.refreshToken = json.refresh_token;
   }
+  // A credential whose origin row vanished (revoked connection, deleted
+  // legacy credential) must not have its freshly minted token cached either.
+  const live = applyCredentialDelta(store, integrationId, cred, delta);
   return {
     token: json.access_token!,
-    exp: Date.now() + (json.expires_in ?? 3600) * 1000,
+    exp: Date.now() + (json.expires_in ?? oauth.defaultExpiresIn ?? 3600) * 1000,
+    live,
   };
 }
 
@@ -263,10 +363,11 @@ export async function oauthBearerToken(
     // miss and this point, in which case there is nothing to exchange.
     const raced = readCache(store, key);
     if (raced) return { token: raced, exp: Date.now() + EXPIRY_MARGIN_MS };
-    const minted = await refreshAccessToken(integration.id, oauth, cred, store);
+    const { live, ...minted } = await refreshAccessToken(integration.id, oauth, cred, store);
     // Persisted by the flight owner only, so a stale result from an earlier
-    // attempt can never overwrite a newer token.
-    store.setSecretSetting(key, minted);
+    // attempt can never overwrite a newer token. A credential deleted
+    // mid-refresh (revoked) is never cached.
+    if (live) store.setSecretSetting(key, minted);
     return minted;
   });
   return fresh.token;
@@ -275,13 +376,16 @@ export async function oauthBearerToken(
 /**
  * client_credentials grant (MongoDB Atlas service accounts). Client id and
  * secret ride in an HTTP Basic header, the minted token is cached in the
- * settings table.
+ * settings table. `fields` replaces the form body for providers with a
+ * variant grant (Zoom Server-to-Server: grant_type=account_credentials plus
+ * account_id).
  */
 export async function clientCredentialsToken(
   integrationId: string,
   tokenUrl: string,
   cred: Credential,
   store: Store,
+  fields: Record<string, string> = { grant_type: "client_credentials" },
 ): Promise<string> {
   const { clientId, clientSecret } = cred.data;
   if (!clientId || !clientSecret) {
@@ -292,15 +396,23 @@ export async function clientCredentialsToken(
   if (cached) return cached;
 
   const url = process.env[envKey(integrationId, "TOKEN")] ?? tokenUrl;
-  const res = await postForm(url, new URLSearchParams({ grant_type: "client_credentials" }), {
+  const res = await postForm(url, new URLSearchParams(fields), {
     accept: "application/json",
     authorization: "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
   });
-  const json = parseTokenResponse(res, `${integrationId} client_credentials grant`);
+  const json = parseTokenResponse(
+    res,
+    `${integrationId} ${fields.grant_type ?? "client_credentials"} grant`,
+  );
   const fresh: CachedToken = {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,
   };
-  store.setSecretSetting(key, fresh);
+  // Cache only if the row still exists with the exact data the grant used: a
+  // credential deleted (revoked) or edited (Zoom account switch, new secret)
+  // while the grant was in flight must not get the old inputs' token.
+  if (sameData(currentOriginData(store, integrationId, cred), cred.data)) {
+    store.setSecretSetting(key, fresh);
+  }
   return fresh.token;
 }

@@ -62,9 +62,9 @@ When an integration has **no named app connections**, behavior is byte-identical
 
 ### OAuth integrations hold multiple named connections too
 
-OAuth integrations (Google, GitLab, Dropbox and the rest of the `connect.method === "oauth"` set) are also multi-connection. Each named OAuth connection is a regular **app connection** (`kind="app"`, `vendor=<integrationId>`) whose `data` holds that account's `{ clientId, clientSecret, accessToken?, refreshToken?, expiresAt?, scopes? }`. It is created and updated by the **OAuth consent flow**, not by `POST /api/connections` directly (that route rejects an OAuth integration with `400 oauth_connection`, pointing you at the connect flow). On the Integrations page an OAuth card offers **Add connection** (runs the consent flow, optionally naming the connection and binding it to one agent) and, once any exist, **Manage connections**; the Connections page shows each named OAuth connection with **Re-authorize** (re-runs consent against the same connection, rotating its tokens in place), **Edit** and **Disconnect**.
+OAuth integrations (Google, GitLab, Dropbox and the rest of the `connect.method === "oauth"` set) are also multi-connection. Each named OAuth connection is a regular **app connection** (`kind="app"`, `vendor=<integrationId>`) whose `data` holds that account's `{ clientId, clientSecret, accessToken?, refreshToken?, expiresAt?, scopes? }`, plus any provider extras the descriptor maps with `persistTokenFields` (Salesforce stores `instanceUrl`). It is created and updated by the **OAuth consent flow**, not by `POST /api/connections` directly (that route rejects an OAuth integration with `400 oauth_connection`, pointing you at the connect flow). On the Integrations page an OAuth card offers **Add connection** (runs the consent flow, optionally naming the connection and binding it to one agent) and, once any exist, **Manage connections**; the Connections page shows each named OAuth connection with **Re-authorize** (re-runs consent against the same connection, rotating its tokens in place), **Edit** and **Disconnect**.
 
-Because a named OAuth connection is an ordinary app connection, it reuses everything above: default-deny grants, tenant-wide-vs-agent-bound scope, per-request `x-onegate-connection` selection, the masked secret preview, and the credential-picking order. The gateway refreshes its access token on demand and persists providers' rotating refresh tokens (such as GitLab's) onto the connection. A legacy single OAuth credential (one set before this feature) keeps working as the fallback when no named OAuth connection exists, and the OAuth card surfaces a **Disconnect legacy** affordance for it.
+Because a named OAuth connection is an ordinary app connection, it reuses everything above: default-deny grants, tenant-wide-vs-agent-bound scope, per-request `x-onegate-connection` selection, the masked secret preview, and the credential-picking order. The gateway refreshes its access token on demand and persists providers' rotating refresh tokens (such as GitLab's), and changed `persistTokenFields` extras, onto the connection. A legacy single OAuth credential (one set before this feature) keeps working as the fallback when no named OAuth connection exists, and the OAuth card surfaces a **Disconnect legacy** affordance for it.
 
 ## Installing a community integration
 
@@ -89,6 +89,12 @@ inject(ctx) {
 ```
 
 **OAuth refresh tokens.** Store the long-lived refresh token as the credential and mint short-lived access tokens on demand, cached in the settings table via `ctx.store`. See `src/integrations/google.ts` for the full pattern (cache key per credential, refresh when within a minute of expiry).
+
+**Provider extras in the token response.** Some providers return facts the gateway needs later alongside the tokens, such as Salesforce's per-org `instance_url`. List them in the descriptor's `persistTokenFields` (response key to credential data key, e.g. `{ instance_url: "instanceUrl" }`) and the OAuth callback stores the string values on the credential. Every refresh re-applies the mapping and persists a changed value the same way as a rotated refresh token. The engine's own keys (`clientId`, `clientSecret`, `accessToken`, `refreshToken`, `expiresAt`, `scopes`) are never overwritten. Providers whose token response carries no `expires_in` can set `defaultExpiresIn` (seconds, default 3600) so the engine refreshes before the real expiry. See `src/integrations/salesforce.ts`.
+
+**Connect-time validation.** `validateCredential(data)` *(optional)* runs after the generic `credentialFields` checks whenever a credential or app connection is saved (`PUT /api/credentials/:id`, `POST`/`PUT /api/connections`, the self-service paste wizard). Return a human-readable error string to reject the save with `400 invalid_data`, or `null` to accept. Use it for non-secret fields with a closed set of valid values, so a typo fails at connect time instead of at the first request. See `src/integrations/datadog.ts` (site) and `src/integrations/posthog.ts` (region).
+
+**Client-credentials variants.** `clientCredentialsToken` takes an optional form body for providers whose service-account grant is not plain `client_credentials` (Zoom Server-to-Server uses `grant_type=account_credentials` plus `account_id`). See `src/integrations/zoom.ts`.
 
 **URL-path credentials.** Some APIs carry the credential in the URL itself (Telegram puts the bot token in the path). `inject` may reassign `ctx.path` and the gateway forwards the rewritten path upstream. Policy evaluation and the audit log always use the original path the agent sent, so the real credential never shows up in rules or logs. See `src/integrations/telegram-bot.ts`. Request bodies can be read (`needsBody`, for payload signing) but not rewritten, an API that only accepts credentials inside the body cannot be injected by OneGate.
 
@@ -361,6 +367,81 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `/api/v1/chat/completions`, `/api/v1/completions`.
 - **LLM vendor:** routable like anthropic, openai and gemini. OpenRouter is an OpenAI-compatible aggregator at `https://openrouter.ai/api/v1`, so point the client's base URL there and use OpenRouter model ids (e.g. `anthropic/claude-3.5-sonnet`). Create the key at https://openrouter.ai/keys.
 - **Limitations:** none notable. Cap the key with a credit limit on the OpenRouter dashboard. The client may send `HTTP-Referer` and `X-Title` for attribution, OneGate forwards them unchanged.
+
+### sentry
+
+- **Credential:** an organization auth token (`sntrys_`) or personal user auth token (`sntryu_`), injected as `Bearer`.
+- **Hosts:** `sentry.io`, `us.sentry.io`, `de.sentry.io` (exact hosts only, so event ingestion on `*.ingest.sentry.io` keeps passing through untouched).
+- **Suggested policy:** `GET /api/0/organizations/<org>/issues/**` and `GET /api/0/projects/<org>/**` for triage, add `PUT /api/0/organizations/<org>/issues/**` to resolve or assign.
+- **Limitations:** sentry.io SaaS only. Self-hosted Sentry needs a community integration with the instance host.
+
+### hubspot
+
+- **Credential:** a private app (legacy app) access token (`pat-na1-...`, `pat-eu1-...`), injected as `Bearer`.
+- **Hosts:** `api.hubapi.com`.
+- **Suggested policy:** `GET /crm/v3/objects/**` plus `POST /crm/v3/objects/*/search` for read-only agents, add `POST`/`PATCH` on `/crm/v3/objects/**` for writers.
+- **Limitations:** private app tokens only. A public OAuth app flow is not implemented yet. Scopes are fixed on the private app, keep them narrow.
+
+### posthog
+
+- **Credential:** a personal API key (`phx_`), injected as `Bearer`, plus a required non-secret **Region** (`us` or `eu`). A missing or unknown region is rejected with `400 invalid_data` when the credential is saved.
+- **Hosts:** `us.posthog.com`, `eu.posthog.com`, `app.posthog.com`. The ingestion hosts (`us.i.posthog.com`, `eu.i.posthog.com`) take the public project key in the body and are not claimed.
+- **Suggested policy:** `GET /api/projects/<id>/**` plus `POST /api/projects/<id>/query/` for analytics agents.
+- **Discovery summary:** `region` and `apiBaseUrl` (for example `https://eu.posthog.com`), so the agent calls the host its key lives on. The Region also binds the key: requests to the other region's host (and to `app.posthog.com` for `eu`) are refused in the gateway. `app.posthog.com` is the legacy US host.
+- **Limitations:** PostHog Cloud only. Self-hosted instances need a community integration.
+
+### attio
+
+- **Credential:** a workspace API key (access token), injected as `Bearer`.
+- **Hosts:** `api.attio.com`.
+- **Suggested policy:** `GET /v2/**` plus `POST /v2/objects/*/records/query` for read-only agents.
+- **Limitations:** API key only (Attio's OAuth app flow is not implemented). Scope the key per area (records, lists, notes, tasks) at the vendor side.
+
+### airtable
+
+- **Credential:** a personal access token (`pat...`), injected as `Bearer`.
+- **Hosts:** `api.airtable.com`, `content.airtable.com` (attachment uploads).
+- **Suggested policy:** `GET /v0/<baseId>/**`, add `POST`/`PATCH` on the same glob for writers.
+- **Limitations:** none notable. Limit the token to specific bases and scopes when creating it.
+
+### asana
+
+- **Credential:** a personal access token, injected as `Bearer`.
+- **Hosts:** `app.asana.com`.
+- **Suggested policy:** `GET /api/1.0/**`, add `POST /api/1.0/tasks` and `PUT /api/1.0/tasks/*` for writers. The host also serves the web app, keep rules under `/api/1.0/`.
+- **Limitations:** a personal access token carries the user's full access in every workspace, so OneGate rules (or a dedicated Asana user) are the only narrowing.
+
+### datadog
+
+- **Credential:** an API key and an optional application key, injected as the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, plus a required non-secret **Site**: the `DD_SITE` value (e.g. `us5.datadoghq.com`), a site or API URL, or the short region name (`us1`, `us3`, `us5`, `eu`, `ap1`, `ap2`, `uk1`, `us1-fed`, `us2-fed`). A missing or unknown site is rejected with `400 invalid_data` when the credential is saved.
+- **Hosts:** `api.<site>` for every Datadog site: `api.datadoghq.com`, `api.us3.datadoghq.com`, `api.us5.datadoghq.com`, `api.datadoghq.eu`, `api.ap1.datadoghq.com`, `api.ap2.datadoghq.com`, `api.uk1.datadoghq.com`, `api.ddog-gov.com`, `api.us2.ddog-gov.com`. Intake hosts (logs, traces, RUM) are not claimed.
+- **Suggested policy:** `GET /api/v1/monitor/**`, `GET /api/v1/query`, `POST /api/v2/logs/events/search` for observability agents.
+- **Discovery summary:** `site` and `apiBaseUrl`. The keys are bound to that site's API host, other regions are refused in the gateway.
+- **Limitations:** scope the application key (or use a service account's key) at the vendor side, the API key alone can submit data.
+
+### zoom
+
+- **Credential:** a Server-to-Server OAuth app: Account ID, Client ID and Client secret. OneGate mints one-hour tokens with the `account_credentials` grant at request time (cached) and injects `Bearer`. Nothing is exchanged at connect time.
+- **Hosts:** `api.zoom.us`.
+- **Suggested policy:** `GET /v2/users/*/meetings` and `GET /v2/meetings/**` for read-only agents, add `POST /v2/users/*/meetings` to schedule.
+- **Discovery summary:** `accountId`.
+- **Limitations:** Server-to-Server apps act account-wide (no `/users/me`), scopes live on the app. User-level OAuth (a General app) is not implemented yet.
+
+### microsoft
+
+- **Credential:** a bring-your-own Microsoft Entra app registration (Application ID + client secret). The connect flow runs consent on the `common` endpoint (work, school and personal accounts) with `offline_access`, OneGate stores the refresh token, persists Microsoft's rotated refresh tokens and injects short-lived access tokens as `Bearer`.
+- **Hosts:** `graph.microsoft.com`.
+- **Scope picker:** Outlook mail (`Mail.ReadWrite`, `Mail.Send`), Outlook calendar (`Calendars.ReadWrite`), OneDrive (`Files.ReadWrite`) and OneNote (`Notes.ReadWrite`). Every pack also requests `offline_access` and `User.Read`.
+- **Suggested policy:** per product with path globs: `/v1.0/me/messages/**` and `POST /v1.0/me/sendMail` (mail), `/v1.0/me/events/**` and `/v1.0/me/calendarView` (calendar), `/v1.0/me/drive/**` (OneDrive), `/v1.0/me/onenote/**` (OneNote).
+- **Limitations:** the app registration must support "Accounts in any organizational directory and personal Microsoft accounts". OneGate uses the `common` endpoints, so a single-tenant app fails at consent with AADSTS50194 (per-credential tenant endpoints are a follow-up). One consent covers every selected product, per-product permissioning is path globs. Work or school tenants may need admin consent. Client secrets expire, reconnect with a new one.
+
+### salesforce
+
+- **Credential:** a bring-your-own External Client App (or Connected App) consumer key and secret. The connect flow (login.salesforce.com) stores the refresh token and the org's `instance_url` as `instanceUrl`. Access tokens are refreshed at request time and injected as `Bearer`.
+- **Hosts:** `.my.salesforce.com` (any My Domain), but each credential is **bound to its own instance host**: a request to any other org under the suffix is refused before a token is minted. Anyone can register a My Domain, so the binding, not the claim, is what keeps the token in its org.
+- **Suggested policy:** `GET /services/data/*/query/**` and `GET /services/data/*/sobjects/**` for read-only agents, add `POST`/`PATCH` on `/services/data/*/sobjects/**` for writers.
+- **Discovery summary:** `instanceUrl` and `apiBaseUrl` (`<instanceUrl>/services/data`).
+- **Limitations:** production and Developer Edition orgs only (sandboxes log in at test.salesforce.com, not supported yet). OneGate sends no PKCE challenge, so untick "Require PKCE" on the app. Salesforce returns no `expires_in`, OneGate assumes ten minutes and refreshes early (session timeouts go down to 15 minutes).
 
 ### typesafe
 

@@ -3,6 +3,7 @@ import http from "node:http";
 import {
   buildAuthUrl,
   exchangeCode,
+  pickTokenFields,
   oauthBearerToken,
   clientCredentialsToken,
 } from "../src/integrations/oauth.js";
@@ -75,6 +76,37 @@ describe("buildAuthUrl", () => {
     expect(u.searchParams.get("return_url")).toBe(params.redirectUri);
     expect(u.searchParams.get("response_type")).toBe("token");
     expect(u.searchParams.get("callback_method")).toBe("fragment");
+  });
+});
+
+describe("pickTokenFields", () => {
+  it("maps string extras and skips reserved keys, empties and non-strings", () => {
+    const oauth: OAuthDescriptor = {
+      ...base,
+      persistTokenFields: {
+        instance_url: "instanceUrl",
+        a: "accessToken",
+        r: "refreshToken",
+        e: "expiresAt",
+        s: "scopes",
+        id: "clientId",
+        n: "num",
+        z: "empty",
+      },
+    };
+    expect(
+      pickTokenFields(oauth, {
+        instance_url: "https://x.example",
+        a: "1",
+        r: "2",
+        e: "3",
+        s: "4",
+        id: "5",
+        n: 7,
+        z: "",
+      }),
+    ).toEqual({ instanceUrl: "https://x.example" });
+    expect(pickTokenFields(base, { instance_url: "x" })).toEqual({});
   });
 });
 
@@ -219,7 +251,7 @@ describe("token endpoint flows", () => {
         return { status: 200, body: { access_token: `at_${calls}`, expires_in: 3600 } };
       };
       const stale = String(Math.floor(Date.now() / 1000) - 10);
-      const c = cred({
+      const c = store.setCredential("testx", "t", {
         clientId: "cid",
         clientSecret: "cs",
         accessToken: "old",
@@ -236,10 +268,162 @@ describe("token endpoint flows", () => {
         status: 200,
         body: { access_token: "at_new", refresh_token: "rt_rotated", expires_in: 7200 },
       });
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
       await oauthBearerToken(integ(), c, store);
       const saved = store.getCredential("testx");
       expect(saved?.data.refreshToken).toBe("rt_rotated");
+      expect(store.getSecretSetting<{ token: string }>(`oauth_access_token:testx:${c.id}`)!.token).toBe("at_new");
+    });
+
+    it("assumes the descriptor's default lifetime when expires_in is absent (Salesforce style)", async () => {
+      respond = () => ({ status: 200, body: { access_token: "no_exp" } });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      expect(await oauthBearerToken(integ({ defaultExpiresIn: 600 }), c, store)).toBe("no_exp");
+      const cached = store.getSecretSetting<{ exp: number }>(`oauth_access_token:testx:${c.id}`)!;
+      expect(cached.exp - Date.now()).toBeLessThanOrEqual(600_000);
+      expect(cached.exp - Date.now()).toBeGreaterThan(590_000);
+    });
+
+    it("falls back to an hour when neither expires_in nor a default is given", async () => {
+      respond = () => ({ status: 200, body: { access_token: "no_exp" } });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      await oauthBearerToken(integ(), c, store);
+      const cached = store.getSecretSetting<{ exp: number }>(`oauth_access_token:testx:${c.id}`)!;
+      expect(cached.exp - Date.now()).toBeGreaterThan(3_590_000);
+    });
+
+    it("re-applies persistTokenFields on refresh but never overwrites reserved keys", async () => {
+      respond = () => ({
+        status: 200,
+        body: { access_token: "at_x", instance_url: "https://new.example", evil: "pwned" },
+      });
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt",
+        instanceUrl: "https://old.example",
+      });
+      await oauthBearerToken(
+        integ({ persistTokenFields: { instance_url: "instanceUrl", evil: "clientSecret" } }),
+        c,
+        store,
+      );
+      const saved = store.getCredential("testx")!.data;
+      expect(saved.instanceUrl).toBe("https://new.example");
+      expect(saved.clientSecret).toBe("cs");
+    });
+
+    it("does not cache the token of a legacy credential deleted mid-refresh", async () => {
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      respond = () => {
+        store.deleteCredential("testx");
+        return { status: 200, body: { access_token: "at_deleted", refresh_token: "rt2", expires_in: 3600 } };
+      };
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getCredential("testx")).toBeNull();
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+    });
+
+    it("deleteCredential purges the credential's cached access token", async () => {
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      respond = () => ({ status: 200, body: { access_token: "at_live", expires_in: 3600 } });
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).not.toBeNull();
+      store.deleteCredential("testx");
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+      store.deleteCredential("testx"); // no row: a no-op
+    });
+
+    it("never resurrects a deleted legacy credential from a refresh", async () => {
+      respond = () => ({ status: 200, body: { access_token: "at_x", refresh_token: "rt_rotated" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getCredential("testx")).toBeNull();
+    });
+
+    it("applies only the refresh delta onto the row as it is now (concurrent edit kept)", async () => {
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt",
+        instanceUrl: "https://old.example",
+      });
+      respond = () => {
+        // An admin edit lands while the token request is in flight.
+        store.setCredential("testx", "t", { ...c.data, clientSecret: "cs_rotated_by_admin" });
+        return { status: 200, body: { access_token: "at_x", refresh_token: "rt2", instance_url: "https://new.example" } };
+      };
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")!.data).toEqual({
+        clientId: "cid",
+        clientSecret: "cs_rotated_by_admin",
+        refreshToken: "rt2",
+        instanceUrl: "https://new.example",
+      });
+    });
+
+    it("drops a stale refresh when the refresh token was replaced mid-flight (re-authorize)", async () => {
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt_old_account",
+        instanceUrl: "https://old.example",
+      });
+      respond = () => {
+        // A re-authorize to another account lands while the refresh is in flight.
+        store.setCredential("testx", "t", {
+          clientId: "cid",
+          clientSecret: "cs",
+          refreshToken: "rt_new_account",
+          instanceUrl: "https://new-account.example",
+        });
+        return { status: 200, body: { access_token: "at_old", refresh_token: "rt_old_rotated", instance_url: "https://old.example" } };
+      };
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")!.data.refreshToken).toBe("rt_new_account");
+      expect(store.getCredential("testx")!.data.instanceUrl).toBe("https://new-account.example");
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+    });
+
+    it("never resurrects a connection deleted mid-refresh, and does not cache its token", async () => {
+      const conn = store.createConnection({
+        kind: "app",
+        vendor: "testx",
+        name: "work",
+        data: { clientId: "cid", clientSecret: "cs", refreshToken: "rt" },
+      });
+      respond = () => {
+        store.deleteConnection(conn.id);
+        return { status: 200, body: { access_token: "at_revoked", refresh_token: "rt_rotated", expires_in: 3600 } };
+      };
+      const c: Credential = { id: conn.id, integrationId: "testx", name: conn.name, data: { ...conn.data }, createdAt: "" };
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getConnection(conn.id)).toBeNull();
+      expect(store.getCredential("testx")).toBeNull();
+      expect(store.getSecretSetting(`oauth_access_token:testx:${conn.id}`)).toBeNull();
+    });
+
+    it("persists the delta onto a live connection", async () => {
+      const conn = store.createConnection({
+        kind: "app",
+        vendor: "testx",
+        name: "work",
+        data: { clientId: "cid", clientSecret: "cs", refreshToken: "rt" },
+      });
+      respond = () => ({ status: 200, body: { access_token: "at_c", refresh_token: "rt_c2", expires_in: 3600 } });
+      const c: Credential = { id: conn.id, integrationId: "testx", name: conn.name, data: { ...conn.data }, createdAt: "" };
+      expect(await oauthBearerToken(integ(), c, store)).toBe("at_c");
+      expect(store.getConnection(conn.id)!.data.refreshToken).toBe("rt_c2");
+      // Writing the rotated refresh token must not purge the token just minted.
+      expect(store.getSecretSetting<{ token: string }>(`oauth_access_token:testx:${conn.id}`)!.token).toBe("at_c");
+      expect(store.getCredential("testx")).toBeNull();
+    });
+
+    it("does not rewrite the credential when nothing changed", async () => {
+      respond = () => ({ status: 200, body: { access_token: "at_x", instance_url: "https://same.example" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt", instanceUrl: "https://same.example" });
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")).toBeNull();
     });
 
     it("surfaces refresh failures", async () => {
@@ -269,7 +453,7 @@ describe("token endpoint flows", () => {
           },
         };
       };
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
 
       const first = oauthBearerToken(integ(), c, store);
       const second = oauthBearerToken(integ(), c, store);
@@ -308,10 +492,36 @@ describe("token endpoint flows", () => {
         return { status: 200, body: { access_token: "cc_at", expires_in: 3600 } };
       };
       const store = new Store(":memory:");
-      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      const c = store.setCredential("testx", "t", { clientId: "svc_id", clientSecret: "svc_secret" });
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(calls).toBe(1);
+    });
+
+    it("sends a caller-supplied grant body (Zoom account_credentials style)", async () => {
+      respond = (req) => {
+        const form = new URLSearchParams(req.body);
+        expect(form.get("grant_type")).toBe("account_credentials");
+        expect(form.get("account_id")).toBe("acct");
+        return { status: 200, body: { access_token: "acct_at", expires_in: 3600 } };
+      };
+      const store = new Store(":memory:");
+      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      expect(
+        await clientCredentialsToken("testx", url, c, store, {
+          grant_type: "account_credentials",
+          account_id: "acct",
+        }),
+      ).toBe("acct_at");
+    });
+
+    it("labels errors client_credentials when the body has no grant_type", async () => {
+      respond = () => ({ status: 401, body: { error: "invalid_client" } });
+      const store = new Store(":memory:");
+      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      await expect(
+        clientCredentialsToken("testx", url, c, store, { audience: "x" }),
+      ).rejects.toThrow(/testx client_credentials grant failed \(401\)/);
     });
 
     it("requires both client id and secret", async () => {

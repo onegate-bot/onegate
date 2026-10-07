@@ -145,7 +145,7 @@ describe("google integration", () => {
   });
 
   const goodCred = () =>
-    cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt_1" }, "google");
+    store.setCredential("google", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt_1" });
 
   it("refreshes once and then serves from cache", async () => {
     const c = goodCred();
@@ -810,7 +810,7 @@ describe("batch 4 integrations (gitlab, confluence, dropbox, cloudflare)", () =>
   });
 
   it("gitlab refreshes through the descriptor token endpoint and caches", async () => {
-    const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" }, "gitlab");
+    const c = store.setCredential("gitlab", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
     const ctx1 = ctxFor("gitlab.com", c, store);
     ctx1.path = "/api/v4/user";
     await gitlab.inject(ctx1);
@@ -1192,7 +1192,7 @@ describe("batch 7 integrations (mongodb-atlas, docker, jfrog, github-app)", () =
   });
 
   it("mongodb-atlas mints a client_credentials token, injects Bearer and caches", async () => {
-    const c = cred({ clientId: "aid", clientSecret: "asecret" }, "mongodb-atlas");
+    const c = store.setCredential("mongodb-atlas", "t", { clientId: "aid", clientSecret: "asecret" });
     const ctx1 = ctxFor("cloud.mongodb.com", c, store);
     await mongodbAtlas.inject(ctx1);
     const ctx2 = ctxFor("cloud.mongodb.com", c, store);

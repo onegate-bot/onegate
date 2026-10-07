@@ -93,6 +93,23 @@ export interface OAuthDescriptor {
    * parameter for the server.
    */
   fragmentCallback?: { paramName: string };
+  /**
+   * Extra token-response fields to keep on the stored credential, mapped
+   * response key -> credential data key (Salesforce: { instance_url:
+   * "instanceUrl" }). Applied at the code exchange AND on every refresh, a
+   * changed value is persisted through the same path as a rotated refresh
+   * token (connection row or legacy credential). Only non-empty string values
+   * are kept, and the engine's own keys (clientId, clientSecret, accessToken,
+   * refreshToken, expiresAt, scopes) are never overwritten. Do not map
+   * secret-bearing fields.
+   */
+  persistTokenFields?: Record<string, string>;
+  /**
+   * Access-token lifetime in seconds assumed when the token response carries
+   * no expires_in. Default 3600. Salesforce omits expires_in and an org admin
+   * may set sessions as short as 15 minutes, so it assumes less.
+   */
+  defaultExpiresIn?: number;
 }
 
 /**
@@ -252,6 +269,13 @@ export interface Integration {
    * returned object MUST NOT contain any secret material (tokens, passwords).
    */
   accountSummary?(cred: Credential): Record<string, string | null>;
+  /**
+   * Optional connect-time check of the credential data, run after the generic
+   * credentialFields validation when a credential or app connection is saved.
+   * Returns a human-readable error (the save fails with 400) or null. Use it
+   * for non-secret fields with a closed set of valid values (Datadog site).
+   */
+  validateCredential?(data: Record<string, string>): string | null;
   /** Mutates ctx.headers to carry real credentials. May be async (OAuth refresh). */
   inject(ctx: InjectionContext): void | Promise<void>;
 }

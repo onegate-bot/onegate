@@ -16,7 +16,7 @@ import type { Connection, OnboardingLink, LlmStrategy } from "../types.js";
 import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry } from "../integrations/types.js";
 import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
-import { buildAuthUrl, exchangeCode } from "../integrations/oauth.js";
+import { buildAuthUrl, exchangeCode, pickTokenFields } from "../integrations/oauth.js";
 import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
@@ -324,6 +324,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     data: Record<string, string>,
   ): string | null {
     if (pending.connectionId) {
+      // Replacing the data purges the cached access token (Store), so a
+      // re-authorize to another account never serves the old consent's token.
       store.updateConnection(pending.connectionId, { data });
       return pending.connectionId;
     }
@@ -561,9 +563,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         accessToken: tokens.access_token!,
       };
       if (tokens.refresh_token) data.refreshToken = tokens.refresh_token;
-      if (tokens.expires_in) {
-        data.expiresAt = String(Math.floor(Date.now() / 1000) + tokens.expires_in);
+      const lifetime = tokens.expires_in ?? oauth.defaultExpiresIn;
+      if (lifetime) {
+        data.expiresAt = String(Math.floor(Date.now() / 1000) + lifetime);
       }
+      Object.assign(data, pickTokenFields(oauth, tokens));
       const grantedScopes = tokens.scope ?? pending.scopes.join(" ");
       if (grantedScopes) data.scopes = grantedScopes;
       const connId = persistOauthResult(integration, pending, data);
@@ -1324,6 +1328,16 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "data_required" });
       return;
     }
+    const nonString = Object.entries(data as Record<string, unknown>).find(([, v]) => typeof v !== "string");
+    if (nonString) {
+      res.status(400).json({ error: "invalid_data", message: `data.${nonString[0]} must be a string` });
+      return;
+    }
+    const invalid = registry.get(integrationId)!.validateCredential?.(data as Record<string, string>);
+    if (invalid) {
+      res.status(400).json({ error: "invalid_data", message: invalid });
+      return;
+    }
     const cred = store.setCredential(integrationId, name ?? integrationId, data);
     res.json({ id: cred.id, integrationId, name: cred.name });
   });
@@ -1503,7 +1517,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     if (fields.length > 0 && Object.values(d).every((v) => !v)) {
       return "data must carry at least one non-empty value";
     }
-    return null;
+    return integration.validateCredential?.(d as Record<string, string>) ?? null;
   }
 
   /**
