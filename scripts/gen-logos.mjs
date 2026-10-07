@@ -20,6 +20,7 @@ const SLUGS = {
   youtube: "youtube",
   hubspot: "hubspot",
   sentry: "sentry",
+  datadog: "datadog",
   posthog: "posthog",
   airtable: "airtable",
   asana: "asana",

@@ -18,6 +18,7 @@ import { buildAuthUrl } from "../src/integrations/oauth.js";
 import type { Integration } from "../src/integrations/types.js";
 import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
+import { datadog, normalizeDatadogSite, DATADOG_SITES } from "../src/integrations/datadog.js";
 import { posthog } from "../src/integrations/posthog.js";
 import { attio } from "../src/integrations/attio.js";
 import { airtable } from "../src/integrations/airtable.js";
@@ -39,6 +40,7 @@ function ctxFor(host: string, credential: Credential, store: Store, headers: Inc
 const BATCH: Integration[] = [
   hubspot,
   sentry,
+  datadog,
   posthog,
   attio,
   airtable,
@@ -53,6 +55,12 @@ describe("batch 8 registry claims", () => {
       "sentry.io": "sentry",
       "us.sentry.io": "sentry",
       "de.sentry.io": "sentry",
+      "api.datadoghq.com": "datadog",
+      "api.us3.datadoghq.com": "datadog",
+      "api.us5.datadoghq.com": "datadog",
+      "api.datadoghq.eu": "datadog",
+      "api.ap1.datadoghq.com": "datadog",
+      "api.ddog-gov.com": "datadog",
       "us.posthog.com": "posthog",
       "eu.posthog.com": "posthog",
       "app.posthog.com": "posthog",
@@ -135,4 +143,64 @@ describe("batch 8 static token integrations", () => {
   });
 });
 
+describe("datadog integration", () => {
+  const store = new Store(":memory:");
+
+  it("injects DD-API-KEY and DD-APPLICATION-KEY over agent placeholders", () => {
+    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi", appKey: "ddapp" }), store, {
+      "dd-api-key": "placeholder",
+      "dd-application-key": "placeholder",
+    });
+    datadog.inject(ctx);
+    expect(ctx.headers["dd-api-key"]).toBe("ddapi");
+    expect(ctx.headers["dd-application-key"]).toBe("ddapp");
+  });
+
+  it("drops an agent-sent application key placeholder when none is stored", () => {
+    const ctx = ctxFor("api.datadoghq.com", cred({ apiKey: "ddapi" }), store, {
+      "dd-application-key": "placeholder",
+    });
+    datadog.inject(ctx);
+    expect(ctx.headers["dd-api-key"]).toBe("ddapi");
+    expect(ctx.headers["dd-application-key"]).toBeUndefined();
+  });
+
+  it("binds the keys to the configured site's API host", () => {
+    const c = cred({ apiKey: "ddapi", appKey: "ddapp", site: "us5.datadoghq.com" });
+    const ok = ctxFor("api.us5.datadoghq.com", c, store);
+    datadog.inject(ok);
+    expect(ok.headers["dd-api-key"]).toBe("ddapi");
+    const other = ctxFor("api.datadoghq.eu", c, store);
+    expect(() => datadog.inject(other)).toThrow(/bound to api\.us5\.datadoghq\.com/);
+    expect(other.headers["dd-api-key"]).toBeUndefined();
+  });
+
+  it("rejects an unknown site and a missing API key", () => {
+    expect(() =>
+      datadog.inject(ctxFor("api.datadoghq.com", cred({ apiKey: "k", site: "evil.example" }), store)),
+    ).toThrow(/unknown site/);
+    expect(() => datadog.inject(ctxFor("api.datadoghq.com", cred({ appKey: "x" }), store))).toThrow(/apiKey/);
+  });
+
+  it("normalizes pasted sites and URLs", () => {
+    expect(normalizeDatadogSite("")).toBeNull();
+    expect(normalizeDatadogSite(undefined)).toBeNull();
+    expect(normalizeDatadogSite("US3.datadoghq.com")).toBe("us3.datadoghq.com");
+    expect(normalizeDatadogSite("https://app.datadoghq.eu/dashboard")).toBe("datadoghq.eu");
+    expect(normalizeDatadogSite("https://api.ap1.datadoghq.com")).toBe("ap1.datadoghq.com");
+    expect(normalizeDatadogSite("datadoghq.com.evil.example")).toBeUndefined();
+  });
+
+  it("claims exactly one API host per site", () => {
+    expect(datadog.hosts).toEqual(DATADOG_SITES.map((s) => `api.${s}`));
+  });
+
+  it("summarizes the site for discovery", () => {
+    expect(datadog.accountSummary!(cred({ apiKey: "k", site: "datadoghq.eu" }))).toEqual({
+      site: "datadoghq.eu",
+      apiBaseUrl: "https://api.datadoghq.eu",
+    });
+    expect(datadog.accountSummary!(cred({ apiKey: "k", site: "nope" }))).toEqual({ site: null, apiBaseUrl: null });
+  });
+});
 

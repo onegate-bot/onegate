@@ -409,3 +409,11 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `GET /api/1.0/**`, add `POST /api/1.0/tasks` and `PUT /api/1.0/tasks/*` for writers. The host also serves the web app, keep rules under `/api/1.0/`.
 - **Limitations:** a personal access token carries the user's full access in every workspace, so OneGate rules (or a dedicated Asana user) are the only narrowing.
 
+### datadog
+
+- **Credential:** an API key and an optional application key, injected as the `DD-API-KEY` and `DD-APPLICATION-KEY` headers, plus an optional non-secret **Site** (the `DD_SITE` value, e.g. `us5.datadoghq.com`).
+- **Hosts:** `api.<site>` for every Datadog site: `api.datadoghq.com`, `api.us3.datadoghq.com`, `api.us5.datadoghq.com`, `api.datadoghq.eu`, `api.ap1.datadoghq.com`, `api.ap2.datadoghq.com`, `api.uk1.datadoghq.com`, `api.ddog-gov.com`, `api.us2.ddog-gov.com`. Intake hosts (logs, traces, RUM) are not claimed.
+- **Suggested policy:** `GET /api/v1/monitor/**`, `GET /api/v1/query`, `POST /api/v2/logs/events/search` for observability agents.
+- **Discovery summary:** `site` and `apiBaseUrl`. When Site is set the keys are bound to that site's API host, other regions are refused in the gateway.
+- **Limitations:** scope the application key (or use a service account's key) at the vendor side, the API key alone can submit data.
+

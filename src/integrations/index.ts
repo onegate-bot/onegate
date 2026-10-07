@@ -49,6 +49,7 @@ import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
 import { hubspot } from "./hubspot.js";
 import { sentry } from "./sentry.js";
+import { datadog } from "./datadog.js";
 import { posthog } from "./posthog.js";
 import { attio } from "./attio.js";
 import { airtable } from "./airtable.js";
@@ -113,6 +114,7 @@ const BUILTINS: Integration[] = [
   make,
   hubspot,
   sentry,
+  datadog,
   posthog,
   attio,
   airtable,

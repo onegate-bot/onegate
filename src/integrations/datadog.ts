@@ -1,0 +1,89 @@
+/**
+ * Datadog API and application keys, injected as the DD-API-KEY and
+ * DD-APPLICATION-KEY headers. Keys belong to one Datadog site (region), and
+ * every site has its own API host, so the integration claims each site's
+ * api.<site> host exactly. Intake hosts (logs, traces, RUM) are not claimed:
+ * a Datadog agent or SDK running next to the AI agent keeps its own key and
+ * passes through untouched.
+ *
+ * The optional "site" field (the DD_SITE value, e.g. us5.datadoghq.com) is
+ * reported to the agent through discovery and binds the keys to that site's
+ * API host, so a request aimed at another region fails fast in OneGate.
+ */
+
+import type { Credential } from "../types.js";
+import type { Integration, InjectionContext } from "./types.js";
+
+/** Every Datadog site, as the DD_SITE value. The API host is "api." + site. */
+export const DATADOG_SITES = [
+  "datadoghq.com",
+  "us3.datadoghq.com",
+  "us5.datadoghq.com",
+  "datadoghq.eu",
+  "ap1.datadoghq.com",
+  "ap2.datadoghq.com",
+  "uk1.datadoghq.com",
+  "ddog-gov.com",
+  "us2.ddog-gov.com",
+] as const;
+
+/**
+ * Normalizes a pasted site to a known DD_SITE value. Accepts the site
+ * ("us5.datadoghq.com"), a site or API URL ("https://api.us5.datadoghq.com",
+ * "https://app.datadoghq.eu") or nothing (null, meaning US1 by default but
+ * unbound). Returns undefined for anything that is not a Datadog site.
+ */
+export function normalizeDatadogSite(raw: string | undefined | null): string | null | undefined {
+  let s = (raw ?? "").trim().toLowerCase();
+  if (!s) return null;
+  s = s.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  s = s.replace(/^(api|app)\./, "");
+  return (DATADOG_SITES as readonly string[]).includes(s) ? s : undefined;
+}
+
+export const datadog: Integration = {
+  id: "datadog",
+  title: "Datadog",
+  hosts: DATADOG_SITES.map((site) => `api.${site}`),
+  category: "Developer",
+  credentialFields: [
+    { key: "apiKey", label: "API key", secret: true },
+    { key: "appKey", label: "Application key", secret: true, optional: true },
+    { key: "site", label: "Site (e.g. datadoghq.com, us5.datadoghq.com, datadoghq.eu)", secret: false, optional: true },
+  ],
+  connect: {
+    method: "api_key",
+    hint: "An API key plus an application key from the same organization. Set the site so the agent knows which regional API host to call.",
+  },
+  llmHelp: {
+    credentialType:
+      "A Datadog API key (organization-level) and an application key (user or service account level). OneGate sends them as the DD-API-KEY and DD-APPLICATION-KEY headers.",
+    whereToCreate:
+      "Datadog, then Organization Settings, then API Keys for the API key and Application Keys for the application key (or a service account's application key, preferred for agents).",
+    scopes: [
+      "Application keys can be scoped (e.g. monitors_read, metrics_read, logs_read_data, dashboards_read). Grant read scopes for observability agents and add write scopes only for automation that edits monitors or dashboards.",
+      "Most read endpoints need both keys. Metric and event submission need only the API key.",
+    ],
+    notes:
+      'Fill "Site" with your DD_SITE value: datadoghq.com (US1), us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu (EU1), ap1.datadoghq.com, ap2.datadoghq.com, uk1.datadoghq.com, ddog-gov.com or us2.ddog-gov.com. The API base URL is https://api.<site>/api/.',
+  },
+  /** The site tells the agent which regional API host its keys live on. */
+  accountSummary(cred: Credential): Record<string, string | null> {
+    const site = normalizeDatadogSite(cred.data.site) ?? null;
+    return { site, apiBaseUrl: site ? `https://api.${site}` : null };
+  },
+  inject(ctx: InjectionContext): void {
+    const { apiKey, appKey } = ctx.credential.data;
+    if (!apiKey) throw new Error('Datadog credential has no "apiKey" field');
+    const site = normalizeDatadogSite(ctx.credential.data.site);
+    if (site === undefined) {
+      throw new Error(`Datadog credential has an unknown site "${ctx.credential.data.site}"`);
+    }
+    if (site && ctx.host.toLowerCase() !== `api.${site}`) {
+      throw new Error(`Datadog credential is bound to api.${site}, refusing to authenticate ${ctx.host}`);
+    }
+    ctx.headers["dd-api-key"] = apiKey;
+    if (appKey) ctx.headers["dd-application-key"] = appKey;
+    else delete ctx.headers["dd-application-key"];
+  },
+};
