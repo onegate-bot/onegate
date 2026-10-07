@@ -172,26 +172,63 @@ export function pickTokenFields(
 }
 
 /**
- * Writes updated credential data back where it came from: the connection row
- * for a connection-backed credential, otherwise the legacy credentials table.
+ * Where a credential came from, decided by its id (connections are minted
+ * "conn_", legacy credentials "cr_"), never by what exists in the store now.
+ * A connection deleted mid-refresh must not fall through to the legacy
+ * credentials upsert: that would resurrect a revoked account's secrets as the
+ * tenant-wide credential every agent can use.
  */
-function persistCredentialData(
+function isConnectionBacked(cred: Credential): boolean {
+  return cred.id.startsWith("conn_");
+}
+
+/**
+ * The CURRENT stored data of the credential's origin row, or null when that
+ * row is gone (a deleted connection, or a legacy credential deleted or
+ * replaced by a different row).
+ */
+function currentOriginData(
   store: Store,
   integrationId: string,
   cred: Credential,
-  data: Record<string, string>,
-): void {
-  if (store.getConnection(cred.id)) {
+): Record<string, string> | null {
+  if (isConnectionBacked(cred)) return store.getConnection(cred.id)?.data ?? null;
+  const row = store.getCredential(integrationId);
+  return row && row.id === cred.id ? row.data : null;
+}
+
+/**
+ * Applies `delta` onto the origin row as it is NOW (so a concurrent admin edit
+ * or re-authorize is kept), writing only when something changes. Returns false
+ * when the origin row no longer exists, in which case nothing is written.
+ */
+function applyCredentialDelta(
+  store: Store,
+  integrationId: string,
+  cred: Credential,
+  delta: Record<string, string>,
+): boolean {
+  const current = currentOriginData(store, integrationId, cred);
+  if (!current) return false;
+  if (Object.entries(delta).every(([k, v]) => current[k] === v)) return true;
+  const data = { ...current, ...delta };
+  if (isConnectionBacked(cred)) {
     store.updateConnection(cred.id, { data });
   } else {
     store.setCredential(integrationId, cred.name, data);
   }
+  return true;
 }
 
 interface CachedToken {
   token: string;
   /** Epoch ms expiry. */
   exp: number;
+}
+
+interface RefreshResult extends CachedToken {
+  /** False when the credential's connection was deleted during the refresh. */
+  live: boolean;
 }
 
 function cacheKey(integrationId: string, credId: string): string {
@@ -242,7 +279,7 @@ async function refreshAccessToken(
   oauth: OAuthDescriptor,
   cred: Credential,
   store: Store,
-): Promise<CachedToken> {
+): Promise<RefreshResult> {
   const { clientId, clientSecret, refreshToken } = cred.data;
   if (!clientId || !clientSecret || !refreshToken) {
     throw new Error(
@@ -260,25 +297,19 @@ async function refreshAccessToken(
   // Some providers rotate the refresh token on every use (GitLab). Persist
   // the replacement or the next refresh would fail. Mapped extras
   // (persistTokenFields, e.g. Salesforce's instance_url) are refreshed the
-  // same way. A connection-backed credential (its id resolves to a connection
-  // row) is persisted on the connection; a legacy single credential keeps the
-  // credentials table.
-  const nextData: Record<string, string> = { ...cred.data };
-  let changed = false;
+  // same way. Only this delta is applied, onto the origin row as it is now
+  // (connection row or legacy credential, chosen by the credential's id).
+  const delta = pickTokenFields(oauth, json);
   if (json.refresh_token && json.refresh_token !== refreshToken) {
-    nextData.refreshToken = json.refresh_token;
-    changed = true;
+    delta.refreshToken = json.refresh_token;
   }
-  for (const [k, v] of Object.entries(pickTokenFields(oauth, json))) {
-    if (nextData[k] !== v) {
-      nextData[k] = v;
-      changed = true;
-    }
-  }
-  if (changed) persistCredentialData(store, integrationId, cred, nextData);
+  const stored = applyCredentialDelta(store, integrationId, cred, delta);
+  // A revoked connection's freshly minted token must not be cached either.
+  const live = stored || !isConnectionBacked(cred);
   return {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? oauth.defaultExpiresIn ?? 3600) * 1000,
+    live,
   };
 }
 
@@ -321,10 +352,11 @@ export async function oauthBearerToken(
     // miss and this point, in which case there is nothing to exchange.
     const raced = readCache(store, key);
     if (raced) return { token: raced, exp: Date.now() + EXPIRY_MARGIN_MS };
-    const minted = await refreshAccessToken(integration.id, oauth, cred, store);
+    const { live, ...minted } = await refreshAccessToken(integration.id, oauth, cred, store);
     // Persisted by the flight owner only, so a stale result from an earlier
-    // attempt can never overwrite a newer token.
-    store.setSecretSetting(key, minted);
+    // attempt can never overwrite a newer token. A connection deleted
+    // mid-refresh (revoked) is never cached.
+    if (live) store.setSecretSetting(key, minted);
     return minted;
   });
   return fresh.token;

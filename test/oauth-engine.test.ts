@@ -268,7 +268,7 @@ describe("token endpoint flows", () => {
         status: 200,
         body: { access_token: "at_new", refresh_token: "rt_rotated", expires_in: 7200 },
       });
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
       await oauthBearerToken(integ(), c, store);
       const saved = store.getCredential("testx");
       expect(saved?.data.refreshToken).toBe("rt_rotated");
@@ -296,7 +296,12 @@ describe("token endpoint flows", () => {
         status: 200,
         body: { access_token: "at_x", instance_url: "https://new.example", evil: "pwned" },
       });
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt", instanceUrl: "https://old.example" });
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt",
+        instanceUrl: "https://old.example",
+      });
       await oauthBearerToken(
         integ({ persistTokenFields: { instance_url: "instanceUrl", evil: "clientSecret" } }),
         c,
@@ -305,6 +310,66 @@ describe("token endpoint flows", () => {
       const saved = store.getCredential("testx")!.data;
       expect(saved.instanceUrl).toBe("https://new.example");
       expect(saved.clientSecret).toBe("cs");
+    });
+
+    it("never resurrects a deleted legacy credential from a refresh", async () => {
+      respond = () => ({ status: 200, body: { access_token: "at_x", refresh_token: "rt_rotated" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getCredential("testx")).toBeNull();
+    });
+
+    it("applies only the refresh delta onto the row as it is now (concurrent edit kept)", async () => {
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt",
+        instanceUrl: "https://old.example",
+      });
+      respond = () => {
+        // An admin edit lands while the token request is in flight.
+        store.setCredential("testx", "t", { ...c.data, clientSecret: "cs_rotated_by_admin" });
+        return { status: 200, body: { access_token: "at_x", refresh_token: "rt2", instance_url: "https://new.example" } };
+      };
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")!.data).toEqual({
+        clientId: "cid",
+        clientSecret: "cs_rotated_by_admin",
+        refreshToken: "rt2",
+        instanceUrl: "https://new.example",
+      });
+    });
+
+    it("never resurrects a connection deleted mid-refresh, and does not cache its token", async () => {
+      const conn = store.createConnection({
+        kind: "app",
+        vendor: "testx",
+        name: "work",
+        data: { clientId: "cid", clientSecret: "cs", refreshToken: "rt" },
+      });
+      respond = () => {
+        store.deleteConnection(conn.id);
+        return { status: 200, body: { access_token: "at_revoked", refresh_token: "rt_rotated", expires_in: 3600 } };
+      };
+      const c: Credential = { id: conn.id, integrationId: "testx", name: conn.name, data: { ...conn.data }, createdAt: "" };
+      await oauthBearerToken(integ(), c, store);
+      expect(store.getConnection(conn.id)).toBeNull();
+      expect(store.getCredential("testx")).toBeNull();
+      expect(store.getSecretSetting(`oauth_access_token:testx:${conn.id}`)).toBeNull();
+    });
+
+    it("persists the delta onto a live connection", async () => {
+      const conn = store.createConnection({
+        kind: "app",
+        vendor: "testx",
+        name: "work",
+        data: { clientId: "cid", clientSecret: "cs", refreshToken: "rt" },
+      });
+      respond = () => ({ status: 200, body: { access_token: "at_c", refresh_token: "rt_c2", expires_in: 3600 } });
+      const c: Credential = { id: conn.id, integrationId: "testx", name: conn.name, data: { ...conn.data }, createdAt: "" };
+      expect(await oauthBearerToken(integ(), c, store)).toBe("at_c");
+      expect(store.getConnection(conn.id)!.data.refreshToken).toBe("rt_c2");
+      expect(store.getCredential("testx")).toBeNull();
     });
 
     it("does not rewrite the credential when nothing changed", async () => {
@@ -341,7 +406,7 @@ describe("token endpoint flows", () => {
           },
         };
       };
-      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      const c = store.setCredential("testx", "t", { clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
 
       const first = oauthBearerToken(integ(), c, store);
       const second = oauthBearerToken(integ(), c, store);

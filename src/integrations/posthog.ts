@@ -44,6 +44,11 @@ export const posthog: Integration = {
     notes:
       'Fill "Region" with us or eu so the agent knows which host to call (https://us.posthog.com or https://eu.posthog.com), OneGate then refuses the other region. Endpoints live under /api/projects/<project_id>/. Event capture uses the public project key and is not routed through OneGate.',
   },
+  /** A typo like "europe" would silently leave the key unbound, reject it at save time. */
+  validateCredential(data: Record<string, string>): string | null {
+    const raw = (data.region ?? "").trim();
+    return raw && !posthogRegion(raw) ? `data.region "${data.region}" must be us or eu` : null;
+  },
   /** The region tells the agent which API host its key lives on. */
   accountSummary(cred: Credential): Record<string, string | null> {
     const region = posthogRegion(cred.data.region);

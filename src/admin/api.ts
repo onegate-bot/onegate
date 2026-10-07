@@ -1326,6 +1326,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "data_required" });
       return;
     }
+    const nonString = Object.entries(data as Record<string, unknown>).find(([, v]) => typeof v !== "string");
+    if (nonString) {
+      res.status(400).json({ error: "invalid_data", message: `data.${nonString[0]} must be a string` });
+      return;
+    }
     const invalid = registry.get(integrationId)!.validateCredential?.(data as Record<string, string>);
     if (invalid) {
       res.status(400).json({ error: "invalid_data", message: invalid });

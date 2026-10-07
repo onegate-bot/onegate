@@ -618,6 +618,46 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     expect(goodConn.status).toBe(201);
   });
 
+  it("rejects non-string legacy credential values with 400 invalid_data, not a 500", async () => {
+    const r = await request("PUT", "/api/credentials/datadog", { data: { apiKey: "k", site: 42 } });
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.text)).toEqual({ error: "invalid_data", message: "data.site must be a string" });
+  });
+
+  it("PUT /api/connections/:id runs the Datadog hook only when data is sent", async () => {
+    // Stored directly with a bad site, bypassing the API, to prove a rename
+    // (no data) never runs the hook.
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "datadog",
+      name: "dd-legacy-bad",
+      data: { apiKey: "k", site: "us9" },
+    });
+    const rename = await request("PUT", `/api/connections/${conn.id}`, { name: "dd-renamed" });
+    expect(rename.status).toBe(200);
+    const bad = await request("PUT", `/api/connections/${conn.id}`, { data: { apiKey: "k", site: "us9" } });
+    expect(bad.status).toBe(400);
+    expect(JSON.parse(bad.text).error).toBe("invalid_data");
+    expect(bad.text).toContain("not a Datadog site");
+  });
+
+  it("rejects an unknown PostHog region on both save routes", async () => {
+    const legacy = await request("PUT", "/api/credentials/posthog", { data: { apiKey: "phx_x", region: "europe" } });
+    expect(legacy.status).toBe(400);
+    expect(legacy.text).toContain("must be us or eu");
+    const conn = await request("POST", "/api/connections", {
+      kind: "app",
+      vendor: "posthog",
+      name: "ph",
+      data: { apiKey: "phx_x", region: "europe" },
+    });
+    expect(conn.status).toBe(400);
+    expect(conn.text).toContain("must be us or eu");
+    const ok = await request("PUT", "/api/credentials/posthog", { data: { apiKey: "phx_x", region: "EU" } });
+    expect(ok.status).toBe(200);
+    expect(posthog.validateCredential!({ apiKey: "phx_x" })).toBeNull();
+  });
+
   it("ignores a non-string instance_url instead of storing junk", async () => {
     tokenBody = { access_token: "sf_at2", refresh_token: "sf_rt2", instance_url: 42 };
     const cb = await connect();
