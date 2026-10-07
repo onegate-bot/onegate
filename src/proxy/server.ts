@@ -26,6 +26,7 @@ import { connectFlowKind, type Integration, type Registry } from "../integration
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
 import { createUsageScanner, extractRequestModel, type TokenUsage } from "../llm/usage.js";
 import { DISCOVERY_HOST, buildDiscovery } from "../discovery.js";
+import { publicBaseUrlFromEnv } from "../util/public-url.js";
 
 interface SocketCtx {
   kind?: "integration";
@@ -94,6 +95,13 @@ export interface ProxyOptions {
    * network calls.
    */
   notifyFetch?: typeof fetch;
+  /**
+   * Base URL for owner-facing links (approve, connect, renew), already
+   * validated and without a trailing slash. `onegate start` resolves it once
+   * (see src/util/public-url.ts). When omitted it is resolved from the
+   * environment on each use.
+   */
+  publicBaseUrl?: string;
 }
 
 const HOP_BY_HOP = new Set([
@@ -755,7 +763,7 @@ export class GatewayProxy {
             : undefined,
         ttlDays: typeof body.ttlDays === "number" && body.ttlDays > 0 ? body.ttlDays : undefined,
       });
-      const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+      const base = this.publicBase();
       this.log(`connect-link self-mint ${ctx.agent.name} -> ${integration.id}`);
       res.writeHead(201, { "content-type": "application/json" });
       res.end(
@@ -771,6 +779,11 @@ export class GatewayProxy {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "bad_request" }));
     });
+  }
+
+  /** Base URL for owner-facing links. */
+  private publicBase(): string {
+    return this.opts.publicBaseUrl ?? publicBaseUrlFromEnv().url;
   }
 
   /**
@@ -877,7 +890,7 @@ export class GatewayProxy {
       if (this.opts.store.findRecentOwnerNotification(agent.id, integration.id, sinceIso)) return;
     }
     // Mint/reuse the right link: a renewal link for a lapsed lease, else connect.
-    const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+    const base = this.publicBase();
     let link;
     let url: string;
     if (opts.lease) {
@@ -936,7 +949,7 @@ export class GatewayProxy {
         integrationId: integration.id,
         ruleId,
       });
-    const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+    const base = this.publicBase();
     return { url: `${base}/renew/${link.token}`, expiresAt: link.expiresAt };
   }
 
@@ -960,7 +973,7 @@ export class GatewayProxy {
     const link =
       this.opts.store.activeOnboardingLinkFor(agent.id, integration.id) ??
       this.opts.store.createOnboardingLink({ agentId: agent.id, integrationId: integration.id });
-    const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+    const base = this.publicBase();
     return { url: `${base}/connect/${integration.id}/${link.token}`, expiresAt: link.expiresAt };
   }
 
@@ -997,7 +1010,7 @@ export class GatewayProxy {
         path,
         bodyHash,
       });
-      const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
+      const base = this.publicBase();
       const url = `${base}/approve/${approval.token}`;
       // Owner notification reuses the SS1 pipeline. Dedup is per approval, so a
       // genuinely new held call always reaches the owner while retries of the

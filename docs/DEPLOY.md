@@ -71,6 +71,10 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+## Owner links (`ONEGATE_PUBLIC_URL`)
+
+When an agent hits a call that needs its owner (a `require_approval` rule, an integration that is not connected yet, an expired time-boxed lease), OneGate hands back a one-time link to the admin listener's public pages (`/approve/...`, `/connect/...`, `/renew/...`) and sends it to the owner's notify webhook. Set `ONEGATE_PUBLIC_URL` to the URL the owner's browser reaches the admin listener on, for example the TLS reverse proxy in front of port 8080. Without it the links point at `http://<bind address or localhost>:<admin port>`, which only works from the gateway's own network.
+
 ## OAuth redirect for Google connect
 
 The Google connect flow needs the browser to reach the admin server's `/oauth/google/callback`. Use the URL you actually browse the UI on (for a tunneled admin port that is `http://localhost:8080`) as the redirect base, and register `<redirectBase>/oauth/google/callback` in the Google Cloud Console OAuth client. The UI prefills this for you.
@@ -83,6 +87,7 @@ The Google connect flow needs the browser to reach the admin server's `/oauth/go
 | `ONEGATE_PROXY_PORT` | 8443 | proxy listener |
 | `ONEGATE_ADMIN_PORT` | 8080 | admin UI/API listener |
 | `ONEGATE_BIND` | 0.0.0.0 | bind address for both listeners |
+| `ONEGATE_PUBLIC_URL` | `http://<ONEGATE_BIND or localhost>:<admin port>` | base URL of the admin listener as owners reach it, e.g. `https://gate.example.com`. Approve, connect and renew links (which carry one-time tokens) and OAuth redirect URIs are built on it. Must be an absolute http(s) URL; a trailing slash is stripped and a malformed value stops `onegate start`. Unset, the gateway warns at startup that links will only work locally |
 | `ONEGATE_COMMUNITY_DIR` | `<data>/integrations` | extra integrations directory |
 | `ONEGATE_DISABLED_INTEGRATIONS` | (none) | comma/space separated integration ids to drop (their hosts pass through instead of being managed) |
 

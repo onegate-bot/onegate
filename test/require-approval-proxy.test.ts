@@ -100,6 +100,8 @@ beforeAll(async () => {
     registry,
     upstreamTls: { ca: caPem },
     upstreamLookup: () => ({ host: "127.0.0.1", port: stubPort }),
+    // The owner link is built on this base (see public-url.test.ts).
+    publicBaseUrl: "https://gate.example.test/og",
   });
   proxyPort = await proxy.listen(0, "127.0.0.1");
 
@@ -208,7 +210,7 @@ describe("require_approval through the proxy", () => {
     seen = [];
     const body = JSON.stringify({ title: "ship it" });
     const held = await hold("POST", "/repos/alpha/issues", body);
-    expect(held.json.approval_url).toMatch(/\/approve\/[0-9a-f]{48}$/);
+    expect(held.json.approval_url).toMatch(/^https:\/\/gate\.example\.test\/og\/approve\/[0-9a-f]{48}$/);
     expect(held.json.message).toContain("retry the identical request");
     expect(seen).toHaveLength(0);
 

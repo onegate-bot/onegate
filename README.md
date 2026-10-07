@@ -87,7 +87,7 @@ onegate agent add <name>     register an agent (--policy, --project)
 onegate agent list           list agents
 ```
 
-Environment: `ONEGATE_DATA` (default `~/.onegate`), `ONEGATE_PROXY_PORT` (8443), `ONEGATE_ADMIN_PORT` (8080), `ONEGATE_BIND`, `ONEGATE_COMMUNITY_DIR`.
+Environment: `ONEGATE_DATA` (default `~/.onegate`), `ONEGATE_PROXY_PORT` (8443), `ONEGATE_ADMIN_PORT` (8080), `ONEGATE_BIND`, `ONEGATE_COMMUNITY_DIR`, `ONEGATE_PUBLIC_URL` (the URL owners reach the admin listener on; approve, connect and renew links are built on it; defaults to the admin listener's own address, which only works locally). See [docs/DEPLOY.md](docs/DEPLOY.md#environment-variables).
 
 ## Development
 
