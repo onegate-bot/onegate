@@ -36,6 +36,7 @@ const FALLBACK = {
   monday: { title: "monday", hex: "FF3D57" },
   linkedin: { title: "LinkedIn", hex: "0A66C2" },
   tavily: { title: "Tavily", hex: "3B82F6" },
+  microsoft: { title: "Microsoft 365", hex: "0078D4" },
   attio: { title: "Attio", hex: "1F2328" },
 };
 

@@ -20,6 +20,7 @@ import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
 import { datadog, normalizeDatadogSite, DATADOG_SITES } from "../src/integrations/datadog.js";
 import { posthog } from "../src/integrations/posthog.js";
+import { microsoft, MICROSOFT_APPS } from "../src/integrations/microsoft.js";
 import { zoom } from "../src/integrations/zoom.js";
 import { attio } from "../src/integrations/attio.js";
 import { airtable } from "../src/integrations/airtable.js";
@@ -43,6 +44,7 @@ const BATCH: Integration[] = [
   sentry,
   datadog,
   posthog,
+  microsoft,
   zoom,
   attio,
   airtable,
@@ -66,6 +68,7 @@ describe("batch 8 registry claims", () => {
       "us.posthog.com": "posthog",
       "eu.posthog.com": "posthog",
       "app.posthog.com": "posthog",
+      "graph.microsoft.com": "microsoft",
       "api.zoom.us": "zoom",
       "api.attio.com": "attio",
       "api.airtable.com": "airtable",
@@ -211,7 +214,9 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
   let server: http.Server;
   let store: Store;
   let zoomGrants = 0;
+  let msRefreshes = 0;
   let lastZoom: { auth: string; params: URLSearchParams } | null = null;
+  let lastMs: URLSearchParams | null = null;
 
   beforeAll(async () => {
     server = http.createServer((req, res) => {
@@ -233,23 +238,38 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
           json(200, { access_token: `zoom_at_${zoomGrants}`, token_type: "bearer", expires_in: 3599 });
           return;
         }
+        if (req.url === "/ms/token") {
+          msRefreshes++;
+          lastMs = params;
+          json(200, {
+            access_token: `ms_at_${msRefreshes}`,
+            refresh_token: `ms_rt_${msRefreshes}`,
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+          return;
+        }
         res.writeHead(404).end();
       });
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     const port = (server.address() as { port: number }).port;
     process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM = `http://127.0.0.1:${port}/zoom/token`;
+    process.env.ONEGATE_OAUTH_TOKEN_URL_MICROSOFT = `http://127.0.0.1:${port}/ms/token`;
   });
 
   afterAll(() => {
     server.close();
     delete process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM;
+    delete process.env.ONEGATE_OAUTH_TOKEN_URL_MICROSOFT;
   });
 
   beforeEach(() => {
     store = new Store(":memory:");
     zoomGrants = 0;
+    msRefreshes = 0;
     lastZoom = null;
+    lastMs = null;
   });
 
   it("zoom mints an account_credentials token with Basic auth, injects Bearer and caches", async () => {
@@ -283,6 +303,38 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
 
 
 
+  it("microsoft refreshes against the token endpoint and persists the rotated refresh token", async () => {
+    const c = store.setCredential("microsoft", "Microsoft 365 OAuth", {
+      clientId: "mscid",
+      clientSecret: "mssec",
+      refreshToken: "ms_rt_0",
+    });
+    const ctx = ctxFor("graph.microsoft.com", c, store, { authorization: "Bearer og_placeholder" });
+    await microsoft.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer ms_at_1");
+    expect(lastMs!.get("grant_type")).toBe("refresh_token");
+    expect(lastMs!.get("refresh_token")).toBe("ms_rt_0");
+    expect(lastMs!.get("client_id")).toBe("mscid");
+    expect(store.getCredential("microsoft")!.data.refreshToken).toBe("ms_rt_1");
+    await microsoft.inject(ctxFor("graph.microsoft.com", c, store));
+    expect(msRefreshes).toBe(1);
+  });
 
+  it("microsoft builds a common-tenant consent URL and every scope pack asks for offline access", () => {
+    const u = new URL(
+      buildAuthUrl("microsoft", microsoft.oauth!, {
+        clientId: "mscid",
+        redirectUri: "https://gw.example/oauth/microsoft/callback",
+        scopes: microsoft.oauth!.defaultScopes,
+        state: "st",
+      }),
+    );
+    expect(u.origin + u.pathname).toBe("https://login.microsoftonline.com/common/oauth2/v2.0/authorize");
+    const scopes = u.searchParams.get("scope")!.split(" ");
+    expect(scopes).toEqual(expect.arrayContaining(["offline_access", "User.Read", "Mail.ReadWrite", "Calendars.ReadWrite", "Files.ReadWrite"]));
+    expect(new Set(scopes).size).toBe(scopes.length);
+    expect(scopes).not.toContain("Notes.ReadWrite");
+    for (const pack of MICROSOFT_APPS) expect(pack.scopes, pack.id).toContain("offline_access");
+  });
 });
 

@@ -425,3 +425,11 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Discovery summary:** `accountId`.
 - **Limitations:** Server-to-Server apps act account-wide (no `/users/me`), scopes live on the app. User-level OAuth (a General app) is not implemented yet.
 
+### microsoft
+
+- **Credential:** a bring-your-own Microsoft Entra app registration (Application ID + client secret). The connect flow runs consent on the `common` endpoint (work, school and personal accounts) with `offline_access`, OneGate stores the refresh token, persists Microsoft's rotated refresh tokens and injects short-lived access tokens as `Bearer`.
+- **Hosts:** `graph.microsoft.com`.
+- **Scope picker:** Outlook mail (`Mail.ReadWrite`, `Mail.Send`), Outlook calendar (`Calendars.ReadWrite`), OneDrive (`Files.ReadWrite`) and OneNote (`Notes.ReadWrite`). Every pack also requests `offline_access` and `User.Read`.
+- **Suggested policy:** per product with path globs: `/v1.0/me/messages/**` and `POST /v1.0/me/sendMail` (mail), `/v1.0/me/events/**` and `/v1.0/me/calendarView` (calendar), `/v1.0/me/drive/**` (OneDrive), `/v1.0/me/onenote/**` (OneNote).
+- **Limitations:** one consent covers every selected product, per-product permissioning is path globs. Work or school tenants may need admin consent. Client secrets expire, reconnect with a new one.
+
