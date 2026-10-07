@@ -44,8 +44,10 @@ export function auditSource(decision: Decision): AuditSource {
  * A short, plain-words explanation suitable for showing next to a row. Returns
  * null when no explanation adds value (a clean allow/passthrough success).
  */
-export function auditReason(entry: Pick<AuditEntry, "decision" | "ruleId" | "status">): string | null {
-  const { decision, ruleId, status } = entry;
+export function auditReason(
+  entry: Pick<AuditEntry, "decision" | "ruleId" | "status"> & { approvalId?: string | null },
+): string | null {
+  const { decision, ruleId, status, approvalId } = entry;
   switch (decision) {
     case "deny":
       return ruleId
@@ -62,6 +64,11 @@ export function auditReason(entry: Pick<AuditEntry, "decision" | "ruleId" | "sta
     case "body_too_large":
       return "Blocked by OneGate: the request body exceeded the size OneGate will buffer.";
     case "allow":
+      if (approvalId) {
+        return typeof status === "number" && status >= 400
+          ? `Allowed by OneGate after owner approval ${approvalId}. The upstream service returned ${status}, so this status came from the API, not OneGate.`
+          : `Allowed by OneGate after owner approval ${approvalId} (rule ${ruleId ?? "unknown"} requires approval).`;
+      }
       return typeof status === "number" && status >= 400
         ? `Allowed by OneGate. The upstream service returned ${status}, so this status came from the API, not OneGate.`
         : null;

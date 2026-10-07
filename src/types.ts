@@ -337,6 +337,8 @@ export interface AuditEntry {
   llmVendor: string | null;
   llmStrategy: LlmStrategy | null;
   llmFailover: boolean | null;
+  /** The approval that let a require_approval hold through, null otherwise. */
+  approvalId: string | null;
 }
 
 /** Status values for an owner_notifications row. */
@@ -381,9 +383,9 @@ export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
  * matches. The owner opens a one-tap approve/reject link; the agent is told the
  * call is PENDING (not denied) and retries later.
  *
- * PHASE ONE does not replay the held request: approval creates an allow window
- * that the agent's own retry lands in. That is why `status` and `expiresAt`
- * matter more than any stored request body (none is kept).
+ * The gateway does not replay the held request: approval lets the agent's own
+ * retry of the SAME request (method, path, body) through exactly once, before
+ * `expiresAt`. The body itself is never stored, only its SHA-256.
  */
 export interface Approval {
   id: string;
@@ -414,4 +416,8 @@ export interface Approval {
   expiresAt: string;
   /** When the owner decided, null while pending. */
   decidedAt: string | null;
+  /** SHA-256 (hex) of the held request body; null on rows minted before body binding. */
+  bodyHash: string | null;
+  /** When an approved row was redeemed by the agent's retry, null until then. */
+  usedAt: string | null;
 }

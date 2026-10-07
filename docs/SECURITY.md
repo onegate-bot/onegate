@@ -14,6 +14,17 @@
 - **Malicious allowed requests.** Policy bounds *which* calls an agent may make, not whether an allowed call is wise. An agent allowed `POST /repos/**` can still open a bad PR.
 - **Traffic to non-integrated hosts.** Passthrough tunnels are opaque by design. OneGate neither inspects nor restricts them (it audits the CONNECT). If you need egress control, do it at the firewall.
 
+## Owner approvals (`require_approval`)
+
+A rule with the `require_approval` action holds a matching call instead of forwarding it. The agent gets `403 onegate_approval_pending`, and the owner gets a one-time `/approve/<token>` link (only the token's SHA-256 is stored). Once the owner approves, the agent's retry of the **identical** request goes through **exactly once**:
+
+- **Bound to the request.** Redemption matches the agent, integration, the gating rule, the HTTP method, the canonical path including its query string, and the SHA-256 of the request body. The body is buffered (up to `ONEGATE_MAX_BUFFERED_BODY`, 32 MiB by default) when the call is held, and its hash is stored with the approval; the retry's body must hash the same. An owner who approved `POST /repos/x/issues` with one payload has not approved a different payload on the same path. A held body over the cap is refused with `413`.
+- **Atomic, single use.** The redeeming `UPDATE` re-checks `status = 'approved' AND used_at IS NULL`, so of two concurrent retries (or two gateway processes on one database) only one passes. After that the next identical call needs a fresh approval.
+- **Never from a refusal.** A pending, rejected or expired approval (the owner's 24-hour window, which also bounds the retry) never lets a call through. An explicit deny rule still beats `require_approval` outright. Approvals recorded before body binding existed carry no body hash and can never be redeemed.
+- **Audited.** The redeemed call is an `allow` row carrying the gating rule id and the `approvalId`.
+
+Limitations: the owner's page shows the method and path, not the body (the body itself is never stored, only its hash), so the owner is approving "this exact call the agent made", not a payload they reviewed. An approval is spent when the gateway admits the retry, so a retry that then fails for another reason (no credential connected, upstream error) needs a new approval.
+
 ## Trust and the root CA
 
 At install time you mint a root CA and explicitly trust it on each agent machine. That trust is exactly what lets the gateway terminate TLS for integration hosts. Understand the consequences:

@@ -11,6 +11,7 @@
  *  - any other host → opaque passthrough tunnel (no MITM, no inspection).
  */
 
+import { createHash } from "node:crypto";
 import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
@@ -20,7 +21,7 @@ import type { Duplex } from "node:stream";
 import type { Ca, LeafCert } from "../ca.js";
 import type { Store } from "../store/db.js";
 import { evaluate, normalizeRequestPath } from "../policy.js";
-import type { Agent, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
+import type { Agent, Approval, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
 import { connectFlowKind, type Integration, type Registry } from "../integrations/types.js";
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
 import { createUsageScanner, extractRequestModel, type TokenUsage } from "../llm/usage.js";
@@ -969,9 +970,9 @@ export class GatewayProxy {
    *
    * Reuse: a bot retrying a held call must not mint a fresh approval and a fresh
    * owner notification on every attempt, so a still-pending approval for the
-   * same agent/integration/method/path is returned as-is. Its plaintext token is
-   * unrecoverable (only the hash is stored), so the reused case returns no URL —
-   * the owner already has the link from the first notification.
+   * same agent/integration/method/path/body is returned as-is. Its plaintext
+   * token is unrecoverable (only the hash is stored), so the reused case returns
+   * no URL — the owner already has the link from the first notification.
    *
    * NEVER THROWS. Any failure returns null and the caller falls back to
    * describing the call as denied, so a broken approval path degrades to a plain
@@ -983,9 +984,10 @@ export class GatewayProxy {
     ruleId: string,
     method: string,
     path: string,
+    bodyHash: string,
   ): { id: string; expiresAt: string; url: string | null } | null {
     try {
-      const existing = this.opts.store.activeApprovalFor(agent.id, integration.id, method, path);
+      const existing = this.opts.store.activeApprovalFor(agent.id, integration.id, method, path, Date.now(), bodyHash);
       if (existing) return { id: existing.id, expiresAt: existing.expiresAt, url: null };
       const approval = this.opts.store.createApproval({
         agentId: agent.id,
@@ -993,6 +995,7 @@ export class GatewayProxy {
         ruleId,
         method,
         path,
+        bodyHash,
       });
       const base = (process.env.ONEGATE_PUBLIC_URL || "https://app.onegate.bot").replace(/\/$/, "");
       const url = `${base}/approve/${approval.token}`;
@@ -1135,6 +1138,30 @@ export class GatewayProxy {
     return { sent: false, connection: resolved ? resolved.connection : null };
   }
 
+  /** Audits and answers a request whose body exceeded the buffering cap. */
+  private respondBodyTooLarge(
+    res: http.ServerResponse,
+    agent: Agent,
+    integration: Integration,
+    host: string,
+    method: string,
+    path: string,
+    err: Error,
+  ): void {
+    this.opts.store.audit({
+      agentId: agent.id,
+      agentName: agent.name,
+      integrationId: integration.id,
+      host,
+      method,
+      path,
+      decision: "body_too_large",
+      status: 413,
+    });
+    res.writeHead(413, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "onegate_body_too_large", message: err.message }));
+  }
+
   private async onInnerRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const ctx = this.ctxBySocket.get(req.socket);
     if (!ctx) {
@@ -1195,6 +1222,44 @@ export class GatewayProxy {
       });
     }
 
+    // A require_approval hold. The body is buffered (bounded) either way: a
+    // new hold records its hash so the owner's decision is bound to this exact
+    // payload, and a retry needs it to redeem. An approved, unexpired, unused
+    // approval for this same agent/integration/rule/method/path/body is spent
+    // atomically here and the request continues as an allow, exactly once.
+    // Anything else (none, pending, rejected, expired, used, different body)
+    // stays held below. A redemption error fails closed into the hold.
+    let approvedBy: { id: string; body: Buffer } | null = null;
+    let heldBodyHash = "";
+    if (effectiveVerdict.effect === "deny" && effectiveVerdict.requiresApproval && effectiveVerdict.ruleId) {
+      let heldBody: Buffer;
+      try {
+        heldBody = await readBody(req, maxBufferedBody());
+      } catch (err) {
+        this.respondBodyTooLarge(res, agent, integration, host, method, path, err as Error);
+        return;
+      }
+      heldBodyHash = createHash("sha256").update(heldBody).digest("hex");
+      let redeemed: Approval | null = null;
+      try {
+        redeemed = this.opts.store.redeemApproval({
+          agentId: agent.id,
+          integrationId: integration.id,
+          ruleId: effectiveVerdict.ruleId,
+          method,
+          path,
+          bodyHash: heldBodyHash,
+        });
+      } catch (err) {
+        this.log(`approval redemption failed for ${agent.name}: ${(err as Error).message}`);
+      }
+      if (redeemed) {
+        this.log(`approval ${redeemed.id} redeemed by ${agent.name}: ${method} ${host}${path}`);
+        approvedBy = { id: redeemed.id, body: heldBody };
+        effectiveVerdict = { effect: "allow", ruleId: effectiveVerdict.ruleId };
+      }
+    }
+
     if (effectiveVerdict.effect === "deny") {
       const verdict = effectiveVerdict;
       this.opts.store.audit({
@@ -1241,16 +1306,17 @@ export class GatewayProxy {
       // explicit-deny short-circuit in evaluate(), so a deny rule always wins
       // and can never be softened into a "pending" state.
       //
-      // The response is still a 4xx and the request is NOT forwarded. Phase one
-      // does not replay the held request: the agent is told to retry once the
-      // owner has decided.
+      // The response is still a 4xx and the request is NOT forwarded. The
+      // gateway does not replay the held request: once the owner approves, the
+      // agent's retry of the identical request (same method, path and body)
+      // is redeemed above and goes through once.
       if (verdict.requiresApproval && verdict.ruleId) {
-        const pending = this.pendingApprovalFor(agent, integration, verdict.ruleId, method, path);
+        const pending = this.pendingApprovalFor(agent, integration, verdict.ruleId, method, path, heldBodyHash);
         res.writeHead(403, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
             error: "onegate_approval_pending",
-            message: `${method} ${host}${path} for agent "${agent.name}" requires owner approval. The request was NOT sent. It is pending a decision${pending ? "" : " (approval could not be recorded, treat as denied)"}; retry after your owner approves.`,
+            message: `${method} ${host}${path} for agent "${agent.name}" requires owner approval. The request was NOT sent. It is pending a decision${pending ? "" : " (approval could not be recorded, treat as denied)"}; once your owner approves, retry the identical request (same method, path and body). An approval lets that request through once.`,
             ...(pending
               ? {
                   approval_id: pending.id,
@@ -1258,10 +1324,10 @@ export class GatewayProxy {
                   ...(pending.url
                     ? {
                         approval_url: pending.url,
-                        hint: "Show approval_url to your owner as a bare link. Opening it lets them approve or reject this call, then retry the request.",
+                        hint: "Show approval_url to your owner as a bare link. Opening it lets them approve or reject this call. After they approve, retry the identical request once, before approval_expires_at.",
                       }
                     : {
-                        hint: "Ask your owner to approve this call in OneGate, then retry the request.",
+                        hint: "Ask your owner to approve this call in OneGate. After they approve, retry the identical request once, before approval_expires_at.",
                       }),
                 }
               : {}),
@@ -1326,6 +1392,7 @@ export class GatewayProxy {
         llmRoute,
         rules,
         verdict.needsConnection ?? false,
+        approvedBy,
       );
       return;
     }
@@ -1437,26 +1504,14 @@ export class GatewayProxy {
 
     // Integrations that sign the payload (e.g. AWS SigV4) need the body
     // before headers can be finalized, so it is buffered up front (bounded).
-    // Everyone else keeps the pure streaming path.
-    let body: Buffer | undefined;
-    if (integration.needsBody) {
+    // A redeemed approval already buffered (and hash-checked) it. Everyone else
+    // keeps the pure streaming path.
+    let body: Buffer | undefined = approvedBy?.body;
+    if (body === undefined && integration.needsBody) {
       try {
         body = await readBody(req, maxBufferedBody());
       } catch (err) {
-        this.opts.store.audit({
-          agentId: agent.id,
-          agentName: agent.name,
-          integrationId: integration.id,
-          host,
-          method,
-          path,
-          decision: "body_too_large",
-          status: 413,
-        });
-        res.writeHead(413, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "onegate_body_too_large", message: (err as Error).message }),
-        );
+        this.respondBodyTooLarge(res, agent, integration, host, method, path, err as Error);
         return;
       }
     }
@@ -1511,6 +1566,7 @@ export class GatewayProxy {
           status: upRes.statusCode ?? null,
           connectionId: selectedConnection?.id ?? null,
           connectionName: selectedConnection?.name ?? null,
+          approvalId: approvedBy?.id ?? null,
         });
         // App requests are not retried (their body may be streamed), but the
         // outcome still counts, so a revoked app credential is benched and the
@@ -1652,6 +1708,8 @@ export class GatewayProxy {
     route: LlmRoute,
     rules: Rule[] = [],
     needsConnection: boolean = false,
+    /** A redeemed approval: its already-buffered body is replayed, never re-read. */
+    approvedBy: { id: string; body: Buffer } | null = null,
   ): Promise<void> {
     const { agent, host, port, integration } = ctx;
     const method = (req.method ?? "GET").toUpperCase();
@@ -1683,6 +1741,8 @@ export class GatewayProxy {
         connectionId: conn.id,
       });
       if (finalVerdict.effect !== "deny") return false;
+      // The approval redeemed for this request already settled its hold.
+      if (approvedBy && finalVerdict.requiresApproval && finalVerdict.ruleId === ruleId) return false;
       this.opts.store.audit({
         agentId: agent.id,
         agentName: agent.name,
@@ -1705,24 +1765,15 @@ export class GatewayProxy {
     };
 
     let body: Buffer;
-    try {
-      body = await readBody(req, maxBufferedBody());
-    } catch (err) {
-      this.opts.store.audit({
-        agentId: agent.id,
-        agentName: agent.name,
-        integrationId: integration.id,
-        host,
-        method,
-        path,
-        decision: "body_too_large",
-        status: 413,
-      });
-      res.writeHead(413, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({ error: "onegate_body_too_large", message: (err as Error).message }),
-      );
-      return;
+    if (approvedBy) {
+      body = approvedBy.body;
+    } else {
+      try {
+        body = await readBody(req, maxBufferedBody());
+      } catch (err) {
+        this.respondBodyTooLarge(res, agent, integration, host, method, path, err as Error);
+        return;
+      }
     }
 
     // The requested model, parsed from the body (Anthropic/OpenAI) or the URL
@@ -1778,6 +1829,7 @@ export class GatewayProxy {
         llmVendor: route.vendor,
         llmStrategy: route.strategy,
         llmFailover: failover,
+        approvalId: approvedBy?.id ?? null,
       });
 
     // One upstream attempt with the given connection. Resolves with the

@@ -107,6 +107,8 @@ Every audit row records a raw `decision` and upstream `status`, but those alone 
 - **`source`** is `onegate` when the row is one of OneGate's own blocks (`deny`, `auth_failed`, `no_credential`, `unknown_connection`, `connection_not_granted`, `body_too_large`), and `upstream` for `allow` and `passthrough` rows where the request reached the vendor.
 - **`reason`** is a short plain-words explanation for any non-clean outcome (for example "Blocked by OneGate: no allow rule matches this agent and integration. Add an allow rule to permit it."), and `null` for a clean success.
 
+An `allow` row for a call that a `require_approval` rule held also carries the `approvalId` that let it through (stored, in a column added by the idempotent audit migration), and its `reason` reads "Allowed by OneGate after owner approval <id>". See [SECURITY.md](SECURITY.md) for how approvals are bound to the request and redeemed once.
+
 The admin UI surfaces `source` as a Source column with the `reason` shown as a sub-row, so a denied call reads as "blocked by OneGate, here is why" versus "the vendor returned this status".
 
 ## Admin API

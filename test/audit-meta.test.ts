@@ -82,6 +82,18 @@ describe("auditReason", () => {
     expect(auditReason({ decision: "allow", ruleId: null, status: null })).toBeNull();
   });
 
+  it("allow on an owner approval names the approval and the gating rule", () => {
+    const ok = auditReason({ decision: "allow", ruleId: "rl_gate", status: 201, approvalId: "apr_1" });
+    expect(ok).toContain("Allowed by OneGate after owner approval apr_1");
+    expect(ok).toContain("rule rl_gate");
+    expect(auditReason({ decision: "allow", ruleId: null, status: 200, approvalId: "apr_1" })).toContain(
+      "rule unknown",
+    );
+    const upstream = auditReason({ decision: "allow", ruleId: "rl_gate", status: 422, approvalId: "apr_1" });
+    expect(upstream).toContain("owner approval apr_1");
+    expect(upstream).toContain("422");
+  });
+
   it("passthrough with a 4xx status names the upstream service", () => {
     const r = auditReason({ decision: "passthrough", ruleId: null, status: 401 });
     expect(r).toContain("Passed through by OneGate");

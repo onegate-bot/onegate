@@ -1033,7 +1033,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           `<h1>Allow ${who} to run this ${title} request?</h1>` +
           `<p class="og-muted">${who} tried to call <code>${esc(approval.method)} ${esc(approval.path)}</code> ` +
           `on your ${title} account. The request was <strong>not</strong> sent. It is waiting for your decision. ` +
-          `Approving lets ${who} retry it. Your credential is never shown to ${who}.</p>` +
+          `Approving lets ${who} retry this exact request once. Your credential is never shown to ${who}.</p>` +
           `<form method="post" action="${publicBase()}/approve/${esc(req.params.token)}">` +
           `<button class="og-btn" type="submit" name="decision" value="approve">Approve</button> ` +
           `<button class="og-btn secondary" type="submit" name="decision" value="reject">Reject</button>` +
@@ -1062,7 +1062,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     const who = agent ? esc(agent.name) : "Your bot";
     if (status === "approved") {
       res.send(
-        resultPage(`Approved ${CHECK_SVG}`, `${who} can retry that ${title} request. You can close this tab.`),
+        resultPage(`Approved ${CHECK_SVG}`, `${who} can retry that ${title} request once. You can close this tab.`),
       );
       return;
     }

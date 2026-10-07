@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS audit (
   connection_name TEXT,
   llm_vendor TEXT,
   llm_strategy TEXT,
-  llm_failover INTEGER
+  llm_failover INTEGER,
+  approval_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 CREATE TABLE IF NOT EXISTS settings (
@@ -240,6 +241,10 @@ CREATE INDEX IF NOT EXISTS idx_owner_notifications_pair ON owner_notifications(a
 -- onboarding_links: the plaintext exists solely in the approve/reject URL
 -- handed to the owner at mint time. A status other than 'pending' marks the
 -- token spent, which is what makes a decision single-use.
+-- body_hash is the SHA-256 of the held request body, so an approval can only
+-- be redeemed by a retry carrying the same body. used_at is set when the
+-- agent's retry redeems an 'approved' row; it is a column rather than a new
+-- status because SQLite cannot widen the status CHECK in place.
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
@@ -251,7 +256,9 @@ CREATE TABLE IF NOT EXISTS approvals (
   status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','expired')),
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  decided_at TEXT
+  decided_at TEXT,
+  body_hash TEXT,
+  used_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_agent ON approvals(agent_id, integration_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
@@ -418,6 +425,8 @@ function rowToApproval(r: Row): Approval {
     createdAt: r.created_at,
     expiresAt: r.expires_at,
     decidedAt: r.decided_at ?? null,
+    bodyHash: r.body_hash ?? null,
+    usedAt: r.used_at ?? null,
   };
 }
 
@@ -652,6 +661,8 @@ export class Store {
       ["llm_vendor", "TEXT"],
       ["llm_strategy", "TEXT"],
       ["llm_failover", "INTEGER"],
+      // The approval a held request was let through on (require_approval).
+      ["approval_id", "TEXT"],
     ];
     for (const [name, type] of wanted) {
       if (!have.has(name)) this.db.exec(`ALTER TABLE audit ADD COLUMN ${name} ${type}`);
@@ -722,6 +733,14 @@ export class Store {
       (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) => String(r.name)),
     );
     if (!linkCols.has("rule_id")) this.db.exec("ALTER TABLE onboarding_links ADD COLUMN rule_id TEXT");
+    // Approval redemption columns. A pre-existing row gets NULL for both, and
+    // redemption compares body_hash with `=`, so an approval minted before this
+    // migration (no recorded body) can never be redeemed. Fails closed.
+    const approvalCols = new Set(
+      (this.db.prepare("PRAGMA table_info(approvals)").all() as Row[]).map((r) => String(r.name)),
+    );
+    if (!approvalCols.has("body_hash")) this.db.exec("ALTER TABLE approvals ADD COLUMN body_hash TEXT");
+    if (!approvalCols.has("used_at")) this.db.exec("ALTER TABLE approvals ADD COLUMN used_at TEXT");
     const notifyCols = new Set(
       (this.db.prepare("PRAGMA table_info(owner_notifications)").all() as Row[]).map((r) =>
         String(r.name),
@@ -2303,6 +2322,12 @@ export class Store {
     ruleId: string;
     method: string;
     path: string;
+    /**
+     * SHA-256 (hex) of the held request body. Redemption requires the retry to
+     * carry the same body, so an owner who approved one payload never
+     * authorizes a different one sent on the same method and path.
+     */
+    bodyHash?: string | null;
     /** How long the owner has to decide. Defaults to 24h; clamped to > 0. */
     ttlSeconds?: number;
   }): Approval {
@@ -2324,10 +2349,12 @@ export class Store {
       createdAt,
       expiresAt,
       decidedAt: null,
+      bodyHash: input.bodyHash ?? null,
+      usedAt: null,
     };
     this.db
       .prepare(
-        "INSERT INTO approvals (id, agent_id, integration_id, rule_id, method, path, token_hash, status, created_at, expires_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approvals (id, agent_id, integration_id, rule_id, method, path, token_hash, status, created_at, expires_at, decided_at, body_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         approval.id,
@@ -2341,6 +2368,7 @@ export class Store {
         approval.createdAt,
         approval.expiresAt,
         null,
+        approval.bodyHash,
       );
     return approval;
   }
@@ -2420,6 +2448,11 @@ export class Store {
    * The returned approval carries an EMPTY `token`: only the hash is stored, so
    * the plaintext cannot be recovered. Callers use this purely to detect that a
    * decision is already outstanding.
+   *
+   * When `bodyHash` is given, only an approval held for that same body counts:
+   * a retry with a different body is a different decision, and reusing the
+   * other body's approval would leave the agent waiting on one it can never
+   * redeem.
    */
   activeApprovalFor(
     agentId: string,
@@ -2427,15 +2460,66 @@ export class Store {
     method: string,
     path: string,
     nowMs: number = Date.now(),
+    bodyHash?: string,
   ): Approval | null {
-    const r = this.db
-      .prepare(
-        "SELECT * FROM approvals WHERE agent_id = ? AND integration_id = ? AND method = ? AND path = ? AND status = 'pending' AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
-      )
-      .get(agentId, integrationId, method.toUpperCase(), path, new Date(nowMs).toISOString()) as
-      | Row
-      | undefined;
+    const params: Array<string> = [agentId, integrationId, method.toUpperCase(), path, new Date(nowMs).toISOString()];
+    let sql =
+      "SELECT * FROM approvals WHERE agent_id = ? AND integration_id = ? AND method = ? AND path = ? AND status = 'pending' AND expires_at > ?";
+    if (bodyHash !== undefined) {
+      sql += " AND body_hash = ?";
+      params.push(bodyHash);
+    }
+    const r = this.db.prepare(`${sql} ORDER BY created_at DESC LIMIT 1`).get(...params) as Row | undefined;
     return r ? rowToApproval(r) : null;
+  }
+
+  /**
+   * Redeems an APPROVED, unexpired, unused approval for exactly this request,
+   * returning it, or null when there is none to spend.
+   *
+   * The match is on everything the owner was shown plus what they could not
+   * see: agent, integration, the require_approval rule that held the call,
+   * method, canonical path (query included, as stored at hold time) and the
+   * body hash. A rejected, expired, still-pending or already-used approval
+   * never matches, and neither does a row with no recorded body hash.
+   *
+   * EXACTLY ONCE: the UPDATE itself re-checks `status = 'approved' AND
+   * used_at IS NULL`, so of two concurrent retries (or two gateway processes
+   * sharing the database) only the first changes the row; the loser sees zero
+   * changes and moves on to the next candidate, or gets null.
+   */
+  redeemApproval(
+    input: {
+      agentId: string;
+      integrationId: string;
+      ruleId: string;
+      method: string;
+      path: string;
+      bodyHash: string;
+    },
+    nowMs: number = Date.now(),
+  ): Approval | null {
+    const iso = new Date(nowMs).toISOString();
+    const candidates = this.db
+      .prepare(
+        "SELECT id FROM approvals WHERE agent_id = ? AND integration_id = ? AND rule_id = ? AND method = ? AND path = ? AND body_hash = ? AND status = 'approved' AND used_at IS NULL AND expires_at > ? ORDER BY created_at ASC",
+      )
+      .all(
+        input.agentId,
+        input.integrationId,
+        input.ruleId,
+        input.method.toUpperCase(),
+        input.path,
+        input.bodyHash,
+        iso,
+      ) as Row[];
+    const claim = this.db.prepare(
+      "UPDATE approvals SET used_at = ? WHERE id = ? AND status = 'approved' AND used_at IS NULL AND expires_at > ?",
+    );
+    for (const c of candidates) {
+      if (Number(claim.run(iso, c.id, iso).changes) === 1) return this.getApproval(String(c.id));
+    }
+    return null;
   }
 
   /**
@@ -2699,10 +2783,12 @@ export class Store {
     llmVendor?: string | null;
     llmStrategy?: LlmStrategy | null;
     llmFailover?: boolean;
+    /** Set when a require_approval hold was let through by this approval. */
+    approvalId?: string | null;
   }): void {
     this.db
       .prepare(
-        "INSERT INTO audit (ts, agent_id, agent_name, integration_id, host, method, path, decision, rule_id, status, connection_id, connection_name, llm_vendor, llm_strategy, llm_failover) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit (ts, agent_id, agent_name, integration_id, host, method, path, decision, rule_id, status, connection_id, connection_name, llm_vendor, llm_strategy, llm_failover, approval_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         now(),
@@ -2720,6 +2806,7 @@ export class Store {
         entry.llmVendor ?? null,
         entry.llmStrategy ?? null,
         entry.llmFailover === undefined ? null : entry.llmFailover ? 1 : 0,
+        entry.approvalId ?? null,
       );
   }
 
@@ -2734,6 +2821,7 @@ export class Store {
       const decision = r.decision as Decision;
       const ruleId = r.rule_id ?? null;
       const status = r.status === null || r.status === undefined ? null : Number(r.status);
+      const approvalId = r.approval_id ?? null;
       return {
         id: Number(r.id),
         ts: r.ts,
@@ -2747,12 +2835,13 @@ export class Store {
         ruleId,
         status,
         source: auditSource(decision),
-        reason: auditReason({ decision, ruleId, status }),
+        reason: auditReason({ decision, ruleId, status, approvalId }),
         connectionId: r.connection_id ?? null,
         connectionName: r.connection_name ?? null,
         llmVendor: r.llm_vendor ?? null,
         llmStrategy: (r.llm_strategy as LlmStrategy | null) ?? null,
         llmFailover: r.llm_failover === null || r.llm_failover === undefined ? null : r.llm_failover === 1,
+        approvalId,
       };
     });
   }
