@@ -561,8 +561,13 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         accessToken: tokens.access_token!,
       };
       if (tokens.refresh_token) data.refreshToken = tokens.refresh_token;
-      if (tokens.expires_in) {
-        data.expiresAt = String(Math.floor(Date.now() / 1000) + tokens.expires_in);
+      const lifetime = tokens.expires_in ?? oauth.defaultExpiresIn;
+      if (lifetime) {
+        data.expiresAt = String(Math.floor(Date.now() / 1000) + lifetime);
+      }
+      for (const [from, to] of Object.entries(oauth.persistTokenFields ?? {})) {
+        const v = tokens[from];
+        if (typeof v === "string" && v) data[to] = v;
       }
       const grantedScopes = tokens.scope ?? pending.scopes.join(" ");
       if (grantedScopes) data.scopes = grantedScopes;

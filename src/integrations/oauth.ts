@@ -72,6 +72,8 @@ export interface TokenResponse {
   scope?: string;
   error?: string;
   error_description?: string;
+  /** Provider-specific extras (Salesforce instance_url), see persistTokenFields. */
+  [extra: string]: unknown;
 }
 
 function tokenRequest(
@@ -220,7 +222,7 @@ async function refreshAccessToken(
   }
   return {
     token: json.access_token!,
-    exp: Date.now() + (json.expires_in ?? 3600) * 1000,
+    exp: Date.now() + (json.expires_in ?? oauth.defaultExpiresIn ?? 3600) * 1000,
   };
 }
 
@@ -275,13 +277,16 @@ export async function oauthBearerToken(
 /**
  * client_credentials grant (MongoDB Atlas service accounts). Client id and
  * secret ride in an HTTP Basic header, the minted token is cached in the
- * settings table.
+ * settings table. `fields` replaces the form body for providers with a
+ * variant grant (Zoom Server-to-Server: grant_type=account_credentials plus
+ * account_id).
  */
 export async function clientCredentialsToken(
   integrationId: string,
   tokenUrl: string,
   cred: Credential,
   store: Store,
+  fields: Record<string, string> = { grant_type: "client_credentials" },
 ): Promise<string> {
   const { clientId, clientSecret } = cred.data;
   if (!clientId || !clientSecret) {
@@ -292,11 +297,11 @@ export async function clientCredentialsToken(
   if (cached) return cached;
 
   const url = process.env[envKey(integrationId, "TOKEN")] ?? tokenUrl;
-  const res = await postForm(url, new URLSearchParams({ grant_type: "client_credentials" }), {
+  const res = await postForm(url, new URLSearchParams(fields), {
     accept: "application/json",
     authorization: "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
   });
-  const json = parseTokenResponse(res, `${integrationId} client_credentials grant`);
+  const json = parseTokenResponse(res, `${integrationId} ${fields.grant_type} grant`);
   const fresh: CachedToken = {
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,

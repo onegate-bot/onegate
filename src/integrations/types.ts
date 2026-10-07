@@ -93,6 +93,20 @@ export interface OAuthDescriptor {
    * parameter for the server.
    */
   fragmentCallback?: { paramName: string };
+  /**
+   * Extra token-response fields to keep on the stored credential, mapped
+   * response key -> credential data key (Salesforce: { instance_url:
+   * "instanceUrl" }). Only string values are kept, from the code exchange.
+   * Never map secret-bearing fields other than the tokens the engine already
+   * stores.
+   */
+  persistTokenFields?: Record<string, string>;
+  /**
+   * Access-token lifetime in seconds assumed when the token response carries
+   * no expires_in. Default 3600. Salesforce omits expires_in and an org admin
+   * may set sessions as short as 15 minutes, so it assumes less.
+   */
+  defaultExpiresIn?: number;
 }
 
 /**

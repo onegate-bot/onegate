@@ -90,6 +90,10 @@ inject(ctx) {
 
 **OAuth refresh tokens.** Store the long-lived refresh token as the credential and mint short-lived access tokens on demand, cached in the settings table via `ctx.store`. See `src/integrations/google.ts` for the full pattern (cache key per credential, refresh when within a minute of expiry).
 
+**Provider extras in the token response.** Some providers return facts the gateway needs later alongside the tokens, such as Salesforce's per-org `instance_url`. List them in the descriptor's `persistTokenFields` (response key to credential data key, e.g. `{ instance_url: "instanceUrl" }`) and the OAuth callback stores the string values on the credential. Providers whose token response carries no `expires_in` can set `defaultExpiresIn` (seconds, default 3600) so the engine refreshes before the real expiry. See `src/integrations/salesforce.ts`.
+
+**Client-credentials variants.** `clientCredentialsToken` takes an optional form body for providers whose service-account grant is not plain `client_credentials` (Zoom Server-to-Server uses `grant_type=account_credentials` plus `account_id`). See `src/integrations/zoom.ts`.
+
 **URL-path credentials.** Some APIs carry the credential in the URL itself (Telegram puts the bot token in the path). `inject` may reassign `ctx.path` and the gateway forwards the rewritten path upstream. Policy evaluation and the audit log always use the original path the agent sent, so the real credential never shows up in rules or logs. See `src/integrations/telegram-bot.ts`. Request bodies can be read (`needsBody`, for payload signing) but not rewritten, an API that only accepts credentials inside the body cannot be injected by OneGate.
 
 **Payload signing.** When the vendor's auth scheme signs the request body (AWS SigV4), declare `needsBody: true` and hash `ctx.body` inside `inject`. See `src/integrations/aws.ts`.
@@ -361,3 +365,4 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `/api/v1/chat/completions`, `/api/v1/completions`.
 - **LLM vendor:** routable like anthropic, openai and gemini. OpenRouter is an OpenAI-compatible aggregator at `https://openrouter.ai/api/v1`, so point the client's base URL there and use OpenRouter model ids (e.g. `anthropic/claude-3.5-sonnet`). Create the key at https://openrouter.ai/keys.
 - **Limitations:** none notable. Cap the key with a credit limit on the OpenRouter dashboard. The client may send `HTTP-Referer` and `X-Title` for attribution, OneGate forwards them unchanged.
+

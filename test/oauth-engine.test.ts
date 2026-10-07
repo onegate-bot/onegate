@@ -242,6 +242,23 @@ describe("token endpoint flows", () => {
       expect(saved?.data.refreshToken).toBe("rt_rotated");
     });
 
+    it("assumes the descriptor's default lifetime when expires_in is absent (Salesforce style)", async () => {
+      respond = () => ({ status: 200, body: { access_token: "no_exp" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      expect(await oauthBearerToken(integ({ defaultExpiresIn: 600 }), c, store)).toBe("no_exp");
+      const cached = store.getSecretSetting<{ exp: number }>("oauth_access_token:testx:cr_oauth")!;
+      expect(cached.exp - Date.now()).toBeLessThanOrEqual(600_000);
+      expect(cached.exp - Date.now()).toBeGreaterThan(590_000);
+    });
+
+    it("falls back to an hour when neither expires_in nor a default is given", async () => {
+      respond = () => ({ status: 200, body: { access_token: "no_exp" } });
+      const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
+      await oauthBearerToken(integ(), c, store);
+      const cached = store.getSecretSetting<{ exp: number }>("oauth_access_token:testx:cr_oauth")!;
+      expect(cached.exp - Date.now()).toBeGreaterThan(3_590_000);
+    });
+
     it("surfaces refresh failures", async () => {
       respond = () => ({ status: 401, body: { error: "invalid_client" } });
       const c = cred({ clientId: "cid", clientSecret: "cs", refreshToken: "rt" });
@@ -312,6 +329,23 @@ describe("token endpoint flows", () => {
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(await clientCredentialsToken("testx", url, c, store)).toBe("cc_at");
       expect(calls).toBe(1);
+    });
+
+    it("sends a caller-supplied grant body (Zoom account_credentials style)", async () => {
+      respond = (req) => {
+        const form = new URLSearchParams(req.body);
+        expect(form.get("grant_type")).toBe("account_credentials");
+        expect(form.get("account_id")).toBe("acct");
+        return { status: 200, body: { access_token: "acct_at", expires_in: 3600 } };
+      };
+      const store = new Store(":memory:");
+      const c = cred({ clientId: "svc_id", clientSecret: "svc_secret" });
+      expect(
+        await clientCredentialsToken("testx", url, c, store, {
+          grant_type: "account_credentials",
+          account_id: "acct",
+        }),
+      ).toBe("acct_at");
     });
 
     it("requires both client id and secret", async () => {
