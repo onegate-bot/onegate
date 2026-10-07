@@ -978,3 +978,40 @@ describe("token format", () => {
     expect(newAgentToken()).not.toBe(newAgentToken());
   });
 });
+
+describe("token caches follow credential data", () => {
+  const seed = (store: Store, vendor: string, id: string) => {
+    store.setSecretSetting(`oauth_access_token:${vendor}:${id}`, { token: "o", exp: Date.now() + 3_600_000 });
+    store.setSecretSetting(`docker_hub_jwt:${id}`, { token: "d", exp: Date.now() + 3_600_000 });
+    store.setSecretSetting(`github_app_token:${id}`, { token: "g", exp: Date.now() + 3_600_000 });
+    store.setSecretSetting(`gcp_access_token:${id}:abc`, { token: "c", exp: Date.now() + 3_600_000 });
+  };
+  const cached = (store: Store, vendor: string, id: string) =>
+    [
+      `oauth_access_token:${vendor}:${id}`,
+      `docker_hub_jwt:${id}`,
+      `github_app_token:${id}`,
+      `gcp_access_token:${id}:abc`,
+    ].filter((k) => store.getSecretSetting(k) !== null).length;
+
+  it("setCredential with new data purges every cached token, keepTokenCache leaves them", () => {
+    const store = new Store(":memory:");
+    const { id } = store.setCredential("docker", "t", { username: "u", pat: "p1" });
+    seed(store, "docker", id);
+    store.setCredential("docker", "t", { username: "u", pat: "p2" }, { keepTokenCache: true });
+    expect(cached(store, "docker", id)).toBe(4);
+    store.setCredential("docker", "t", { username: "u", pat: "p3" });
+    expect(cached(store, "docker", id)).toBe(0);
+  });
+
+  it("updateConnection with data purges every cached token, keepTokenCache or a rename leaves them", () => {
+    const store = new Store(":memory:");
+    const conn = store.createConnection({ kind: "app", vendor: "gcp", name: "g", data: { serviceAccountJson: "{}" } });
+    seed(store, "gcp", conn.id);
+    store.updateConnection(conn.id, { data: { serviceAccountJson: "{ }" } }, { keepTokenCache: true });
+    store.updateConnection(conn.id, { name: "renamed" });
+    expect(cached(store, "gcp", conn.id)).toBe(4);
+    store.updateConnection(conn.id, { data: { serviceAccountJson: "{  }" } });
+    expect(cached(store, "gcp", conn.id)).toBe(0);
+  });
+});

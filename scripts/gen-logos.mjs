@@ -18,6 +18,13 @@ const SLUGS = {
   docker: "docker", "jfrog-artifactory": "jfrog", "github-app": "github",
   elevenlabs: "elevenlabs", make: "make", flyio: "flydotio", hetzner: "hetzner",
   youtube: "youtube",
+  hubspot: "hubspot",
+  sentry: "sentry",
+  datadog: "datadog",
+  posthog: "posthog",
+  zoom: "zoom",
+  airtable: "airtable",
+  asana: "asana",
 };
 
 // Brands simple-icons no longer ships: monogram fallback (title + brand hex).
@@ -29,6 +36,9 @@ const FALLBACK = {
   monday: { title: "monday", hex: "FF3D57" },
   linkedin: { title: "LinkedIn", hex: "0A66C2" },
   tavily: { title: "Tavily", hex: "3B82F6" },
+  salesforce: { title: "Salesforce", hex: "00A1E0" },
+  microsoft: { title: "Microsoft 365", hex: "0078D4" },
+  attio: { title: "Attio", hex: "1F2328" },
   typesafe: { title: "TypeSafe", hex: "334155" },
 };
 

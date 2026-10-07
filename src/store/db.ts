@@ -1108,14 +1108,42 @@ export class Store {
   // ---- credentials ----
 
   /** Inserts or replaces the credential for an integration (one per integration). */
-  setCredential(integrationId: string, name: string, data: Record<string, string>): Credential {
+  /**
+   * Drops every token minted from one credential or connection (OAuth access
+   * token, Docker Hub JWT, GitHub App installation token, GCP access tokens).
+   * Run whenever the source data is replaced or deleted, so a cached token can
+   * never outlive or cross over from the data it was minted for (a Salesforce
+   * instanceUrl edit, a Zoom account change).
+   */
+  private purgeTokenCaches(vendor: string, id: string): void {
+    this.deleteSetting(`oauth_access_token:${vendor}:${id}`);
+    this.deleteSetting(`docker_hub_jwt:${id}`);
+    this.deleteSetting(`github_app_token:${id}`);
+    this.deleteSettingsByPrefix(`gcp_access_token:${id}:`);
+  }
+
+  /**
+   * Upserts the legacy credential. Replacing data purges the tokens cached for
+   * it; `keepTokenCache` is for the OAuth refresh path only, which writes a
+   * rotated refresh token and then caches the token it just minted.
+   */
+  setCredential(
+    integrationId: string,
+    name: string,
+    data: Record<string, string>,
+    opts: { keepTokenCache?: boolean } = {},
+  ): Credential {
     const c: Credential = { id: newId("cr"), integrationId, name, data, createdAt: now() };
-    this.db
-      .prepare(
-        `INSERT INTO credentials (id, integration_id, name, data, created_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(integration_id) DO UPDATE SET name = excluded.name, data = excluded.data`,
-      )
-      .run(c.id, c.integrationId, c.name, this.secrets.seal(c.data), c.createdAt);
+    const prev = this.getCredential(integrationId);
+    this.tx(() => {
+      this.db
+        .prepare(
+          `INSERT INTO credentials (id, integration_id, name, data, created_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(integration_id) DO UPDATE SET name = excluded.name, data = excluded.data`,
+        )
+        .run(c.id, c.integrationId, c.name, this.secrets.seal(c.data), c.createdAt);
+      if (prev && !opts.keepTokenCache) this.purgeTokenCaches(integrationId, prev.id);
+    });
     return this.getCredential(integrationId)!;
   }
 
@@ -1133,7 +1161,13 @@ export class Store {
   }
 
   deleteCredential(integrationId: string): void {
-    this.db.prepare("DELETE FROM credentials WHERE integration_id = ?").run(integrationId);
+    const cur = this.getCredential(integrationId);
+    this.tx(() => {
+      this.db.prepare("DELETE FROM credentials WHERE integration_id = ?").run(integrationId);
+      // Like deleteConnection: drop the cached tokens too, so a deleted
+      // credential's live token cannot outlive it.
+      if (cur) this.purgeTokenCaches(integrationId, cur.id);
+    });
   }
 
   // ---- connections (multi-credential) ----
@@ -1471,9 +1505,14 @@ export class Store {
    * connections always has exactly one default). The owner bucket cannot be
    * changed here.
    */
+  /**
+   * Replacing `data` purges the tokens cached for the connection, except with
+   * `keepTokenCache` (the OAuth refresh path, see setCredential).
+   */
   updateConnection(
     id: string,
     patch: { name?: string; data?: Record<string, string>; isDefault?: boolean },
+    opts: { keepTokenCache?: boolean } = {},
   ): Connection | null {
     const cur = this.getConnection(id);
     if (!cur) return null;
@@ -1493,6 +1532,7 @@ export class Store {
           now(),
           id,
         );
+      if (patch.data && !opts.keepTokenCache) this.purgeTokenCaches(cur.vendor, id);
     });
     return this.getConnection(id);
   }
@@ -1505,10 +1545,7 @@ export class Store {
     // (or, with grants cascaded off, in a half-torn state). Run both together.
     this.tx(() => {
       this.db.prepare("DELETE FROM connections WHERE id = ?").run(id);
-      this.deleteSetting(`oauth_access_token:${cur.vendor}:${id}`);
-      this.deleteSetting(`docker_hub_jwt:${id}`);
-      this.deleteSetting(`github_app_token:${id}`);
-      this.deleteSettingsByPrefix(`gcp_access_token:${id}:`);
+      this.purgeTokenCaches(cur.vendor, id);
       if (cur.isDefault) {
         const next = this.listConnections({
           kind: cur.kind,
