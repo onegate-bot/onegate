@@ -366,3 +366,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **LLM vendor:** routable like anthropic, openai and gemini. OpenRouter is an OpenAI-compatible aggregator at `https://openrouter.ai/api/v1`, so point the client's base URL there and use OpenRouter model ids (e.g. `anthropic/claude-3.5-sonnet`). Create the key at https://openrouter.ai/keys.
 - **Limitations:** none notable. Cap the key with a credit limit on the OpenRouter dashboard. The client may send `HTTP-Referer` and `X-Title` for attribution, OneGate forwards them unchanged.
 
+### sentry
+
+- **Credential:** an organization auth token (`sntrys_`) or personal user auth token (`sntryu_`), injected as `Bearer`.
+- **Hosts:** `sentry.io`, `us.sentry.io`, `de.sentry.io` (exact hosts only, so event ingestion on `*.ingest.sentry.io` keeps passing through untouched).
+- **Suggested policy:** `GET /api/0/organizations/<org>/issues/**` and `GET /api/0/projects/<org>/**` for triage, add `PUT /api/0/organizations/<org>/issues/**` to resolve or assign.
+- **Limitations:** sentry.io SaaS only. Self-hosted Sentry needs a community integration with the instance host.
+

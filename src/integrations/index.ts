@@ -47,6 +47,7 @@ import { jfrogArtifactory } from "./jfrog-artifactory.js";
 import { githubApp } from "./github-app.js";
 import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
+import { sentry } from "./sentry.js";
 
 /**
  * Built-ins. Array order does NOT decide which integration owns a host:
@@ -105,6 +106,7 @@ const BUILTINS: Integration[] = [
   githubApp,
   elevenlabs,
   make,
+  sentry,
 ];
 
 /**
