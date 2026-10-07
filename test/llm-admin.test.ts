@@ -797,6 +797,42 @@ describe("openrouter LLM connections", () => {
   });
 });
 
+describe("typesafe LLM connections", () => {
+  it("lists typesafe as an LLM vendor in the integration catalog", async () => {
+    const r = await api("GET", "/api/integrations");
+    expect(r.status).toBe(200);
+    const ts = r.json.find((i: any) => i.id === "typesafe");
+    expect(ts.title).toBe("TypeSafe (Jev)");
+    expect(ts.llm.vendor).toBe("typesafe");
+    expect(ts.credentialFields.map((f: any) => f.key)).toEqual(["apiKey"]);
+  });
+
+  it("creates a typesafe connection without echoing the secret, and requires apiKey", async () => {
+    const r = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "typesafe",
+      name: "Jev - prod",
+      data: { apiKey: "ts-live-secret-key-value" },
+    });
+    expect(r.status).toBe(201);
+    expect(r.json.vendor).toBe("typesafe");
+    expect(r.json.data).toBeUndefined();
+    expect(r.text).not.toContain("ts-live-secret-key-value");
+    expect(r.json.secretPreview).toBe("ts-live-secr...alue");
+
+    // Only an apiKey authenticates: some other non-empty field is not enough.
+    const wrongField = await api("POST", "/api/connections", {
+      kind: "llm",
+      vendor: "typesafe",
+      name: "Jev - bad",
+      data: { token: "ts-elsewhere" },
+    });
+    expect(wrongField.status).toBe(400);
+    expect(wrongField.json.error).toBe("invalid_data");
+    expect(wrongField.json.message ?? wrongField.text).toContain("apiKey");
+  });
+});
+
 describe("derived LLM mode on agents list and per-agent llm endpoint", () => {
   it("list carries llmMode and the llm endpoint carries a matching mode", async () => {
     // Seed a connection (anthropic, llm).
