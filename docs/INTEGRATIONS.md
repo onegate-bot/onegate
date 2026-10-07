@@ -380,3 +380,11 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Suggested policy:** `GET /crm/v3/objects/**` plus `POST /crm/v3/objects/*/search` for read-only agents, add `POST`/`PATCH` on `/crm/v3/objects/**` for writers.
 - **Limitations:** private app tokens only. A public OAuth app flow is not implemented yet. Scopes are fixed on the private app, keep them narrow.
 
+### posthog
+
+- **Credential:** a personal API key (`phx_`), injected as `Bearer`, plus an optional non-secret **Region** (`us` or `eu`).
+- **Hosts:** `us.posthog.com`, `eu.posthog.com`, `app.posthog.com`. The ingestion hosts (`us.i.posthog.com`, `eu.i.posthog.com`) take the public project key in the body and are not claimed.
+- **Suggested policy:** `GET /api/projects/<id>/**` plus `POST /api/projects/<id>/query/` for analytics agents.
+- **Discovery summary:** `region` and `apiBaseUrl` (for example `https://eu.posthog.com`) when the Region field is set, so the agent calls the host its key lives on.
+- **Limitations:** PostHog Cloud only. Self-hosted instances need a community integration.
+

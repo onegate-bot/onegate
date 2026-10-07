@@ -49,6 +49,7 @@ import { elevenlabs } from "./elevenlabs.js";
 import { make } from "./make.js";
 import { hubspot } from "./hubspot.js";
 import { sentry } from "./sentry.js";
+import { posthog } from "./posthog.js";
 
 /**
  * Built-ins. Array order does NOT decide which integration owns a host:
@@ -109,6 +110,7 @@ const BUILTINS: Integration[] = [
   make,
   hubspot,
   sentry,
+  posthog,
 ];
 
 /**

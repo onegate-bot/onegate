@@ -18,6 +18,7 @@ import { buildAuthUrl } from "../src/integrations/oauth.js";
 import type { Integration } from "../src/integrations/types.js";
 import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
+import { posthog } from "../src/integrations/posthog.js";
 import { INTEGRATION_LOGOS } from "../src/admin/logos.js";
 import { Store } from "../src/store/db.js";
 import { initCa } from "../src/ca.js";
@@ -35,6 +36,7 @@ function ctxFor(host: string, credential: Credential, store: Store, headers: Inc
 const BATCH: Integration[] = [
   hubspot,
   sentry,
+  posthog,
 ];
 
 describe("batch 8 registry claims", () => {
@@ -45,6 +47,9 @@ describe("batch 8 registry claims", () => {
       "sentry.io": "sentry",
       "us.sentry.io": "sentry",
       "de.sentry.io": "sentry",
+      "us.posthog.com": "posthog",
+      "eu.posthog.com": "posthog",
+      "app.posthog.com": "posthog",
     };
     for (const [host, id] of Object.entries(expected)) {
       expect(registry.resolveHostCandidates(host).map((i) => i.id), host).toEqual([id]);
@@ -89,6 +94,7 @@ describe("batch 8 static token integrations", () => {
   const cases: [Integration, string, Record<string, string>, string][] = [
     [hubspot, "api.hubapi.com", { token: "pat-na1-x" }, "Bearer pat-na1-x"],
     [sentry, "us.sentry.io", { token: "sntryu_x" }, "Bearer sntryu_x"],
+    [posthog, "eu.posthog.com", { apiKey: "phx_x" }, "Bearer phx_x"],
   ];
 
   for (const [integration, host, data, expected] of cases) {
@@ -103,6 +109,17 @@ describe("batch 8 static token integrations", () => {
     });
   }
 
+  it("posthog summarizes the region and API base, ignoring junk", () => {
+    expect(posthog.accountSummary!(cred({ apiKey: "k", region: " EU " }))).toEqual({
+      region: "eu",
+      apiBaseUrl: "https://eu.posthog.com",
+    });
+    expect(posthog.accountSummary!(cred({ apiKey: "k" }))).toEqual({ region: null, apiBaseUrl: null });
+    expect(posthog.accountSummary!(cred({ apiKey: "k", region: "mars" }))).toEqual({
+      region: null,
+      apiBaseUrl: null,
+    });
+  });
 });
 
 

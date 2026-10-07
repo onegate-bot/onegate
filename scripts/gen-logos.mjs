@@ -20,6 +20,7 @@ const SLUGS = {
   youtube: "youtube",
   hubspot: "hubspot",
   sentry: "sentry",
+  posthog: "posthog",
 };
 
 // Brands simple-icons no longer ships: monogram fallback (title + brand hex).
