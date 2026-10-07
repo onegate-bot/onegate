@@ -126,6 +126,29 @@ describe("usageFromObject / usageFromJson (pure)", () => {
     ).toEqual({ inputTokens: 5, outputTokens: 7 });
   });
 
+  it("parses a TypeSafe Jev evaluation (typed answers, anthropic-style usage)", () => {
+    const body = JSON.stringify({
+      model: "jev-1.13.0",
+      answers: {
+        department: {
+          type: "choice",
+          choice: "billing",
+          probabilities: { billing: 0.88, technical: 0.12, sales: 0.0 },
+          confidence: 0.81,
+        },
+      },
+      usage: { input_tokens: 318, output_tokens: 34 },
+    });
+    expect(usageFromJson(body)).toEqual({ inputTokens: 318, outputTokens: 34 });
+  });
+
+  it("reads the Jev model from a TypeSafe request body", () => {
+    const body = Buffer.from(
+      JSON.stringify({ state: "x", model: "jev-latest", questions: { q: { type: "noul", instructions: "?" } } }),
+    );
+    expect(extractRequestModel("/v1/systemone", body)).toBe("jev-latest");
+  });
+
   it("parses anthropic message_start (usage nested in message)", () => {
     expect(
       usageFromObject({

@@ -128,7 +128,7 @@ export type LlmStrategy = "fallback" | "round-robin";
 /**
  * A named credential. Connections let a vendor hold MANY credentials at once.
  *
- * - kind "llm" (vendor anthropic|openai|gemini): the per-agent LLM routing
+ * - kind "llm" (vendor anthropic|openai|gemini|openrouter|typesafe): the per-agent LLM routing
  *   engine picks one per request. Always tenant-wide (ownerAgentId null).
  * - kind "app" (vendor = the integration id, e.g. github|slack): multiple
  *   named accounts for one app integration. A connection is either tenant-wide
@@ -145,12 +145,13 @@ export type LlmStrategy = "fallback" | "round-robin";
 export interface Connection {
   id: string;
   kind: ConnectionKind;
-  /** For llm: the vendor id (anthropic|openai|gemini). For app: the integration id. */
+  /** For llm: the vendor id (anthropic|openai|gemini|openrouter|typesafe). For app: the integration id. */
   vendor: string;
   /** User label, e.g. "Anthropic - prod". */
   name: string;
   /**
-   * Vendor-specific secret material. anthropic/gemini: { apiKey }.
+   * Vendor-specific secret material. gemini/openrouter/typesafe: { apiKey }.
+   * anthropic: { apiKey } or { authToken } (optionally tagged with authMode).
    * openai: { apiKey } or an imported auth.json shape
    * { accessToken, accountId? } (Codex-CLI style). App connections carry the
    * same fields the integration's credentialFields declare.

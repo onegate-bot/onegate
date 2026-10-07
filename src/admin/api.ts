@@ -1347,7 +1347,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   // ---- connections (multi-credential, LLM routing) ----
 
-  /** LLM vendor ids known to this registry (anthropic, openai, gemini, ...). */
+  /** LLM vendor ids known to this registry (anthropic, openai, gemini, typesafe, ...). */
   function llmVendors(): Set<string> {
     return new Set(
       registry
@@ -1359,9 +1359,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   /**
    * Validates LLM connection secret material. anthropic accepts an apiKey OR a
-   * subscription authToken (optionally tagged with authMode). gemini needs an
-   * apiKey. openai accepts an apiKey OR an imported auth.json shape
-   * (accessToken with optional accountId). Unknown llm vendors (community)
+   * subscription authToken (optionally tagged with authMode). gemini and
+   * typesafe need an apiKey. openai accepts an apiKey OR an imported auth.json
+   * shape (accessToken with optional accountId). Unknown llm vendors (community)
    * just need some non-empty material. Returns an error string or null.
    */
   function validateLlmData(vendor: string, data: unknown): string | null {
@@ -1393,7 +1393,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       if (d.authToken) return anthropicSecretMismatch("auth_token", d.authToken as string);
       return anthropicSecretMismatch("api_key", d.apiKey as string);
     }
-    if (vendor === "gemini") {
+    if (vendor === "gemini" || vendor === "typesafe") {
       if (!d.apiKey) return `${vendor} connections need "apiKey"`;
       return null;
     }

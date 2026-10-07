@@ -39,6 +39,7 @@ const FALLBACK = {
   salesforce: { title: "Salesforce", hex: "00A1E0" },
   microsoft: { title: "Microsoft 365", hex: "0078D4" },
   attio: { title: "Attio", hex: "1F2328" },
+  typesafe: { title: "TypeSafe", hex: "334155" },
 };
 
 const exportFor = (slug) => "si" + slug.charAt(0).toUpperCase() + slug.slice(1);
