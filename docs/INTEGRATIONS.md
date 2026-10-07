@@ -417,3 +417,11 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Discovery summary:** `site` and `apiBaseUrl`. When Site is set the keys are bound to that site's API host, other regions are refused in the gateway.
 - **Limitations:** scope the application key (or use a service account's key) at the vendor side, the API key alone can submit data.
 
+### zoom
+
+- **Credential:** a Server-to-Server OAuth app: Account ID, Client ID and Client secret. OneGate mints one-hour tokens with the `account_credentials` grant at request time (cached) and injects `Bearer`. Nothing is exchanged at connect time.
+- **Hosts:** `api.zoom.us`.
+- **Suggested policy:** `GET /v2/users/*/meetings` and `GET /v2/meetings/**` for read-only agents, add `POST /v2/users/*/meetings` to schedule.
+- **Discovery summary:** `accountId`.
+- **Limitations:** Server-to-Server apps act account-wide (no `/users/me`), scopes live on the app. User-level OAuth (a General app) is not implemented yet.
+

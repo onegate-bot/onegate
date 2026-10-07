@@ -22,6 +22,7 @@ const SLUGS = {
   sentry: "sentry",
   datadog: "datadog",
   posthog: "posthog",
+  zoom: "zoom",
   airtable: "airtable",
   asana: "asana",
 };

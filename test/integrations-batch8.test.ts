@@ -20,6 +20,7 @@ import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
 import { datadog, normalizeDatadogSite, DATADOG_SITES } from "../src/integrations/datadog.js";
 import { posthog } from "../src/integrations/posthog.js";
+import { zoom } from "../src/integrations/zoom.js";
 import { attio } from "../src/integrations/attio.js";
 import { airtable } from "../src/integrations/airtable.js";
 import { asana } from "../src/integrations/asana.js";
@@ -42,6 +43,7 @@ const BATCH: Integration[] = [
   sentry,
   datadog,
   posthog,
+  zoom,
   attio,
   airtable,
   asana,
@@ -64,6 +66,7 @@ describe("batch 8 registry claims", () => {
       "us.posthog.com": "posthog",
       "eu.posthog.com": "posthog",
       "app.posthog.com": "posthog",
+      "api.zoom.us": "zoom",
       "api.attio.com": "attio",
       "api.airtable.com": "airtable",
       "content.airtable.com": "airtable",
@@ -202,5 +205,84 @@ describe("datadog integration", () => {
     });
     expect(datadog.accountSummary!(cred({ apiKey: "k", site: "nope" }))).toEqual({ site: null, apiBaseUrl: null });
   });
+});
+
+describe("token flows against a local stub (zoom, salesforce, microsoft)", () => {
+  let server: http.Server;
+  let store: Store;
+  let zoomGrants = 0;
+  let lastZoom: { auth: string; params: URLSearchParams } | null = null;
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const json = (status: number, payload: unknown) => {
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        if (req.url === "/zoom/token") {
+          zoomGrants++;
+          lastZoom = { auth: req.headers.authorization ?? "", params };
+          if (lastZoom.auth !== "Basic " + Buffer.from("zcid:zsecret").toString("base64")) {
+            json(401, { reason: "Invalid client_id or client_secret", error: "invalid_client" });
+            return;
+          }
+          json(200, { access_token: `zoom_at_${zoomGrants}`, token_type: "bearer", expires_in: 3599 });
+          return;
+        }
+        res.writeHead(404).end();
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM = `http://127.0.0.1:${port}/zoom/token`;
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ONEGATE_OAUTH_TOKEN_URL_ZOOM;
+  });
+
+  beforeEach(() => {
+    store = new Store(":memory:");
+    zoomGrants = 0;
+    lastZoom = null;
+  });
+
+  it("zoom mints an account_credentials token with Basic auth, injects Bearer and caches", async () => {
+    const c = cred({ accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" }, "zoom");
+    const ctx1 = ctxFor("api.zoom.us", c, store, { authorization: "Bearer og_placeholder" });
+    await zoom.inject(ctx1);
+    const ctx2 = ctxFor("api.zoom.us", c, store);
+    await zoom.inject(ctx2);
+    expect(ctx1.headers.authorization).toBe("Bearer zoom_at_1");
+    expect(ctx2.headers.authorization).toBe("Bearer zoom_at_1");
+    expect(zoomGrants).toBe(1);
+    expect(lastZoom!.params.get("grant_type")).toBe("account_credentials");
+    expect(lastZoom!.params.get("account_id")).toBe("acct_1");
+    // Client credentials ride in the Basic header, never the body.
+    expect(lastZoom!.params.has("client_secret")).toBe(false);
+  });
+
+  it("zoom surfaces vendor rejections and requires an account id", async () => {
+    const bad = cred({ accountId: "acct_1", clientId: "zcid", clientSecret: "wrong" }, "zoom");
+    await expect(zoom.inject(ctxFor("api.zoom.us", bad, store))).rejects.toThrow(
+      /account_credentials grant failed \(401\)/,
+    );
+    const noAcct = cred({ clientId: "zcid", clientSecret: "zsecret" }, "zoom");
+    await expect(zoom.inject(ctxFor("api.zoom.us", noAcct, store))).rejects.toThrow(/accountId/);
+    expect(zoom.accountSummary!(cred({ accountId: "acct_1" }))).toEqual({ accountId: "acct_1" });
+    expect(zoom.accountSummary!(cred({}))).toEqual({ accountId: null });
+  });
+
+
+
+
+
+
+
 });
 

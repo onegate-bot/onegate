@@ -51,6 +51,7 @@ import { hubspot } from "./hubspot.js";
 import { sentry } from "./sentry.js";
 import { datadog } from "./datadog.js";
 import { posthog } from "./posthog.js";
+import { zoom } from "./zoom.js";
 import { attio } from "./attio.js";
 import { airtable } from "./airtable.js";
 import { asana } from "./asana.js";
@@ -116,6 +117,7 @@ const BUILTINS: Integration[] = [
   sentry,
   datadog,
   posthog,
+  zoom,
   attio,
   airtable,
   asana,
