@@ -384,10 +384,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 
 ### posthog
 
-- **Credential:** a personal API key (`phx_`), injected as `Bearer`, plus an optional non-secret **Region** (`us` or `eu`).
+- **Credential:** a personal API key (`phx_`), injected as `Bearer`, plus a required non-secret **Region** (`us` or `eu`). A missing or unknown region is rejected with `400 invalid_data` when the credential is saved.
 - **Hosts:** `us.posthog.com`, `eu.posthog.com`, `app.posthog.com`. The ingestion hosts (`us.i.posthog.com`, `eu.i.posthog.com`) take the public project key in the body and are not claimed.
 - **Suggested policy:** `GET /api/projects/<id>/**` plus `POST /api/projects/<id>/query/` for analytics agents.
-- **Discovery summary:** `region` and `apiBaseUrl` (for example `https://eu.posthog.com`) when the Region field is set, so the agent calls the host its key lives on. A set Region also binds the key: requests to the other region's host (and to `app.posthog.com` for `eu`) are refused in the gateway. `app.posthog.com` is the legacy US host.
+- **Discovery summary:** `region` and `apiBaseUrl` (for example `https://eu.posthog.com`), so the agent calls the host its key lives on. The Region also binds the key: requests to the other region's host (and to `app.posthog.com` for `eu`) are refused in the gateway. `app.posthog.com` is the legacy US host.
 - **Limitations:** PostHog Cloud only. Self-hosted instances need a community integration.
 
 ### attio

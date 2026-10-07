@@ -199,8 +199,11 @@ function currentOriginData(
 
 /**
  * Applies `delta` onto the origin row as it is NOW (so a concurrent admin edit
- * or re-authorize is kept), writing only when something changes. Returns false
- * when the origin row no longer exists, in which case nothing is written.
+ * of other fields is kept), writing only when something changes. Returns false,
+ * writing nothing, when the origin row no longer exists or its refresh token
+ * changed since this refresh started (a concurrent re-authorize or edit): the
+ * stale delta must not clobber the new account, and the caller must not cache
+ * a token minted for the old one.
  */
 function applyCredentialDelta(
   store: Store,
@@ -209,7 +212,7 @@ function applyCredentialDelta(
   delta: Record<string, string>,
 ): boolean {
   const current = currentOriginData(store, integrationId, cred);
-  if (!current) return false;
+  if (!current || current.refreshToken !== cred.data.refreshToken) return false;
   if (Object.entries(delta).every(([k, v]) => current[k] === v)) return true;
   const data = { ...current, ...delta };
   // keepTokenCache: the caller caches the token it just minted right after.
@@ -219,6 +222,13 @@ function applyCredentialDelta(
     store.setCredential(integrationId, cred.name, data, { keepTokenCache: true });
   }
   return true;
+}
+
+/** Order-independent equality of two credential data objects (null never matches). */
+function sameData(a: Record<string, string> | null, b: Record<string, string>): boolean {
+  if (!a) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
 }
 
 interface CachedToken {
@@ -398,8 +408,11 @@ export async function clientCredentialsToken(
     token: json.access_token!,
     exp: Date.now() + (json.expires_in ?? 3600) * 1000,
   };
-  // A credential deleted while the grant was in flight (revoked connection)
-  // must not have its token cached.
-  if (currentOriginData(store, integrationId, cred)) store.setSecretSetting(key, fresh);
+  // Cache only if the row still exists with the exact data the grant used: a
+  // credential deleted (revoked) or edited (Zoom account switch, new secret)
+  // while the grant was in flight must not get the old inputs' token.
+  if (sameData(currentOriginData(store, integrationId, cred), cred.data)) {
+    store.setSecretSetting(key, fresh);
+  }
   return fresh.token;
 }

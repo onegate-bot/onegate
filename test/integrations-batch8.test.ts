@@ -122,7 +122,7 @@ describe("batch 8 static token integrations", () => {
   const cases: [Integration, string, Record<string, string>, string][] = [
     [hubspot, "api.hubapi.com", { token: "pat-na1-x" }, "Bearer pat-na1-x"],
     [sentry, "us.sentry.io", { token: "sntryu_x" }, "Bearer sntryu_x"],
-    [posthog, "eu.posthog.com", { apiKey: "phx_x" }, "Bearer phx_x"],
+    [posthog, "eu.posthog.com", { apiKey: "phx_x", region: "eu" }, "Bearer phx_x"],
     [attio, "api.attio.com", { apiKey: "attio_x" }, "Bearer attio_x"],
     [airtable, "content.airtable.com", { token: "patX.y" }, "Bearer patX.y"],
     [asana, "app.asana.com", { token: "2/123/456:abc" }, "Bearer 2/123/456:abc"],
@@ -352,6 +352,14 @@ describe("token flows against a local stub (zoom, salesforce, microsoft)", () =>
     await zoom.inject(ctxFor("api.zoom.us", c, store));
     expect(store.getSecretSetting(`oauth_access_token:zoom:${conn.id}`)).toBeNull();
     expect(store.getCredential("zoom")).toBeNull();
+  });
+
+  it("zoom does not cache a token minted for an account edited mid-request", async () => {
+    const c = store.setCredential("zoom", "t", { accountId: "acct_1", clientId: "zcid", clientSecret: "zsecret" });
+    onZoomMint = () => store.setCredential("zoom", "t", { accountId: "acct_2", clientId: "zcid", clientSecret: "zsecret" });
+    await zoom.inject(ctxFor("api.zoom.us", c, store));
+    expect(store.getSecretSetting(`oauth_access_token:zoom:${c.id}`)).toBeNull();
+    expect(store.getCredential("zoom")!.data.accountId).toBe("acct_2");
   });
 
   it("zoom re-mints after the account ID is edited instead of reusing the old account's token", async () => {
@@ -688,7 +696,15 @@ describe("OAuth callback persists Salesforce's instance_url (admin app, stub tok
     expect(conn.text).toContain("must be us or eu");
     const ok = await request("PUT", "/api/credentials/posthog", { data: { apiKey: "phx_x", region: "EU" } });
     expect(ok.status).toBe(200);
-    expect(posthog.validateCredential!({ apiKey: "phx_x" })).toBeNull();
+    expect(posthog.validateCredential!({ apiKey: "phx_x" })).toBe("data.region is required (us or eu)");
+    expect(posthog.validateCredential!({ apiKey: "phx_x", region: " " })).toBe("data.region is required (us or eu)");
+    const missing = await request("PUT", "/api/credentials/posthog", { data: { apiKey: "phx_x" } });
+    expect(missing.status).toBe(400);
+    expect(missing.text).toContain("region is required");
+    // Stored without a region some other way, inject refuses instead of sending the key anywhere.
+    expect(() =>
+      posthog.inject({ headers: {}, method: "GET", path: "/", host: "us.posthog.com", credential: cred({ apiKey: "phx_x" }), store }),
+    ).toThrow(/no valid "region"/);
   });
 
   it("re-authorizing a connection to another org drops the old org's cached token", async () => {

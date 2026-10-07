@@ -362,6 +362,29 @@ describe("token endpoint flows", () => {
       });
     });
 
+    it("drops a stale refresh when the refresh token was replaced mid-flight (re-authorize)", async () => {
+      const c = store.setCredential("testx", "t", {
+        clientId: "cid",
+        clientSecret: "cs",
+        refreshToken: "rt_old_account",
+        instanceUrl: "https://old.example",
+      });
+      respond = () => {
+        // A re-authorize to another account lands while the refresh is in flight.
+        store.setCredential("testx", "t", {
+          clientId: "cid",
+          clientSecret: "cs",
+          refreshToken: "rt_new_account",
+          instanceUrl: "https://new-account.example",
+        });
+        return { status: 200, body: { access_token: "at_old", refresh_token: "rt_old_rotated", instance_url: "https://old.example" } };
+      };
+      await oauthBearerToken(integ({ persistTokenFields: { instance_url: "instanceUrl" } }), c, store);
+      expect(store.getCredential("testx")!.data.refreshToken).toBe("rt_new_account");
+      expect(store.getCredential("testx")!.data.instanceUrl).toBe("https://new-account.example");
+      expect(store.getSecretSetting(`oauth_access_token:testx:${c.id}`)).toBeNull();
+    });
+
     it("never resurrects a connection deleted mid-refresh, and does not cache its token", async () => {
       const conn = store.createConnection({
         kind: "app",
