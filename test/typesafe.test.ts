@@ -2,8 +2,9 @@
  * End-to-end tests for TypeSafe (Jev) as a routed LLM vendor, using the real
  * built-in integration. A stub https server answers for api.typesafe.ai and
  * its response is driven by the injected Bearer key: "ts-529" is overloaded,
- * "ts-401" is a revoked key, "ts-429" is rate limited, anything else returns
- * a Jev evaluation (typed answers plus usage.input_tokens/output_tokens).
+ * anything else returns a Jev evaluation (typed answers plus
+ * usage.input_tokens/output_tokens). Vendor-agnostic routing behavior (429
+ * cooldowns, 401 benching) is covered in llm-proxy and inactive-connections.
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
@@ -64,8 +65,6 @@ beforeAll(async () => {
           res.end(JSON.stringify({ error: { type } }));
         };
         if (auth === "Bearer ts-529") return fail(529, "overloaded");
-        if (auth === "Bearer ts-401") return fail(401, "unauthorized");
-        if (auth === "Bearer ts-429") return fail(429, "rate_limited");
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -155,8 +154,8 @@ function viaProxy(
             host: HOST,
             method: opts.method ?? "POST",
             path: opts.path ?? "/v1/systemone",
-            // The agent only ever holds a placeholder key, as with the TypeSafe SDK
-            // pointed at the gateway (TYPESAFE_API_KEY=placeholder).
+            // The agent only ever holds a placeholder key; the gateway swaps in
+            // the real one.
             headers: { "content-type": "application/json", authorization: "Bearer placeholder" },
           },
           (res) => {
@@ -255,38 +254,5 @@ describe("typesafe strategy-routed requests", () => {
     expect(store.getLlmStrategyState(agent.id, VENDOR).activeIndex).toBe(1);
     // 529 is transient, not an auth failure: the key stays in rotation.
     expect(store.getConnection(overloaded.id)!.inactiveAt).toBeUndefined();
-  });
-
-  it("round-robin cools down a 429'd connection and still serves the request", async () => {
-    const agent = newAgent("ts-429");
-    const limited = conn("jev-limited", "ts-429");
-    const healthy = conn("jev-ok", "ts-key-ok");
-    store.setAgentLlmConfig(agent.id, {
-      enabled: true,
-      strategy: "round-robin",
-      connectionIds: [limited.id, healthy.id],
-    });
-    const r = await viaProxy(agent.token);
-    expect(r.status).toBe(200);
-    expect(seen).toEqual(["Bearer ts-429", "Bearer ts-key-ok"]);
-    expect(store.getLlmStrategyState(agent.id, VENDOR).cooldowns[limited.id]).toBeGreaterThan(0);
-  });
-
-  it("consecutive 401s bench a revoked key while requests keep succeeding", async () => {
-    const agent = newAgent("ts-401");
-    const dead = conn("jev-revoked", "ts-401");
-    const good = conn("jev-good", "ts-key-g");
-    store.setAgentLlmConfig(agent.id, {
-      enabled: true,
-      strategy: "round-robin",
-      connectionIds: [dead.id, good.id],
-    });
-    for (let i = 0; i < 40 && !store.getConnection(dead.id)!.inactiveAt; i++) {
-      const r = await viaProxy(agent.token);
-      expect(r.status).toBe(200);
-      expect(JSON.parse(r.body).auth).toBe("Bearer ts-key-g");
-    }
-    expect(store.getConnection(dead.id)!.inactiveAt).toBeTruthy();
-    expect(store.getConnection(good.id)!.inactiveAt).toBeUndefined();
   });
 });
