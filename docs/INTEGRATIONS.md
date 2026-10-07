@@ -388,3 +388,10 @@ Every built-in integration, what it stores, which hosts it owns, and a least-pri
 - **Discovery summary:** `region` and `apiBaseUrl` (for example `https://eu.posthog.com`) when the Region field is set, so the agent calls the host its key lives on.
 - **Limitations:** PostHog Cloud only. Self-hosted instances need a community integration.
 
+### attio
+
+- **Credential:** a workspace API key (access token), injected as `Bearer`.
+- **Hosts:** `api.attio.com`.
+- **Suggested policy:** `GET /v2/**` plus `POST /v2/objects/*/records/query` for read-only agents.
+- **Limitations:** API key only (Attio's OAuth app flow is not implemented). Scope the key per area (records, lists, notes, tasks) at the vendor side.
+

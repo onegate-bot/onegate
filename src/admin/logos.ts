@@ -62,4 +62,5 @@ export const INTEGRATION_LOGOS: Record<string, BrandLogo> = {
   "monday": { title: "monday", hex: "FF3D57" },
   "linkedin": { title: "LinkedIn", hex: "0A66C2" },
   "tavily": { title: "Tavily", hex: "3B82F6" },
+  "attio": { title: "Attio", hex: "1F2328" },
 };

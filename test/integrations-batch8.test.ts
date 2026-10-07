@@ -19,6 +19,7 @@ import type { Integration } from "../src/integrations/types.js";
 import { hubspot } from "../src/integrations/hubspot.js";
 import { sentry } from "../src/integrations/sentry.js";
 import { posthog } from "../src/integrations/posthog.js";
+import { attio } from "../src/integrations/attio.js";
 import { INTEGRATION_LOGOS } from "../src/admin/logos.js";
 import { Store } from "../src/store/db.js";
 import { initCa } from "../src/ca.js";
@@ -37,6 +38,7 @@ const BATCH: Integration[] = [
   hubspot,
   sentry,
   posthog,
+  attio,
 ];
 
 describe("batch 8 registry claims", () => {
@@ -50,6 +52,7 @@ describe("batch 8 registry claims", () => {
       "us.posthog.com": "posthog",
       "eu.posthog.com": "posthog",
       "app.posthog.com": "posthog",
+      "api.attio.com": "attio",
     };
     for (const [host, id] of Object.entries(expected)) {
       expect(registry.resolveHostCandidates(host).map((i) => i.id), host).toEqual([id]);
@@ -95,6 +98,7 @@ describe("batch 8 static token integrations", () => {
     [hubspot, "api.hubapi.com", { token: "pat-na1-x" }, "Bearer pat-na1-x"],
     [sentry, "us.sentry.io", { token: "sntryu_x" }, "Bearer sntryu_x"],
     [posthog, "eu.posthog.com", { apiKey: "phx_x" }, "Bearer phx_x"],
+    [attio, "api.attio.com", { apiKey: "attio_x" }, "Bearer attio_x"],
   ];
 
   for (const [integration, host, data, expected] of cases) {
