@@ -73,6 +73,7 @@ Served by the admin server (default port 8080): dashboard, agents (one-time toke
 
 - [Architecture](docs/ARCHITECTURE.md). Components, request flow, data model.
 - [Deployment](docs/DEPLOY.md). Docker, compose, cloud VMs, backups.
+- [OneGate cluster](docs/CLUSTER.md). Several gateways sharing one configuration, active/active.
 - [Integrations guide](docs/INTEGRATIONS.md). Build and ship a community integration.
 - [Security model](docs/SECURITY.md). Threat model and operational guidance.
 
