@@ -351,3 +351,29 @@ describe("availability", () => {
     expect(b.runtime.status().peers.find((p) => p.nodeId === a.nodeId)!.lag).toBe(0);
   });
 });
+
+describe("approvals across nodes (#115 body binding and single use)", () => {
+  it("an approval decided on A is redeemable on B for the same body, and spent on B is spent on A", async () => {
+    nodes = await makeCluster(2);
+    const [a, b] = nodes;
+    const { agent } = a.store.createAgent("bot");
+    const rule = a.store.createRule({
+      scope: "agent", subjectId: agent.id, integrationId: "github", methods: ["POST"], pathGlob: "/**", effect: "deny",
+    });
+    const held = a.store.createApproval({
+      agentId: agent.id, integrationId: "github", ruleId: rule.id, method: "POST", path: "/repos/x/issues", bodyHash: "h1",
+    });
+    a.store.decideApproval(held.id, "approved");
+    await syncAll(nodes);
+
+    const req = { agentId: agent.id, integrationId: "github", ruleId: rule.id, method: "POST", path: "/repos/x/issues" };
+    // A different body never matches, on any node.
+    expect(b.store.redeemApproval({ ...req, bodyHash: "other" })).toBeNull();
+    // The agent's retry lands on B and is let through once.
+    expect(b.store.redeemApproval({ ...req, bodyHash: "h1" })?.id).toBe(held.id);
+    await syncAll(nodes);
+    // Spent on B means spent on A.
+    expect(a.store.getApproval(held.id)?.usedAt).not.toBeNull();
+    expect(a.store.redeemApproval({ ...req, bodyHash: "h1" })).toBeNull();
+  });
+});
