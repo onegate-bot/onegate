@@ -165,6 +165,12 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "created_at",
       "expires_at",
       "decided_at",
+      // #115: an approval is bound to the request body and spent on first use.
+      // Both replicate, so an approved retry is let through on whichever node
+      // it reaches, and spending it on one node spends it everywhere (subject to
+      // the replication window, see docs/CLUSTER.md).
+      "body_hash",
+      "used_at",
     ],
   },
   { table: "settings", pk: ["key"], columns: ["key", "value"], filter: settingsFilter },
