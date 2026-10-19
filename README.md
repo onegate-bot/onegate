@@ -100,3 +100,7 @@ pnpm typecheck
 ## License
 
 Apache License 2.0 (see [LICENSE](LICENSE)). Contributions are accepted under the same license (inbound = outbound), no CLA. See [CONTRIBUTING.md](CONTRIBUTING.md). Third-party material bundled in this repository is documented in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## More from the toolkit
+
+Built and maintained by [Ziv Isaiah](https://www.zivisaiah.com). The rest of the open-source tooling, covering agent security, agentic runtimes and developer utilities, is catalogued at [zivisaiah.com/projects](https://www.zivisaiah.com/projects).
