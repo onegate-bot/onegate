@@ -5,7 +5,7 @@ The `onegate` command operates a gateway in two ways:
 - **Local commands** read and write the data directory directly (no running server needed).
 - **Admin API commands** talk to a running gateway over its admin API, using the admin token.
 
-Local commands are unchanged from earlier releases. This page covers the admin API commands.
+Local commands are unchanged from earlier releases (the one new local command, `cluster join`, is under [Cluster](#cluster)). This page covers the admin API commands.
 
 ## Connecting to a running gateway
 
@@ -186,6 +186,35 @@ onegate projects list
 onegate projects add <name>
 onegate projects rm <id>
 ```
+
+## Cluster
+
+Manage a OneGate cluster (several gateways sharing one configuration,
+active/active). Design, security and the full runbook: [CLUSTER.md](CLUSTER.md).
+
+```bash
+onegate cluster status                          # node, peers, lag, last pull, clock skew, errors, conflicts
+onegate cluster init --advertise http://100.64.0.10:9443
+onegate cluster join-token --ttl 15m            # single-use; move it out of band
+onegate cluster peers                           # list
+onegate cluster peers add http://100.64.0.12:9443
+onegate cluster peers remove <node-id>
+onegate cluster leave                           # stop replicating; keep the config standalone
+```
+
+These are admin API commands (`--host`, `--token`, `--json` apply). The join is a
+**local** command run on the new node while OneGate is stopped, because it has no
+admin token yet and writes the cluster's DB key and root CA into the data dir.
+Here `--token` is the join token (prefer `--token-stdin`, or
+`ONEGATE_CLUSTER_JOIN_TOKEN`):
+
+```bash
+printf %s "$JOIN_TOKEN" | onegate cluster join http://100.64.0.10:9443 \
+  --token-stdin --advertise http://100.64.0.11:9443 [--replace-local-config] [--json]
+```
+
+`--advertise` (or `ONEGATE_CLUSTER_ADVERTISE`) is the URL peers use to reach the
+node's cluster listener (`ONEGATE_CLUSTER_LISTEN`).
 
 ## Exit codes
 

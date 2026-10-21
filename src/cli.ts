@@ -8,13 +8,16 @@
  *   onegate agent add <name> [...]    register an agent, print its token
  *   onegate agent list
  *
+ *   onegate cluster ...               OneGate cluster (see docs/CLUSTER.md)
+ *
  * Data directory: $ONEGATE_DATA or ~/.onegate
- * Ports: $ONEGATE_PROXY_PORT (default 8443), $ONEGATE_ADMIN_PORT (default 8080)
+ * Ports: $ONEGATE_PROXY_PORT (default 8443), $ONEGATE_ADMIN_PORT (default 8080),
+ *        $ONEGATE_CLUSTER_LISTEN (cluster listener, off by default)
  * Owner link base: $ONEGATE_PUBLIC_URL (default http://<bind or localhost>:<admin port>)
  */
 
 import { parseArgs } from "node:util";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +38,8 @@ import { approvalsCommand } from "./cli/commands/approvals.js";
 import { credentialsCommand, integrationsCommand } from "./cli/commands/integrations.js";
 import { auditCommand, usageCommand } from "./cli/commands/observe.js";
 import { projectsCommand } from "./cli/commands/projects.js";
+import { clusterCommand, clusterJoinCommand } from "./cli/commands/cluster.js";
+import { ClusterRuntime, parseClusterListen, retentionMsFromEnv } from "./cluster/runtime.js";
 
 function dataDir(): string {
   return process.env.ONEGATE_DATA ?? join(homedir(), ".onegate");
@@ -108,7 +113,24 @@ async function cmdStart(): Promise<void> {
   });
   await proxy.listen(proxyPort, bindHost);
 
-  const app = createAdminApp({ store, registry, ca, version: version(), publicBaseUrl: publicBase.url });
+  // OneGate cluster. The listener is off unless ONEGATE_CLUSTER_LISTEN is set;
+  // the replication loop only runs once this node is a cluster member.
+  const caFiles = () => {
+    const p = caPaths(dir);
+    if (!existsSync(p.certPath) || !existsSync(p.keyPath)) return null;
+    return { cert: readFileSync(p.certPath, "utf8"), key: readFileSync(p.keyPath, "utf8") };
+  };
+  const cluster = new ClusterRuntime({
+    store,
+    caFiles,
+    retentionMs: retentionMsFromEnv(),
+    log: (l) => console.error(`[cluster] ${l}`),
+  });
+  const clusterListen = parseClusterListen(process.env.ONEGATE_CLUSTER_LISTEN, bindHost);
+  if (clusterListen) await cluster.listen(clusterListen.port, clusterListen.host);
+  cluster.refresh();
+
+  const app = createAdminApp({ store, registry, ca, version: version(), publicBaseUrl: publicBase.url, cluster });
   const adminServer = http.createServer(app);
   await new Promise<void>((resolve) => adminServer.listen(adminPort, bindHost, resolve));
 
@@ -116,6 +138,7 @@ async function cmdStart(): Promise<void> {
   console.log(`  proxy:  http://${bindHost}:${proxyPort}  (agents: HTTPS_PROXY=http://agent:<token>@host:${proxyPort})`);
   console.log(`  admin:  http://${bindHost}:${adminPort}  (UI + API; root CA at /ca.pem)`);
   console.log(`  links:  ${publicBase.url}  (approve/connect/renew links sent to owners)`);
+  if (clusterListen) console.log(`  cluster: http://${cluster.listening()}  (${cluster.state.isEnabled() ? `node ${cluster.state.peekNodeId()}` : "not in a cluster"})`);
   console.log(`  data:   ${dir}`);
   if (publicBase.fallback) {
     console.error(
@@ -137,6 +160,7 @@ async function cmdStart(): Promise<void> {
     hardExit.unref();
     try {
       await proxy.close();
+      await cluster.close();
       adminServer.close();
       store.close();
     } catch {
@@ -240,6 +264,15 @@ Admin API commands (talk to a running gateway over --host + admin token):
   onegate audit [--agent <id>] [--limit N]
   onegate usage [--since ISO] [--until ISO] [--limit N]
   onegate projects list|add <name>|rm <id>
+  onegate cluster status                                 this node, its peers, lag, errors, conflicts
+  onegate cluster init --advertise <url>                 start a cluster on this (running) node
+  onegate cluster join-token [--ttl 15m]                 mint a single-use join token
+  onegate cluster peers [list] | add <url> | remove <node-id>
+  onegate cluster leave                                  stop replicating; keep the config standalone
+
+Cluster join (local, on a NEW node with OneGate stopped):
+  printf %s "$JOIN_TOKEN" | onegate cluster join <peer-cluster-url> --token-stdin --advertise <this-node-cluster-url>
+    [--replace-local-config]   (refused on a node that already has config unless given)
 
 Secrets:
   Pipe secret material in on stdin: --secret-stdin, --client-secret-stdin, --data-stdin.
@@ -258,6 +291,9 @@ Environment:
   ONEGATE_ADMIN_PORT      admin port (default 8080)
   ONEGATE_BIND            bind address (default 0.0.0.0)
   ONEGATE_COMMUNITY_DIR   extra integrations dir (default <data>/integrations)
+  ONEGATE_CLUSTER_LISTEN  cluster listener "port" or "host:port" (default off)
+  ONEGATE_CLUSTER_ADVERTISE  default --advertise URL for cluster init/join
+  ONEGATE_CLUSTER_RETENTION_DAYS  changelog history kept after all peers pulled it (default 7)
   ONEGATE_ADMIN_URL       admin API base URL for CLI commands
   ONEGATE_ADMIN_TOKEN     admin token for CLI commands
 `;
@@ -291,6 +327,16 @@ function extractGlobals(argv: string[]): { rest: string[]; ctx: ReturnType<typeo
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  // Before global-flag extraction: for `cluster join`, --token is the JOIN
+  // token, and there is no admin API to talk to yet.
+  if (argv[0] === "cluster" && argv[1] === "join") {
+    try {
+      if (argv.includes("--json")) setJsonMode(true);
+      return await clusterJoinCommand(argv.slice(2), dataDir());
+    } catch (err) {
+      fail((err as Error).message);
+    }
+  }
   const { rest: cleaned, ctx } = extractGlobals(argv);
   const [cmd, sub, ...rest] = cleaned;
 
@@ -316,6 +362,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (cmd === "audit") return await auditCommand(ctx, cleaned.slice(1));
     if (cmd === "usage") return await usageCommand(ctx, cleaned.slice(1));
     if (cmd === "projects") return await projectsCommand(ctx, sub, rest);
+    if (cmd === "cluster") return await clusterCommand(ctx, sub, rest);
   } catch (err) {
     if (err instanceof ApiError) fail(err.message);
     fail((err as Error).message);

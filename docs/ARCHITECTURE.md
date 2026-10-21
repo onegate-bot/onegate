@@ -1,6 +1,8 @@
 # Architecture
 
-OneGate is a single Node.js process with two listeners and one SQLite database.
+OneGate is a single Node.js process with two listeners and one SQLite database
+(three listeners when the optional cluster listener is on, see
+[CLUSTER.md](CLUSTER.md)).
 
 ```
                         ┌────────────────────────────────────────────────┐
@@ -35,6 +37,8 @@ OneGate is a single Node.js process with two listeners and one SQLite database.
 | `src/integrations/` | Integration registry, GitHub and Google built-ins, community loader |
 | `src/admin/api.ts` | REST API, OAuth connect flow, static UI hosting |
 | `src/cli.ts` | `init`, `start`, `print-ca`, `agent add/list`, `admin reset-token` |
+| `src/store/cluster-schema.ts` | Which tables/columns replicate in a OneGate cluster, and the TEMP capture triggers |
+| `src/cluster/` | OneGate cluster: replication state and LWW apply (`state.ts`), transport crypto (`crypto.ts`), the cluster listener (`server.ts`), peer client (`client.ts`), the replication loop (`runtime.ts`), and the local join (`join.ts`) |
 
 ## Request flow (matched host)
 
@@ -128,6 +132,16 @@ The LLM routing feature adds:
 | `GET /api/usage` | LLM usage rollups per connection and per vendor (requests, errors, failovers, input/output tokens) over `?since`/`?until` ISO timestamps (default: the last 7 days), plus the most recent selection events (`?limit`, default 100) with the routed connection, strategy, failover flag and outcome. |
 
 Orphaned credentials (issue #3886): `GET /api/integrations` also lists credentials whose integration id is not in the registry (disabled via `ONEGATE_DISABLED_INTEGRATIONS` or a removed community integration), flagged `orphaned: true` with the credential name, so the UI can offer disconnect. `DELETE /api/credentials/:integrationId` works for them, it never registry-checks.
+
+## OneGate cluster
+
+Optional active/active replication between OneGate instances, off by default.
+Each member captures local writes to shared tables with TEMP triggers into a
+changelog; every node pulls every peer's changelog over a dedicated, HMAC-signed
+and AES-GCM-sealed cluster listener and applies it last-writer-wins per row.
+Members share the DB key and the root CA, so tokens, sealed credentials and
+leaves are valid on every node. Audit, usage and router state stay per node.
+Full design, consistency model and runbook: [CLUSTER.md](CLUSTER.md).
 
 ## Certificate authority
 

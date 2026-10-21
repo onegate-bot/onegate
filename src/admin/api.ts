@@ -24,6 +24,9 @@ import { publicBaseUrlFromEnv } from "../util/public-url.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
 import type { Agent } from "../types.js";
+import { ClusterRuntime } from "../cluster/runtime.js";
+import { ClusterError, DEFAULT_JOIN_TTL_SECONDS } from "../cluster/state.js";
+import { parseDurationSeconds } from "../cluster/crypto.js";
 
 const ADMIN_TOKEN_KEY = "admin_token_hash";
 
@@ -107,6 +110,12 @@ export interface AdminApiOptions {
    * environment on each use.
    */
   publicBaseUrl?: string;
+  /**
+* The gateway's cluster runtime (listener + replication loop). Optional: when
+   * absent the cluster endpoints still work against the store, but nothing
+   * replicates until a runtime is started (tests, embedded use).
+   */
+  cluster?: ClusterRuntime;
 }
 
 /** Minimal HTML escaping for the OAuth result pages. */
@@ -2521,6 +2530,92 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           : null,
       })),
     );
+  });
+
+  // ---- cluster ----
+  //
+  // Mirrors `onegate cluster ...`. `join` is deliberately absent: it runs on a
+  // fresh, stopped node that has no admin token yet and writes key files into
+  // its data dir, so it is a local CLI command only (src/cluster/join.ts).
+
+  const cluster = opts.cluster ?? new ClusterRuntime({ store });
+
+  function clusterFail(res: express.Response, err: unknown): void {
+    if (err instanceof ClusterError) {
+      res.status(err.status).json({ error: err.code, ...(err.message !== err.code ? { message: err.message } : {}) });
+      return;
+    }
+    res.status(500).json({ error: "cluster_error", message: (err as Error).message });
+  }
+
+  app.get("/api/cluster", (_req, res) => {
+    res.json(cluster.status());
+  });
+
+  app.post("/api/cluster/init", (req, res) => {
+    try {
+      cluster.state.init(req.body?.advertiseUrl);
+      // Start replicating right away on a live gateway (no restart needed).
+      if (opts.cluster) cluster.refresh();
+      res.status(201).json(cluster.status());
+    } catch (err) {
+      clusterFail(res, err);
+    }
+  });
+
+  app.post("/api/cluster/join-tokens", (req, res) => {
+    const raw = req.body?.ttl;
+    let ttl = DEFAULT_JOIN_TTL_SECONDS;
+    if (raw !== undefined) {
+      const parsed = typeof raw === "number" ? raw : typeof raw === "string" ? parseDurationSeconds(raw) : null;
+      if (parsed === null) {
+        res.status(400).json({ error: "invalid_ttl", message: 'ttl is seconds or a duration like "15m"' });
+        return;
+      }
+      ttl = parsed;
+    }
+    try {
+      const minted = cluster.state.mintJoinToken(ttl);
+      res.status(201).json({ ...minted, peerUrl: cluster.state.advertiseUrl() });
+    } catch (err) {
+      clusterFail(res, err);
+    }
+  });
+
+  app.get("/api/cluster/peers", (_req, res) => {
+    res.json(cluster.status().peers);
+  });
+
+  app.post("/api/cluster/peers", async (req, res) => {
+    try {
+      res.status(201).json(await cluster.addPeer(req.body?.url));
+    } catch (err) {
+      clusterFail(res, err);
+    }
+  });
+
+  app.delete("/api/cluster/peers/:nodeId", (req, res) => {
+    try {
+      if (req.params.nodeId === cluster.state.peekNodeId()) {
+        res.status(400).json({ error: "cannot_remove_self", message: "use POST /api/cluster/leave on this node" });
+        return;
+      }
+      if (!cluster.state.removePeer(req.params.nodeId)) {
+        res.status(404).json({ error: "not_found" });
+        return;
+      }
+      res.status(204).end();
+    } catch (err) {
+      clusterFail(res, err);
+    }
+  });
+
+  app.post("/api/cluster/leave", async (_req, res) => {
+    try {
+      res.json(await cluster.leave());
+    } catch (err) {
+      clusterFail(res, err);
+    }
   });
 
   // ---- static web UI ----

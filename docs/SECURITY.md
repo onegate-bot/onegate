@@ -43,6 +43,8 @@ At install time you mint a root CA and explicitly trust it on each agent machine
 | OAuth client (BYOC) and tokens | part of the integration credential, plaintext in SQLite |
 | Minted short-lived tokens | cached in the SQLite settings table, refreshed on expiry |
 | Root CA key | PEM on disk, mode 0600 |
+| Cluster secret (cluster members only) | sealed with the DB key in the node-local `settings` row `cluster.secret`; never sent after the join |
+| Cluster join token (`ogj_`) | shown once; stored as a SHA-256 lookup id plus the token-derived payload key sealed with the DB key, erased on use or expiry; single use, 15 min default TTL |
 
 For OAuth integrations you bring your own OAuth client. The client ID and secret you enter in the connect dialog are stored inside the integration credential, alongside the access and refresh tokens OneGate obtains with them. They get the same protection (and the same exposure) as any other credential. Integrations that mint short-lived tokens at request time (Google, GCP, MongoDB Atlas, Docker Hub, GitHub App) cache those tokens in the settings table, which lives in the same database.
 
@@ -53,6 +55,26 @@ Protect `ONEGATE_DATA` (and its backups) accordingly: it is equivalent to the cr
 - **Proxy port (8443):** reachable by agents only. Proxy auth is required before any tunneling happens, and failures are audited.
 - **Admin port (8080):** token-protected, but do not expose it publicly. Use an SSH tunnel or a TLS-terminating reverse proxy with its own auth. The OAuth callback is protected by a single-use, 10-minute random state.
 - The gateway dials vendors directly with a dedicated agent and ignores ambient proxy environment variables, so credentials cannot be siphoned through an injected upstream proxy.
+
+## OneGate cluster
+
+A cluster ([CLUSTER.md](CLUSTER.md)) widens the blast radius on purpose: every
+member holds the same DB key and root CA key, so compromising any member is
+compromising all of them. Harden every node like the first.
+
+- **Cluster listener** (`ONEGATE_CLUSTER_LISTEN`, off by default): bind it to a
+  tailnet address and firewall it to the other members. Requests are
+  HMAC-authenticated with the cluster secret (60 s replay window plus a nonce
+  cache) and responses are AES-256-GCM sealed and bound to the request, so the
+  link does not need to be private, but there is no reason to expose it.
+- **Join token**: grants the DB key, the CA key and the cluster secret to whoever
+  redeems it first. It is single use and short-lived, and the join exchange is
+  sealed under it, but move it out of band and pipe it with `--token-stdin`.
+- **Admin token**: shared by the cluster (`admin_token_hash` replicates).
+  `onegate admin reset-token` on any node rotates it everywhere.
+- **Removing a node** (`cluster peers remove`) stops replication to it but does
+  not revoke what it holds. If a node is compromised, treat the DB key, the CA
+  and every credential as exposed.
 
 ## Operational guidance
 
