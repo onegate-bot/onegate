@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS connections (
   inactive_at TEXT,
   inactive_reason TEXT,
   auth_failures INTEGER NOT NULL DEFAULT 0,
+  instance_origin TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -504,6 +505,7 @@ function rowToConnection(r: Row, box: SecretBox): Connection | null {
     leaseTtlSeconds: r.lease_ttl_seconds ?? null,
     // Only present when inactive, so an active connection's shape is unchanged.
     ...(r.inactive_at ? { inactiveAt: r.inactive_at, inactiveReason: r.inactive_reason ?? null } : {}),
+    instanceOrigin: r.instance_origin ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -767,6 +769,12 @@ export class Store {
       this.db.exec("ALTER TABLE connections ADD COLUMN inactive_reason TEXT");
     if (!connCols.has("auth_failures"))
       this.db.exec("ALTER TABLE connections ADD COLUMN auth_failures INTEGER NOT NULL DEFAULT 0");
+    // Owner-supplied instance origin for self-managed deployments. NULL = the
+    // connection targets the integration's builtin SaaS hosts (the behavior
+    // every existing row keeps). Added by ALTER so a legacy DB gains it without
+    // touching any stored value.
+    if (!connCols.has("instance_origin"))
+      this.db.exec("ALTER TABLE connections ADD COLUMN instance_origin TEXT");
     const linkCols = new Set(
       (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) => String(r.name)),
     );
@@ -798,6 +806,16 @@ export class Store {
     // pre-time-boxing database.
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_owner_notifications_dedup ON owner_notifications(dedup_key)",
+    );
+    // Enforces the "one connection per instance origin" rule at the storage
+    // layer, so two connections can never ambiguously claim the same host even
+    // if a caller bypasses the application-level check. A partial index keeps
+    // the NULL rows (every pre-existing connection) out of the constraint.
+    // Created here, after the ALTER above, for the same reason as the index
+    // above it: it must never reference instance_origin on a legacy DB before
+    // the column exists.
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_connections_instance_origin ON connections(instance_origin) WHERE instance_origin IS NOT NULL",
     );
     // Seed the default time-boxed integrations. INSERT OR IGNORE so an operator
     // who later changes or clears the TTL is never overwritten on boot.
@@ -1229,20 +1247,26 @@ export class Store {
     isDefault?: boolean;
     /** Owner lease override: null = inherit, 0 = always-on, >0 = custom seconds. */
     leaseTtlSeconds?: number | null;
+    /**
+     * Canonical https origin of a self-managed deployment (app connections
+     * only). Must already be validated and normalised by the caller (see
+     * util/instance-origin.ts): the store only enforces uniqueness.
+     */
+    instanceOrigin?: string | null;
   }): Connection {
     const ts = now();
     const ownerAgentId = input.kind === "app" ? input.ownerAgentId ?? null : null;
+    const instanceOrigin = input.kind === "app" ? input.instanceOrigin ?? null : null;
     const id = newId("conn");
-    // The "is this bucket empty?" probe, the demotion of the previous default
-    // and the insert are one atomic step. Split apart they break the
-    // one-default-per-bucket invariant two ways: an interrupt between the
-    // demotion and the insert leaves the bucket with NO default (headerless
-    // requests then fall through to resolveAppConnection's oldest-candidate
-    // heuristic, silently changing which credential is injected), and the
-    // read-then-write emptiness check races the other process on this DB (the
-    // admin API and the CLI both open it) to produce TWO defaults. BEGIN
-    // IMMEDIATE takes the write lock before the probe reads.
     this.tx(() => {
+      if (instanceOrigin) {
+        const clash = this.getConnectionByInstanceOrigin(instanceOrigin);
+        if (clash) {
+          throw new Error(
+            `instance origin ${instanceOrigin} is already claimed by connection ${clash.id}`,
+          );
+        }
+      }
       const existing = this.listConnections({
         kind: input.kind,
         vendor: input.vendor,
@@ -1252,7 +1276,7 @@ export class Store {
       if (isDefault) this.clearDefaultConnection(input.kind, input.vendor, ownerAgentId);
       this.db
         .prepare(
-          "INSERT INTO connections (id, kind, vendor, name, data, owner_agent_id, is_default, lease_ttl_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO connections (id, kind, vendor, name, data, owner_agent_id, is_default, lease_ttl_seconds, instance_origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           id,
@@ -1263,6 +1287,7 @@ export class Store {
           ownerAgentId,
           isDefault ? 1 : 0,
           input.leaseTtlSeconds ?? null,
+          instanceOrigin,
           ts,
           ts,
         );
@@ -1326,6 +1351,32 @@ export class Store {
         .run(ts, `deactivated by admin${reason?.trim() ? `: ${reason.trim()}` : ""}`, ts, id);
     }
     return this.getConnection(id);
+  }
+
+  /**
+   * Finds the app connection claiming `origin` (canonical form), or null.
+   * Uniqueness is enforced by a partial unique index, so there is at most one.
+   */
+  getConnectionByInstanceOrigin(origin: string): Connection | null {
+    const r = this.db
+      .prepare("SELECT * FROM connections WHERE instance_origin = ?")
+      .get(origin.toLowerCase()) as Row | undefined;
+    return r ? rowToConnection(r, this.secrets) : null;
+  }
+
+  /**
+   * Resolves a hostname to the connection that claims it as its self-managed
+   * instance origin. Backs the registry's host lookup, so a request to an
+   * owner's own domain resolves to the right integration AND the right
+   * connection. Returns null for every host with no claim, which is the
+   * overwhelmingly common case.
+   */
+  instanceOriginClaimFor(
+    host: string,
+  ): { host: string; integrationId: string; connectionId: string } | null {
+    const conn = this.getConnectionByInstanceOrigin(`https://${host.toLowerCase()}`);
+    if (!conn) return null;
+    return { host: host.toLowerCase(), integrationId: conn.vendor, connectionId: conn.id };
   }
 
   /**
@@ -1549,24 +1600,37 @@ export class Store {
    */
   updateConnection(
     id: string,
-    patch: { name?: string; data?: Record<string, string>; isDefault?: boolean },
+    patch: {
+      name?: string;
+      data?: Record<string, string>;
+      isDefault?: boolean;
+      /** undefined = leave as-is; null = clear the claim; string = re-claim. */
+      instanceOrigin?: string | null;
+    },
     opts: { keepTokenCache?: boolean } = {},
   ): Connection | null {
     const cur = this.getConnection(id);
     if (!cur) return null;
     const makeDefault = patch.isDefault === true && !cur.isDefault;
-    // Demoting the old default and promoting this row is one handoff: an
-    // interrupt between them leaves the bucket with no default at all.
+    const nextOrigin =
+      patch.instanceOrigin === undefined ? (cur.instanceOrigin ?? null) : patch.instanceOrigin;
     this.tx(() => {
+      if (nextOrigin && nextOrigin !== cur.instanceOrigin) {
+        const clash = this.getConnectionByInstanceOrigin(nextOrigin);
+        if (clash && clash.id !== id) {
+          throw new Error(`instance origin ${nextOrigin} is already claimed by connection ${clash.id}`);
+        }
+      }
       if (makeDefault) this.clearDefaultConnection(cur.kind, cur.vendor, cur.ownerAgentId);
       this.db
         .prepare(
-          "UPDATE connections SET name = ?, data = ?, is_default = ?, updated_at = ? WHERE id = ?",
+          "UPDATE connections SET name = ?, data = ?, is_default = ?, instance_origin = ?, updated_at = ? WHERE id = ?",
         )
         .run(
           patch.name ?? cur.name,
           this.secrets.seal(patch.data ?? cur.data),
           makeDefault || cur.isDefault ? 1 : 0,
+          nextOrigin ? nextOrigin.toLowerCase() : null,
           now(),
           id,
         );
