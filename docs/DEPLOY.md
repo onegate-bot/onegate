@@ -90,6 +90,9 @@ The Google connect flow needs the browser to reach the admin server's `/oauth/go
 | `ONEGATE_PUBLIC_URL` | `http://<ONEGATE_BIND or localhost>:<admin port>` | base URL of the admin listener as owners reach it, e.g. `https://gate.example.com`. Approve, connect and renew links (which carry one-time tokens) and OAuth redirect URIs are built on it. Must be an absolute http(s) URL; a trailing slash is stripped and a malformed value stops `onegate start`. Unset, the gateway warns at startup that links will only work locally |
 | `ONEGATE_COMMUNITY_DIR` | `<data>/integrations` | extra integrations directory |
 | `ONEGATE_DISABLED_INTEGRATIONS` | (none) | comma/space separated integration ids to drop (their hosts pass through instead of being managed) |
+| `ONEGATE_CLUSTER_LISTEN` | (off) | OneGate cluster listener, `port` or `host:port` (see [CLUSTER.md](CLUSTER.md)) |
+| `ONEGATE_CLUSTER_ADVERTISE` | (none) | default `--advertise` URL for `cluster init` / `cluster join` |
+| `ONEGATE_CLUSTER_RETENTION_DAYS` | 7 | cluster changelog history kept after every peer pulled it |
 
 ### Disabling integrations
 
@@ -99,10 +102,30 @@ Set `ONEGATE_DISABLED_INTEGRATIONS` (e.g. `anthropic,telegram-bot`) when a host 
 
 Everything is in the data directory: `rootCA.pem`, `rootCA.key`, `certs/`, `onegate.db`. Back it up cold (or use SQLite's `.backup`). Restoring it on a new host restores the whole gateway, and agents keep working because they already trust that root CA. Treat the backup as secret material (it contains credentials and the CA key).
 
+## High availability (OneGate cluster)
+
+Two or more gateways can share one configuration and serve traffic at the same
+time, so an agent fails over by changing only its proxy URL. Start the first
+node's cluster listener on a tailnet address, run `onegate cluster init`, mint a
+join token, and run `onegate cluster join` on the new (stopped) node. Step by
+step, with the consistency model and failure modes: [CLUSTER.md](CLUSTER.md).
+
+In Docker, publish the cluster port only on the tailnet interface
+(`-p 100.64.0.10:9443:9443 -e ONEGATE_CLUSTER_LISTEN=9443`). Join a new node
+before its first `start`, on its (new) data volume:
+
+```sh
+printf %s "$JOIN_TOKEN" | docker run --rm -i -v onegate-data:/data onegate \
+  cluster join http://100.64.0.10:9443 --token-stdin --advertise http://100.64.0.11:9443
+```
+
+The entrypoint runs `init` first on an empty volume; the join then replaces that
+throwaway CA and admin token with the cluster's.
+
 ## Upgrading
 
 ```sh
 git pull && docker compose up -d --build
 ```
 
-The schema is created with `IF NOT EXISTS` and the data volume carries state across image rebuilds.
+The schema is created with `IF NOT EXISTS` and the data volume carries state across image rebuilds. In a cluster, upgrade every node promptly; the upgrade that introduced clustering is additive and an older build can still open the database (see [CLUSTER.md](CLUSTER.md#upgrade-and-rollback)).
