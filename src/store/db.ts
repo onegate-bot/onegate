@@ -8,6 +8,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SecretBox, loadSecretKey } from "./secret-box.js";
+import { CLUSTER_SCHEMA, CLUSTER_SETTING_PREFIX, installCapture, removeCapture } from "./cluster-schema.js";
 import { normalizeMethods } from "../util/methods.js";
 import type {
   Agent,
@@ -608,17 +609,54 @@ function ensureDataDir(dir: string): void {
 export class Store {
   private db: DatabaseSync;
   private secrets: SecretBox;
+  private readonly secretKey: Buffer;
+  /** Node id the cluster capture triggers are installed for, or null if none. */
+  private captureNodeId: string | null = null;
 
   constructor(dbPath: string) {
     if (dbPath !== ":memory:") ensureDataDir(dirname(dbPath));
-    this.secrets = new SecretBox(loadSecretKey(dbPath));
+    this.secretKey = loadSecretKey(dbPath);
+    this.secrets = new SecretBox(this.secretKey);
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.db.exec(CLUSTER_SCHEMA);
     this.migrate();
     this.encryptSecretsAtRest();
     this.hashCapabilityTokensAtRest();
+    // After the migrations, so boot-time housekeeping (the lease seed above) is
+    // never captured as a change: it runs identically on every node.
+    this.syncClusterCapture();
+  }
+
+  /**
+   * Installs or removes the cluster change-capture triggers on this connection
+   * to match the node's membership (see src/store/cluster-schema.ts). A node
+   * that is not in a cluster has no triggers, so this is a single settings read
+   * for it. Idempotent; called at open and whenever membership may have
+   * changed (cluster init/join/leave, and each replication tick, which is how a
+   * long-running server picks up a `cluster` change made by another process).
+   * Returns whether capture is active.
+   */
+  syncClusterCapture(): boolean {
+    const clusterId = this.getSetting(`${CLUSTER_SETTING_PREFIX}id`);
+    const nodeId = this.getSetting(`${CLUSTER_SETTING_PREFIX}node_id`);
+    const want = clusterId && nodeId ? nodeId : null;
+    if (want === this.captureNodeId) return want !== null;
+    removeCapture(this.db);
+    if (want) installCapture(this.db, want);
+    this.captureNodeId = want;
+    return want !== null;
+  }
+
+  /**
+   * Cluster plumbing only (src/cluster/*): the raw connection, the SecretBox,
+   * and the 32-byte DB key a joining node must share. Not for general use; the
+   * Store methods are the API.
+   */
+  clusterInternals(): { db: DatabaseSync; secrets: SecretBox; secretKey: Buffer } {
+    return { db: this.db, secrets: this.secrets, secretKey: this.secretKey };
   }
 
   /**
