@@ -97,7 +97,7 @@ describe("onegate approvals", () => {
     const mine = hold(agentId, "/repos/acme/app/merges");
     const theirs = hold(otherId, "/repos/acme/other/merges");
     const all = await run("approvals", "ls");
-    expect(all.out).toMatch(/ID\s+AGENT\s+INTEGRATION\s+METHOD\s+PATH\s+STATUS\s+EXPIRES/);
+    expect(all.out).toMatch(/ID\s+AGENT\s+INTEGRATION\s+METHOD\s+HOST\s+PATH\s+STATUS\s+EXPIRES/);
     expect(all.out).toContain(mine.id);
     expect(all.out).toContain(theirs.id);
     // The decision token is never printed.

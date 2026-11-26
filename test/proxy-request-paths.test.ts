@@ -299,12 +299,19 @@ describe("self-mint connect links on the discovery host: edge cases", () => {
     expect(ttlMs).toBeLessThan(2 * 86400_000 + 60_000);
   });
 
-  it("ignores a blank connectionName and a non-positive or non-numeric ttlDays (7-day default)", async () => {
+  it("rejects a non-positive ttlDays with 400 (no silent default)", async () => {
+    const a = newAgent("selfmint-bad-ttl");
+    const r = await post(a.token, JSON.stringify({ integrationId: "reqvendor", ttlDays: -3 }));
+    expect(r.status).toBe(400);
+    expect(h.store.listOnboardingLinks(a.id)).toHaveLength(0);
+  });
+
+  it("ignores a blank connectionName and defaults an omitted ttlDays to 7 days", async () => {
     const a = newAgent("selfmint-defaults");
     const before = Date.now();
     const r = await post(
       a.token,
-      JSON.stringify({ integrationId: "reqvendor", scopes: "read", connectionName: "   ", ttlDays: -3 }),
+      JSON.stringify({ integrationId: "reqvendor", scopes: "read", connectionName: "   " }),
     );
     expect(r.status).toBe(201);
     const [link] = h.store.listOnboardingLinks(a.id);
@@ -367,8 +374,9 @@ describe("lapsed access leases", () => {
     const first = await viaProxy(h, { host: VENDOR_HOST, token: a.token, path: "/v1/leased" });
     expect(first.status).toBe(403);
     expect(first.json.error).toBe("onegate_lease_expired");
-    expect(first.json.connect_url).toMatch(new RegExp(`^${BASE}/renew/[0-9a-f]+$`));
-    expect(first.json.hint).toMatch(/re-allows/);
+    // The agent never receives a redeemable renewal link; only the owner does.
+    expect(first.json.connect_url).toBeUndefined();
+    expect(JSON.stringify(first.json)).not.toMatch(/\/renew\//);
     expect(h.seen).toHaveLength(0);
 
     // The renewal link is agent-scoped and bound to the lapsed rule.
@@ -425,7 +433,9 @@ describe("approval holds: owner notification and fail-closed errors", () => {
     const first = await viaProxy(h, { host: VENDOR_HOST, token: a.token, method: "POST", path: "/v1/held/x", body: "{}" });
     expect(first.status).toBe(403);
     expect(first.json.error).toBe("onegate_approval_pending");
-    expect(first.json.approval_url).toMatch(new RegExp(`^${BASE}/approve/`));
+    // The agent never receives the decision link; only the owner's webhook does.
+    expect(first.json.approval_url).toBeUndefined();
+    expect(JSON.stringify(first.json)).not.toMatch(/\/approve\//);
 
     await waitFor(() => notificationsFor(a.id).some((n) => n.status === "delivered"));
     const rows = notificationsFor(a.id);
@@ -434,7 +444,7 @@ describe("approval holds: owner notification and fail-closed errors", () => {
     expect(rows[0].connectToken).toBeNull();
     expect(notifyCalls[0].body).toMatchObject({
       reason: "approval_required",
-      connectUrl: first.json.approval_url,
+      connectUrl: expect.stringMatching(new RegExp(`^${BASE}/approve/`)),
       connectExpiresAt: first.json.approval_expires_at,
     });
 
@@ -442,7 +452,7 @@ describe("approval holds: owner notification and fail-closed errors", () => {
     expect(retry.json.error).toBe("onegate_approval_pending");
     expect(retry.json.approval_id).toBe(first.json.approval_id);
     expect(retry.json.approval_url).toBeUndefined();
-    expect(retry.json.hint).toMatch(/Ask your owner/);
+    expect(retry.json.hint).toMatch(/owner has been notified/);
     expect(notificationsFor(a.id)).toHaveLength(1);
     expect(h.seen).toHaveLength(0);
   });
