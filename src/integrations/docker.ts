@@ -10,6 +10,7 @@ import type { Integration, InjectionContext } from "./types.js";
 import type { Credential } from "../types.js";
 import type { Store } from "../store/db.js";
 import { postJson } from "../util/http.js";
+import { TokenEndpointError } from "./oauth.js";
 
 const LOGIN_URL = "https://hub.docker.com/v2/users/login";
 /** Refresh the JWT when it is within a minute of expiry. */
@@ -50,7 +51,8 @@ export async function dockerHubToken(cred: Credential, store: Store): Promise<st
     } catch {
       // Non-JSON error body.
     }
-    throw new Error(`Docker Hub login failed (${res.status})${detail ? `: ${detail}` : ""}`);
+    // Vendor text stays in the server log; the agent only sees the status.
+    throw new TokenEndpointError(`Docker Hub login failed (${res.status})`, res.status, detail.slice(0, 300));
   }
   const { token } = JSON.parse(res.body) as { token?: string };
   if (!token) throw new Error("Docker Hub login did not return a token");

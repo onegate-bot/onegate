@@ -87,6 +87,7 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "connection_scope",
       "created_by",
       "action",
+      "connection_scope_enforced",
     ],
   },
   {
@@ -149,6 +150,7 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "expires_at",
       "used_at",
       "rule_id",
+      "minted_by",
     ],
   },
   {

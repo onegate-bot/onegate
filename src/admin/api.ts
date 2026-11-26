@@ -16,7 +16,12 @@ import type { Connection, OnboardingLink, LlmStrategy } from "../types.js";
 import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry } from "../integrations/types.js";
 import type { Ca } from "../ca.js";
 import { composeLlmHelpPrompt } from "../integrations/llm-help.js";
-import { buildAuthUrl, exchangeCode, pickTokenFields } from "../integrations/oauth.js";
+import {
+  TokenEndpointError,
+  buildAuthUrl,
+  exchangeCode,
+  pickTokenFields,
+} from "../integrations/oauth.js";
 import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
@@ -366,8 +371,22 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   /**
    * Connect-wizard auto-wire. Runs only when the pending entry carries a wizard
    * token + agent. Atomically claims the onboarding link FIRST, then grants the
-   * freshly created connection to the agent and ensures an agent-scoped allow
-   * rule for the integration exists.
+   * freshly created connection to the agent and creates an allow rule bound to
+   * THAT connection only.
+   *
+   * The rule is connection-scoped (`connectionScope: "only"`, `connectionId` =
+   * the new connection) with `connectionScopeEnforced`, so it participates in a
+   * decision only when the request resolved to the connection the wizard just
+   * created, whether or not ONEGATE_CONNECTION_SCOPED_RULES is on. A wizard
+   * redeem therefore never changes the verdict for any OTHER connection the
+   * agent can reach (e.g. an owner's connection granted via the project): the
+   * link is a bearer capability the bot itself can mint, so the credential
+   * submitted through it (possibly junk) must not buy access to anything but
+   * itself.
+   *
+   * Existing rules are never touched: no lease is re-stamped, extended or
+   * cleared by a redeem. Each wizard connection gets its own rule, with its own
+   * lease resolved from the connection override / integration default.
    *
    * Returns false without wiring anything when the link was already claimed (a
    * concurrent or replayed redemption). The claim is the gate: a losing racer
@@ -385,44 +404,34 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     alreadyClaimed = false,
   ): boolean {
     if (!alreadyClaimed && !store.claimOnboardingLink(wizardToken)) return false;
-    if (connectionId) store.grantConnection(connectionId, "agent", agentId);
-    // Resolve the effective access lease for this integration/connection: the
-    // owner's per-connection override (chosen in the wizard) wins over the
-    // integration default. null = no lease (regular, non-time-boxed).
-    const connLeaseTtl = connectionId ? store.getConnection(connectionId)?.leaseTtlSeconds ?? null : null;
+    // No connection (legacy single-credential write): nothing to bind a rule
+    // to, and an unbound rule is exactly what must never be created here.
+    if (!connectionId) return true;
+    const agent = store.getAgent(agentId);
+    if (!agent) return true;
+    store.grantConnection(connectionId, "agent", agentId);
+    // Resolve the effective access lease for this connection: the owner's
+    // per-connection override (chosen in the wizard) wins over the integration
+    // default. null = no lease (regular, non-time-boxed).
+    const connLeaseTtl = store.getConnection(connectionId)?.leaseTtlSeconds ?? null;
     const ttl = store.effectiveLeaseTtlSeconds(integration.id, connLeaseTtl);
     const expiresAt = ttl ? new Date(Date.now() + ttl * 1000).toISOString() : null;
-    const agent = store.getAgent(agentId);
-    if (agent) {
-      const existing = store
-        .rulesForAgent(agent)
-        .find(
-          (r) =>
-            r.scope === "agent" &&
-            r.subjectId === agentId &&
-            r.integrationId === integration.id &&
-            r.effect === "allow",
-        );
-      if (existing) {
-        // Re-connecting refreshes the lease on the existing allow rule (a new
-        // period starts now, or clears the lease if now always-on).
-        store.stampRuleLease(existing.id, expiresAt, ttl);
-      } else {
-        store.createRule({
-          scope: "agent",
-          subjectId: agentId,
-          integrationId: integration.id,
-          methods: ["*"],
-          pathGlob: "/**",
-          effect: "allow",
-          expiresAt,
-          leaseTtlSeconds: ttl,
-          // Same provenance as a manually granted connection: this rule exists
-          // because a connection was attached, not because an operator wrote it.
-          createdBy: "grant",
-        });
-      }
-    }
+    store.createRule({
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: integration.id,
+      methods: ["*"],
+      pathGlob: "/**",
+      effect: "allow",
+      expiresAt,
+      leaseTtlSeconds: ttl,
+      connectionId,
+      connectionScope: "only",
+      connectionScopeEnforced: true,
+      // Same provenance as a manually granted connection: this rule exists
+      // because a connection was attached, not because an operator wrote it.
+      createdBy: "grant",
+    });
     return true;
   }
 
@@ -592,7 +601,13 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       finishWizard(integration, pending, connId);
       done();
     } catch (err) {
-      res.status(502).send(resultPage("Connection failed", esc((err as Error).message)));
+      // The owner completing consent sees the vendor's explanation of their own
+      // exchange (e.g. a redirect_uri mismatch); it never reaches an agent.
+      const msg =
+        err instanceof TokenEndpointError && err.detail
+          ? `${err.message}: ${err.detail}`
+          : (err as Error).message;
+      res.status(502).send(resultPage("Connection failed", esc(msg)));
     }
   });
 
@@ -2566,6 +2581,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       scopes: Array.isArray(scopes) ? scopes.map(String) : undefined,
       connectionName: typeof connectionName === "string" && connectionName.trim() ? connectionName.trim() : undefined,
       ttlDays: typeof ttlDays === "number" && ttlDays > 0 ? ttlDays : undefined,
+      mintedBy: "owner",
     });
     const base = publicBase();
     res.status(201).json({
