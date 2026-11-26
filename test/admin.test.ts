@@ -97,25 +97,13 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+// Public-route and Bearer-gate coverage lives in admin-api-auth-gate.test.ts.
 describe("auth", () => {
-  it("health is public, api requires the admin token", async () => {
-    expect((await api("GET", "/api/health", undefined, null)).status).toBe(200);
-    expect((await api("GET", "/api/agents", undefined, null)).status).toBe(401);
-    expect((await api("GET", "/api/agents", undefined, "oga_wrong")).status).toBe(401);
-    expect((await api("GET", "/api/agents")).status).toBe(200);
-  });
-
   it("ensureAdminToken only generates once; reset replaces it", () => {
     expect(ensureAdminToken(store)).toBeNull();
     const fresh = resetAdminToken(store);
     expect(fresh).toMatch(/^oga_/);
     adminToken = fresh;
-  });
-
-  it("serves the root CA publicly", async () => {
-    const r = await api("GET", "/ca.pem", undefined, null);
-    expect(r.status).toBe(200);
-    expect(r.text).toContain("BEGIN CERTIFICATE");
   });
 });
 
