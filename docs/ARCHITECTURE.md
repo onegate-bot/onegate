@@ -56,6 +56,8 @@ An agent often needs an account-specific URL or id that lives only in OneGate (f
 
 The agent makes a normal `CONNECT onegate.internal:443` through the proxy with its `og_` token, then `GET /`. The host `onegate.internal` is a sentinel intercepted in the proxy after token auth: TLS is terminated locally with a leaf from the same root CA the agent already trusts, and the request is served in-process (never forwarded upstream, no audit row). GET only, otherwise `405`.
 
+`GET /approvals/<id>` on the same host returns the status of one of the calling agent's own held calls (`pending`, `approved`, `rejected`, `expired`, plus `used`), so a bot can wait for its owner's decision. It never carries the decision token, and another agent's approval reads as `404`. The `onegate_approval_pending` 403 points at it as `approval_status_url`.
+
 The JSON response lists every integration the agent has at least one account for, and for each: a coarse `access` hint (`allowed` or `denied`, from the policy engine at path `/`), the account(s) (named app connections granted to the agent, or the legacy shared credential), each account's non-secret `summary` (built by the integration's optional `accountSummary(cred)`, e.g. Jira's `siteUrl` and `apiBaseUrl`), and `defaultAccountId`. A sole account auto-defaults. LLM-vendor integrations fall away naturally (they expose no app accounts). The payload is strictly non-secret: only ids, names, and summary facts, never credential values.
 
 ## Policy engine
@@ -120,7 +122,7 @@ Every audit row records a raw `decision` and upstream `status`, but those alone 
 - **`source`** is `onegate` when the row is one of OneGate's own blocks (`deny`, `auth_failed`, `no_credential`, `unknown_connection`, `connection_not_granted`, `body_too_large`, `invalid_path`), and `upstream` for `allow` and `passthrough` rows where the request reached the vendor.
 - **`reason`** is a short plain-words explanation for any non-clean outcome (for example "Blocked by OneGate: no allow rule matches this agent and integration. Add an allow rule to permit it."), and `null` for a clean success.
 
-An `allow` row for a call that a `require_approval` rule held also carries the `approvalId` that let it through (stored, in a column added by the idempotent audit migration), and its `reason` reads "Allowed by OneGate after owner approval <id>". See [SECURITY.md](SECURITY.md) for how approvals are bound to the request and redeemed once.
+An `allow` row for a call that a `require_approval` rule held also carries the `approvalId` that let it through (stored, in a column added by the idempotent audit migration), and its `reason` reads "Allowed by OneGate after owner approval <id>". See [SECURITY.md](SECURITY.md) for how approvals are bound to the request (including its upstream host, stored in `approvals.host`) and redeemed once, and why the decision link is never returned to the agent unless `ONEGATE_AGENT_RELAYS_OWNER_LINKS` is set.
 
 The admin UI surfaces `source` as a Source column with the `reason` shown as a sub-row, so a denied call reads as "blocked by OneGate, here is why" versus "the vendor returned this status".
 
