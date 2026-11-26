@@ -168,9 +168,13 @@ export interface InjectionContext {
   headers: IncomingHttpHeaders;
   method: string;
   /**
-   * Request path. Reassigning it forwards the rewritten path upstream, for
-   * APIs that carry credentials in the URL (policy and audit always see the
-   * original path the agent sent).
+   * Request path in its WIRE form: the canonical path percent-encoded for
+   * upstream (see encodePathForUpstream in policy.ts) plus the agent's query
+   * string, so a signature computed over it covers exactly the bytes sent.
+   * Reassigning it forwards the rewritten path upstream, for APIs that carry
+   * credentials in the URL (policy and audit always see the canonical decoded
+   * path the agent sent). A rewrite must stay a valid request target (encode
+   * anything it splices in).
    */
   path: string;
   host: string;
