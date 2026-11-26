@@ -412,7 +412,13 @@ export function ruleConnectionMatch(
   // Flag off: the connection scope is ignored and the rule sits out the
   // decision entirely. (It must NOT fall through as a plain rule, or a
   // DENY-except would become a DENY-all.)
-  if (!enabled) return "excluded";
+  //
+  // Exception: a rule marked connectionScopeEnforced (the allow rule the
+  // connect wizard creates for the connection it just made) is ALWAYS bound to
+  // its connection. Without that, a wizard redeem would have to grant either
+  // nothing or the whole integration; with it, the rule authorizes exactly the
+  // new connection and nothing else, flag or no flag.
+  if (!enabled && !(rule.connectionScopeEnforced && rule.connectionId)) return "excluded";
   if (req.connectionId === undefined) return "pending";
   const isTarget = req.connectionId != null && req.connectionId === rule.connectionId;
   const applies = rule.connectionScope === "only" ? isTarget : !isTarget;

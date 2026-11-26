@@ -28,6 +28,7 @@ import type {
   LlmStrategyState,
   LlmUsageEvent,
   OnboardingLink,
+  OnboardingLinkMinter,
   OwnerNotification,
   OwnerNotificationStatus,
   Project,
@@ -84,7 +85,10 @@ CREATE TABLE IF NOT EXISTS rules (
   -- unaware of actions fails CLOSED. A future action value can be added with a
   -- plain ALTER, whereas widening the effect CHECK above would need a full
   -- table rebuild, which is why the action lives in its own column.
-  action TEXT CHECK (action IN ('require_approval'))
+  action TEXT CHECK (action IN ('require_approval')),
+  -- 1 = enforce connection_id/connection_scope even with the
+  -- ONEGATE_CONNECTION_SCOPED_RULES flag off. Set only on connect-wizard rules.
+  connection_scope_enforced INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_rules_subject ON rules(scope, subject_id);
 -- Time-boxed integrations: presence of a row marks the integration as
@@ -216,7 +220,8 @@ CREATE TABLE IF NOT EXISTS onboarding_links (
   expires_at TEXT NOT NULL,
   used_at TEXT,
   rule_id TEXT,
-  pin_failures INTEGER NOT NULL DEFAULT 0
+  pin_failures INTEGER NOT NULL DEFAULT 0,
+  minted_by TEXT CHECK (minted_by IN ('owner','agent'))
 );
 CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id);
 CREATE TABLE IF NOT EXISTS agent_notify (
@@ -415,6 +420,7 @@ function rowToRule(r: Row): Rule {
     // a row written by a newer build cannot make an older engine treat a rule as
     // something it does not understand. The stored effect ('deny') still stands.
     action: r.action === "require_approval" ? "require_approval" : null,
+    connectionScopeEnforced: Number(r.connection_scope_enforced ?? 0) === 1,
   };
 }
 
@@ -456,6 +462,7 @@ function rowToOnboardingLink(r: Row): OnboardingLink {
     expiresAt: r.expires_at,
     usedAt: r.used_at ?? null,
     ruleId: r.rule_id ?? null,
+    mintedBy: r.minted_by === "owner" || r.minted_by === "agent" ? r.minted_by : null,
   };
 }
 
@@ -785,6 +792,12 @@ export class Store {
     // cannot alter without rebuilding the table.
     if (!ruleCols.has("action"))
       this.db.exec("ALTER TABLE rules ADD COLUMN action TEXT CHECK (action IN ('require_approval'))");
+    // Wizard-rule connection-scope enforcement. 0 on every pre-existing row, so
+    // existing connection-scoped rules keep following the feature flag.
+    if (!ruleCols.has("connection_scope_enforced"))
+      this.db.exec(
+        "ALTER TABLE rules ADD COLUMN connection_scope_enforced INTEGER NOT NULL DEFAULT 0",
+      );
     if (!connCols.has("lease_ttl_seconds"))
       this.db.exec("ALTER TABLE connections ADD COLUMN lease_ttl_seconds INTEGER");
     // Inactive-connection columns. NULL inactive_at = active, so every existing
@@ -806,6 +819,11 @@ export class Store {
     if (!linkCols.has("rule_id")) this.db.exec("ALTER TABLE onboarding_links ADD COLUMN rule_id TEXT");
     if (!linkCols.has("pin_failures"))
       this.db.exec("ALTER TABLE onboarding_links ADD COLUMN pin_failures INTEGER NOT NULL DEFAULT 0");
+    // Link provenance. NULL on pre-existing rows (unknown / proxy-minted).
+    if (!linkCols.has("minted_by"))
+      this.db.exec(
+        "ALTER TABLE onboarding_links ADD COLUMN minted_by TEXT CHECK (minted_by IN ('owner','agent'))",
+      );
     // Approval redemption columns. A pre-existing row gets NULL for both, and
     // redemption compares body_hash with `=`, so an approval minted before this
     // migration (no recorded body) can never be redeemed. Fails closed.
@@ -943,11 +961,23 @@ export class Store {
         expires_at TEXT NOT NULL,
         used_at TEXT,
         rule_id TEXT,
-        pin_failures INTEGER NOT NULL DEFAULT 0
+        pin_failures INTEGER NOT NULL DEFAULT 0,
+        minted_by TEXT CHECK (minted_by IN ('owner','agent'))
       )`);
         this.db.exec(
           "CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id)",
         );
+        // A half-migrated database may already hold a new-shaped table from a
+        // build that predates minted_by; give it the column before copying.
+        const newCols = new Set(
+          (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) =>
+            String(r.name),
+          ),
+        );
+        if (!newCols.has("minted_by"))
+          this.db.exec(
+            "ALTER TABLE onboarding_links ADD COLUMN minted_by TEXT CHECK (minted_by IN ('owner','agent'))",
+          );
         const legacyCols = new Set(
           (this.db.prepare("PRAGMA table_info(onboarding_links_legacy)").all() as Row[]).map((r) =>
             String(r.name),
@@ -955,7 +985,7 @@ export class Store {
         );
         const rows = this.db.prepare("SELECT * FROM onboarding_links_legacy").all() as Row[];
         const insert = this.db.prepare(
-          "INSERT OR IGNORE INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id, minted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         );
         for (const r of rows) {
           insert.run(
@@ -968,6 +998,7 @@ export class Store {
             r.expires_at,
             r.used_at ?? null,
             legacyCols.has("rule_id") ? (r.rule_id ?? null) : null,
+            legacyCols.has("minted_by") ? (r.minted_by ?? null) : null,
           );
         }
         this.db.exec("DROP TABLE onboarding_links_legacy");
@@ -2283,6 +2314,8 @@ export class Store {
      * effect='deny' regardless of the effect passed in (see below).
      */
     action?: RuleAction | null;
+    /** Enforce the connection scope even with the feature flag off. See Rule. */
+    connectionScopeEnforced?: boolean;
   }): Rule {
     const action = input.action ?? null;
     const r: Rule = {
@@ -2306,10 +2339,14 @@ export class Store {
       connectionId: input.connectionId ?? null,
       connectionScope: input.connectionScope,
       createdBy: input.createdBy ?? "operator",
+      // Meaningless without a connection scope, so never persisted without one.
+      connectionScopeEnforced: Boolean(
+        input.connectionScopeEnforced && input.connectionId && input.connectionScope,
+      ),
     };
     this.db
       .prepare(
-        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope, created_by, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO rules (id, scope, subject_id, integration_id, methods, path_glob, effect, created_at, expires_at, lease_ttl_seconds, connection_id, connection_scope, created_by, action, connection_scope_enforced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         r.id,
@@ -2326,6 +2363,7 @@ export class Store {
         r.connectionScope ?? null,
         r.createdBy ?? null,
         r.action ?? null,
+        r.connectionScopeEnforced ? 1 : 0,
       );
     return r;
   }
@@ -2443,6 +2481,8 @@ export class Store {
     ttlDays?: number;
     /** Set for a RENEWAL link: the allow rule whose lease it re-stamps. */
     ruleId?: string | null;
+    /** Who minted it ("owner" admin API, "agent" self-mint). See OnboardingLink. */
+    mintedBy?: OnboardingLinkMinter | null;
   }): OnboardingLink {
     // Callers validate untrusted input with parseOnboardingTtlDays first; this
     // guard keeps an out-of-range value from reaching toISOString (which throws
@@ -2468,10 +2508,11 @@ export class Store {
       expiresAt,
       usedAt: null,
       ruleId: input.ruleId ?? null,
+      mintedBy: input.mintedBy ?? null,
     };
     this.db
       .prepare(
-        "INSERT INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO onboarding_links (token_hash, agent_id, integration_id, scopes, connection_name, created_at, expires_at, used_at, rule_id, minted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         link.tokenHash,
@@ -2483,6 +2524,7 @@ export class Store {
         link.expiresAt,
         link.usedAt,
         link.ruleId ?? null,
+        link.mintedBy ?? null,
       );
     return link;
   }
@@ -2802,6 +2844,20 @@ export class Store {
     // mint a fresh link each time; owner-notification dedup (time window /
     // dedupKey) still prevents duplicate notifications.
     return null;
+  }
+
+  /**
+   * How many agent SELF-MINTED connect links for this agent are still
+   * outstanding (unused and unexpired). Bounds how many live bearer links a bot
+   * can hold at once (see the self-mint handler in the proxy).
+   */
+  countOutstandingSelfMintedLinks(agentId: string): number {
+    const r = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM onboarding_links WHERE agent_id = ? AND minted_by = 'agent' AND used_at IS NULL AND expires_at > ?",
+      )
+      .get(agentId, now()) as Row;
+    return Number(r.n);
   }
 
   /** A link is valid iff it exists, is unused, and has not expired. */

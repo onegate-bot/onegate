@@ -1219,9 +1219,12 @@ describe("batch 7 integrations (mongodb-atlas, docker, jfrog, github-app)", () =
     expect(dockerBody).toEqual({ username: "ziv", password: "dckr_pat_x" });
   });
 
-  it("docker surfaces login failures with the vendor detail", async () => {
+  it("docker reports login failures by status, keeping the vendor detail off the message", async () => {
     const c = cred({ username: "ziv", apiToken: "bad" }, "docker");
-    await expect(dockerHubToken(c, store)).rejects.toThrow(/Incorrect authentication/);
+    const err = (await dockerHubToken(c, store).catch((e: unknown) => e)) as Error & { detail?: string };
+    expect(err.message).toMatch(/Docker Hub login failed \(401\)/);
+    expect(err.message).not.toMatch(/Incorrect authentication/);
+    expect(err.detail).toMatch(/Incorrect authentication/);
   });
 
   it("jwtExpiryMs parses exp and tolerates garbage", () => {

@@ -96,19 +96,63 @@ function tokenRequest(
     : postForm(url, new URLSearchParams(fields), headers);
 }
 
+/**
+ * A vendor token endpoint refused or garbled a token call. `message` is safe to
+ * hand to an agent (what failed + HTTP status + the RFC 6749 error code, when
+ * the vendor sent a well-formed one). `detail` carries the first 300 chars of
+ * the vendor's response body: it can echo client ids, account identifiers or
+ * internal hints, so it only ever goes to the server log (and to the owner on
+ * the connect wizard's result page, where it describes the owner's own
+ * exchange), never into a proxy response body.
+ */
+export class TokenEndpointError extends Error {
+  readonly status: number;
+  readonly detail: string;
+  constructor(message: string, status: number, detail: string) {
+    super(message);
+    this.name = "TokenEndpointError";
+    this.status = status;
+    this.detail = detail;
+    // Server log only. The proxy echoes `message` to the agent, never `detail`.
+    if (detail) console.warn(`onegate: ${message}: ${detail}`);
+  }
+}
+
+/** A standard OAuth error code (`invalid_grant`, ...), or null for anything else. */
+function safeOauthErrorCode(v: unknown): string | null {
+  return typeof v === "string" && /^[a-z_]{1,64}$/.test(v) ? v : null;
+}
+
 function parseTokenResponse(res: HttpResult, what: string): TokenResponse {
   if (res.status < 200 || res.status >= 300) {
-    throw new Error(`${what} failed (${res.status}): ${res.body.slice(0, 300)}`);
+    let code: string | null = null;
+    try {
+      code = safeOauthErrorCode((JSON.parse(res.body) as { error?: unknown }).error);
+    } catch {
+      /* non-JSON error body: no code */
+    }
+    throw new TokenEndpointError(
+      `${what} failed (${res.status})${code ? `: ${code}` : ""}`,
+      res.status,
+      res.body.slice(0, 300),
+    );
   }
   let json: TokenResponse;
   try {
     json = JSON.parse(res.body) as TokenResponse;
   } catch {
-    throw new Error(`${what} returned a non-JSON response: ${res.body.slice(0, 300)}`);
+    throw new TokenEndpointError(
+      `${what} returned a non-JSON response (${res.status})`,
+      res.status,
+      res.body.slice(0, 300),
+    );
   }
   if (json.error || !json.access_token) {
-    throw new Error(
-      `${what} failed: ${json.error_description ?? json.error ?? "no access_token in response"}`,
+    const code = safeOauthErrorCode(json.error);
+    throw new TokenEndpointError(
+      `${what} failed: ${code ?? (json.error ? "token endpoint error" : "no access_token in response")}`,
+      res.status,
+      String(json.error_description ?? json.error ?? "").slice(0, 300),
     );
   }
   return json;
