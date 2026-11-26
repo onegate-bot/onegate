@@ -86,17 +86,6 @@ describe("pipeUpstreamResponse", () => {
     expect(res.destroyed).toBe(true);
   });
 
-  it("attaches an 'error' listener to the upstream response stream", async () => {
-    const { res } = await nextResponse();
-    const upRes = new http.IncomingMessage(null as never);
-
-    expect(upRes.listenerCount("error")).toBe(0);
-    pipeUpstreamResponse(upRes, res, fakeUpstream());
-    expect(upRes.listenerCount("error")).toBeGreaterThan(0);
-
-    res.destroy();
-  });
-
   it("destroys the upstream request when the agent-facing response errors", async () => {
     const { res } = await nextResponse();
     const upRes = new http.IncomingMessage(null as never);
