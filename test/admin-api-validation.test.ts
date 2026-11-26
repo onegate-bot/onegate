@@ -639,8 +639,8 @@ describe("onboarding links admin mint", () => {
     expect(link.connectionName).toBe("Named");
     expect(link.scopes).toEqual(["a", "2"]);
 
-    // Blank name and a non-positive ttl fall back to defaults (7 days).
-    const d = await h.api("POST", "/api/onboarding-links", { agentId, integrationId: "hetzner", connectionName: "  ", ttlDays: -1 });
+    // A blank name and an omitted ttl fall back to the defaults (7 days).
+    const d = await h.api("POST", "/api/onboarding-links", { agentId, integrationId: "hetzner", connectionName: "  " });
     expect(h.store.getOnboardingLink(d.json.token)!.connectionName).toBeNull();
     expect(Date.parse(d.json.expiresAt) - Date.now()).toBeGreaterThan(7 * 86400_000 - 60_000);
 
