@@ -72,7 +72,11 @@ export const youtube: Integration = {
     if (!apiKey) throw new Error('YouTube credential has no "apiKey" field');
     // The key travels as a query parameter. Replace any placeholder the agent
     // sent rather than appending a second `key`, which YouTube rejects.
-    const [rawPath, rawQuery = ""] = ctx.path.split("?");
+    // Split on the FIRST "?" only: a literal "?" inside the query (e.g.
+    // q=what?now) belongs to the query and must survive the rewrite.
+    const qi = ctx.path.indexOf("?");
+    const rawPath = qi === -1 ? ctx.path : ctx.path.slice(0, qi);
+    const rawQuery = qi === -1 ? "" : ctx.path.slice(qi + 1);
     const params = new URLSearchParams(rawQuery);
     params.set("key", apiKey);
     ctx.path = `${rawPath}?${params.toString()}`;

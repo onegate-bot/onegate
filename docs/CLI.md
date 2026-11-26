@@ -144,7 +144,7 @@ onegate agents rotate-token <agentId>
 onegate agents rm <agentId>
 ```
 
-`add` and `rotate-token` print the agent token once.
+`add` and `rotate-token` print the agent token once. `--policy` must be `allow-all` or `deny-unmatched` (the default); the admin API rejects any other value with `400 invalid_default_policy`.
 
 ## Rules
 
@@ -155,6 +155,16 @@ onegate rules rm <ruleId>
 ```
 
 `--effect` is `allow` or `deny`. `--methods` is a comma list (omit for all). `--path` is a glob (defaults to `/**`).
+
+The admin API validates every field before storing a rule, so a typo fails with a 400 instead of saving a rule that never matches:
+
+- `scope` must be `agent` or `project` (`invalid_scope`), and `effect` must be `allow` or `deny` (`invalid_effect`).
+- `pathGlob` must be a string that starts with `/` or `*` (`invalid_path_glob`).
+- `ttlSeconds` (`--ttl`) must be a number from 0 to 315360000, which is 10 years (`invalid_ttl_seconds`). 0 means no lease.
+
+Related limits on other admin routes:
+
+- An integration's default lease (`PUT /api/integration-leases/:id`) must be a JSON integer from 1 to 315360000. 0 or `null` clears it.
 
 ## Credentials and integrations
 

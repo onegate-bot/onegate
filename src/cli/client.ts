@@ -11,9 +11,6 @@
 
 import http from "node:http";
 import https from "node:https";
-import { Store, hashToken } from "../store/db.js";
-
-const ADMIN_TOKEN_KEY = "admin_token_hash";
 
 export interface ClientOptions {
   /** Base URL of the admin API, e.g. http://localhost:8080 */
@@ -150,17 +147,6 @@ export function resolveToken(explicit: string | undefined): string {
     );
   }
   return token;
-}
-
-/**
- * Same-host sanity check: confirms the given token hashes to the admin token
- * hash stored locally. Only usable when the CLI runs on the server box with
- * access to the store. Returns true when it matches, false otherwise. Never
- * reveals the token.
- */
-export function tokenMatchesStore(store: Store, token: string): boolean {
-  const stored = store.getSetting(ADMIN_TOKEN_KEY);
-  return Boolean(stored) && stored === hashToken(token);
 }
 
 export function resolveHost(explicit: string | undefined): string {
