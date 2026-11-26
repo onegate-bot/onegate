@@ -108,6 +108,7 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "lease_ttl_seconds",
       "inactive_at",
       "inactive_reason",
+      "instance_origin",
       "created_at",
       "updated_at",
     ],
