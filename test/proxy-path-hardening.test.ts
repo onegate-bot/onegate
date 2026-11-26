@@ -5,7 +5,11 @@
  *  - a percent-decoded space/control character in the path made https.request
  *    throw synchronously inside the async inner handler (unhandled rejection,
  *    process exit). The path is now re-encoded for the wire.
- *  - path confusion (`;`, `\`, encoded `?`) is refused with 400 + audit.
+ *  - path confusion (`;`, `\`, encoded `?`, `#`, `%252f`) is forwarded
+ *    percent-encoded, so the vendor reads the same text policy matched; a deny
+ *    additionally matches the lenient (`;params` stripped, `\` as `/`) reading.
+ *    Non-origin-form targets are refused with 400 + audit.
+ *  - S3 keys with `;`/`?` reach S3 byte-exact with a valid SigV4 signature.
  *  - an out-of-range self-mint `ttlDays` threw RangeError in an event listener.
  *  - a write to a reset CONNECT socket before its error listener was attached.
  *  - a ClientHello pipelined in the same packet as CONNECT broke the handshake.
@@ -22,9 +26,11 @@ import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import { Duplex } from "node:stream";
+import { createHash, createHmac } from "node:crypto";
 import { initCa } from "../src/ca.js";
 import { Store, parseOnboardingTtlDays, MAX_ONBOARDING_LINK_TTL_DAYS } from "../src/store/db.js";
 import { Registry, type Integration } from "../src/integrations/types.js";
+import { aws, canonicalUri, deriveSigningKey } from "../src/integrations/aws.js";
 import { GatewayProxy } from "../src/proxy/server.js";
 import {
   canonicalizeRequestTarget,
@@ -39,6 +45,8 @@ import { DISCOVERY_HOST } from "../src/discovery.js";
 const VENDOR = "api.example-vendor.com";
 /** An integration whose inject splices an unescaped space into the path. */
 const BROKEN = "api.broken-vendor.com";
+const S3 = "reports-bucket.s3.us-west-2.amazonaws.com";
+const AWS_SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
 let dir: string;
 let store: Store;
@@ -48,7 +56,12 @@ let caPem: string;
 let token: string;
 let agentId: string;
 let stub: https.Server;
-const seen: Array<{ path: string; auth: string | undefined }> = [];
+const seen: Array<{
+  path: string;
+  auth: string | undefined;
+  method: string;
+  headers: import("node:http").IncomingHttpHeaders;
+}> = [];
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "onegate-path-hardening-"));
@@ -56,10 +69,25 @@ beforeAll(async () => {
   caPem = ca.rootPem;
   store = new Store(":memory:");
   const leaf = ca.leafFor(VENDOR);
-  stub = https.createServer({ key: leaf.key, cert: leaf.cert }, (req, res) => {
+  const contexts = new Map<string, tls.SecureContext>();
+  const sni = (name: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => {
+    let c = contexts.get(name);
+    if (!c) {
+      const l = ca.leafFor(name);
+      c = tls.createSecureContext({ key: l.key, cert: l.cert });
+      contexts.set(name, c);
+    }
+    cb(null, c);
+  };
+  stub = https.createServer({ key: leaf.key, cert: leaf.cert, SNICallback: sni }, (req, res) => {
     req.resume();
     req.on("end", () => {
-      seen.push({ path: req.url ?? "", auth: req.headers.authorization });
+      seen.push({
+        path: req.url ?? "",
+        auth: req.headers.authorization,
+        method: req.method ?? "",
+        headers: req.headers,
+      });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ path: req.url }));
     });
@@ -88,6 +116,8 @@ beforeAll(async () => {
     },
   });
   store.setCredential("broken", "k", { apiKey: "x" });
+  registry.register(aws);
+  store.setCredential("aws", "k", { accessKeyId: "AKIDEXAMPLE", secretAccessKey: AWS_SECRET });
   store.setCredential("vendor", "k", { apiKey: "REAL-SECRET" });
   const a = store.createAgent("hardening", { defaultPolicy: "deny-unmatched" });
   token = a.token;
@@ -115,6 +145,22 @@ beforeAll(async () => {
     methods: ["*"],
     pathGlob: "/v1/admin/**",
     effect: "deny",
+  });
+  store.createRule({
+    scope: "agent",
+    subjectId: agentId,
+    integrationId: "vendor",
+    methods: ["*"],
+    pathGlob: "/v1/*/secret/**",
+    effect: "deny",
+  });
+  store.createRule({
+    scope: "agent",
+    subjectId: agentId,
+    integrationId: "aws",
+    methods: ["*"],
+    pathGlob: "/reports/**",
+    effect: "allow",
   });
 
   proxy = new GatewayProxy({
@@ -252,19 +298,29 @@ describe("canonicalizeRequestTarget (unit)", () => {
     expect(normalizeRequestPath("/projects/group%252Fproj")).toBe(dbl.path);
   });
 
-  it("rejects ';', '\\', an encoded '?' and non-origin-form targets", () => {
-    for (const raw of [
-      "/v1/admin;x/users",
-      "/v1/admin%3bx/users",
-      "/v1/admin%5cusers",
-      "/v1/admin\\users",
-      "/v1/admin%3F/users",
-      "http://evil.example/v1/x",
-      "*",
-    ]) {
+  it("encodes ';', '\\' and an encoded '?' on the wire instead of rejecting", () => {
+    expect(canonicalizeRequestTarget("/v1/admin;x/users")).toMatchObject({
+      path: "/v1/admin;x/users",
+      forward: "/v1/admin%3Bx/users",
+      rejectReason: null,
+    });
+    expect(canonicalizeRequestTarget("/v1/admin%3bx/users").forward).toBe("/v1/admin%3Bx/users");
+    expect(canonicalizeRequestTarget("/v1/admin%5cusers").forward).toBe("/v1/admin%5Cusers");
+    expect(canonicalizeRequestTarget("/v1/admin\\users").forward).toBe("/v1/admin%5Cusers");
+    // A decoded '?' stays %3F in the policy view so the matcher's query split
+    // can never truncate the path at it.
+    expect(canonicalizeRequestTarget("/v1/x%3F/admin/users?q=1")).toMatchObject({
+      path: "/v1/x%3F/admin/users?q=1",
+      forward: "/v1/x%3F/admin/users?q=1",
+      rejectReason: null,
+    });
+    expect(canonicalizeRequestTarget("/v1/x?a=1;b=2").forward).toBe("/v1/x?a=1;b=2");
+  });
+
+  it("rejects non-origin-form targets", () => {
+    for (const raw of ["http://evil.example/v1/x", "*"]) {
       expect(canonicalizeRequestTarget(raw).rejectReason, raw).toBeTruthy();
     }
-    expect(canonicalizeRequestTarget("/v1/x?a=1;b=2").rejectReason).toBeNull();
   });
 
   it("a deny '/**' glob also matches a decoded newline (dotAll)", () => {
@@ -298,12 +354,6 @@ describe("decoded paths never crash the gateway", () => {
     expect((await rawRequest("GET /v1/ok")).status).toBe(200);
   });
 
-  it("forwards %252f and %23 encoded so the vendor sees what policy saw", async () => {
-    expect((await rawRequest("GET /v1/admin%252fusers")).status).toBe(200);
-    expect((await rawRequest("GET /v1/admin%23")).status).toBe(200);
-    expect(seen.map((s) => s.path)).toEqual(["/v1/admin%252fusers", "/v1/admin%23"]);
-  });
-
   it("still denies the canonical forms of the deny glob", async () => {
     for (const p of ["/v1/admin/users", "/v1/admin%2fusers", "/v1/%2e%2e/v1/admin/x", "/v1//admin/x"]) {
       expect((await rawRequest(`GET ${p}`)).status, p).toBe(403);
@@ -324,16 +374,48 @@ describe("inner request handler safety net", () => {
   });
 });
 
-describe("path confusion is rejected with 400 and audited", () => {
+describe("path confusion: forwarded encoded, verdict matches the vendor's reading", () => {
+  // Deny wins for both the literal reading and the lenient one a Tomcat-style
+  // (`;params` stripped) or IIS-style (`\` as `/`) server could apply.
   for (const p of [
     "/v1/admin;x/users",
     "/v1/admin%3bx/users",
     "/v1/admin%5cusers",
     "/v1/admin\\users",
-    "/v1/admin%3F/users",
-    "http://evil.example/v1/admin/x",
+    "/v1;x/admin/users",
+    // `?` from %3F no longer truncates the matched path at `/v1/x`.
+    "/v1/x%3F/secret/y",
   ]) {
-    it(`GET ${p} -> 400 invalid_path, never forwarded`, async () => {
+    it(`GET ${p} -> 403 deny, never forwarded`, async () => {
+      const r = await rawRequest(`GET ${p}`);
+      expect(r.status).toBe(403);
+      expect(seen).toEqual([]);
+      const row = lastAudit();
+      expect(row.decision).toBe("deny");
+      expect(row.ruleId).not.toBeNull();
+    });
+  }
+
+  // Not under any deny in either reading: allowed and forwarded with the
+  // delimiters encoded, so the vendor sees exactly the text policy matched.
+  for (const [p, wire] of [
+    ["/v1/data;v=1/x", "/v1/data%3Bv=1/x"],
+    ["/v1/data%3bv=1/x", "/v1/data%3Bv=1/x"],
+    ["/v1/dir\\file", "/v1/dir%5Cfile"],
+    ["/v1/admin%3F/users", "/v1/admin%3F/users"],
+    ["/v1/admin%252fusers", "/v1/admin%252fusers"],
+    ["/v1/admin%23", "/v1/admin%23"],
+  ] as const) {
+    it(`GET ${p} -> forwarded as ${wire}`, async () => {
+      const r = await rawRequest(`GET ${p}`);
+      expect(r.status).toBe(200);
+      expect(seen.map((s) => s.path)).toEqual([wire]);
+      expect(lastAudit().decision).toBe("allow");
+    });
+  }
+
+  for (const p of ["http://evil.example/v1/admin/x", "*"]) {
+    it(`GET ${p} -> 400 invalid_path, audited, never forwarded`, async () => {
       const r = await rawRequest(`GET ${p}`);
       expect(r.status).toBe(400);
       expect(JSON.parse(r.body).error).toBe("onegate_invalid_path");
@@ -345,6 +427,75 @@ describe("path confusion is rejected with 400 and audited", () => {
       expect(row.source).toBe("onegate");
     });
   }
+});
+
+/**
+ * Independent server-side SigV4 check, written from the AWS spec rather than
+ * from src/integrations/aws.ts: S3 derives the canonical URI by decoding the
+ * received path and UriEncoding the key once (unreserved and '/' kept).
+ */
+function verifyS3Signature(req: (typeof seen)[number], host: string, region: string): boolean {
+  const auth = req.auth ?? "";
+  const m = /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/s3\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/.exec(auth);
+  if (!m || m[3] !== region) return false;
+  const [, , date, , signedHeaders, signature] = m;
+  const [rawPath, rawQuery = ""] = req.path.split("?");
+  const uriEncode = (s: string) =>
+    encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  const canonicalUri = rawPath.split("/").map((seg) => uriEncode(decodeURIComponent(seg))).join("/");
+  expect(rawQuery).toBe("");
+  const canonicalHeaders = signedHeaders
+    .split(";")
+    .map((h) => `${h}:${h === "host" ? host : String(req.headers[h]).trim()}\n`)
+    .join("");
+  const canonicalRequest = [
+    req.method,
+    canonicalUri,
+    "",
+    canonicalHeaders,
+    signedHeaders,
+    String(req.headers["x-amz-content-sha256"]),
+  ].join("\n");
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    String(req.headers["x-amz-date"]),
+    `${date}/${region}/s3/aws4_request`,
+    createHash("sha256").update(canonicalRequest).digest("hex"),
+  ].join("\n");
+  const expected = createHmac("sha256", deriveSigningKey(AWS_SECRET, date, region, "s3"))
+    .update(stringToSign)
+    .digest("hex");
+  return expected === signature;
+}
+
+describe("S3 object keys with ';' and '?'", () => {
+  it("reach S3 byte-exact and correctly signed", async () => {
+    // Key: reports/q1;final?v2 (draft):x.csv  (';' raw, '?' and ' ' escaped).
+    const r = await rawRequest("PUT /reports/q1;final%3Fv2%20(draft):x.csv", { host: S3, body: "data" });
+    expect(r.status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].path).toBe("/reports/q1%3Bfinal%3Fv2%20(draft):x.csv");
+    expect(decodeURIComponent(seen[0].path)).toBe("/reports/q1;final?v2 (draft):x.csv");
+    expect(seen[0].headers["x-amz-content-sha256"]).toBe(createHash("sha256").update("data").digest("hex"));
+    expect(verifyS3Signature(seen[0], S3, "us-west-2")).toBe(true);
+    expect(lastAudit()).toMatchObject({ decision: "allow", path: "/reports/q1;final%3Fv2 (draft):x.csv" });
+  });
+
+  it("canonicalUri: S3 encodes the decoded key once, other services encode the wire path again", () => {
+    expect(canonicalUri("/reports/q1%3Bfinal%3Fv2%20(draft):x.csv", "s3")).toBe(
+      "/reports/q1%3Bfinal%3Fv2%20%28draft%29%3Ax.csv",
+    );
+    expect(canonicalUri("/documents%20and%20settings/", "ec2")).toBe("/documents%2520and%2520settings/");
+    expect(canonicalUri("/plain-path_1.~", "s3")).toBe("/plain-path_1.~");
+    expect(canonicalUri("", "s3")).toBe("/");
+  });
+
+  it("the signature check really discriminates (a tampered path fails)", async () => {
+    await rawRequest("GET /reports/a;b", { host: S3 });
+    expect(seen[0].path).toBe("/reports/a%3Bb");
+    expect(verifyS3Signature(seen[0], S3, "us-west-2")).toBe(true);
+    expect(verifyS3Signature({ ...seen[0], path: "/reports/a" }, S3, "us-west-2")).toBe(false);
+  });
 });
 
 describe("self-mint ttlDays", () => {

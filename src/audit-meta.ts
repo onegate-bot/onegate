@@ -65,7 +65,7 @@ export function auditReason(
     case "body_too_large":
       return "Blocked by OneGate: the request body exceeded the size OneGate will buffer.";
     case "invalid_path":
-      return "Blocked by OneGate: the request target was not a plain absolute path, or contained a ';', a '\\' or an encoded '?', which upstream servers can route differently than policy matched.";
+      return "Blocked by OneGate: the request target was not an absolute path (absolute-form or '*' targets are refused inside a tunnel).";
     case "allow":
       if (approvalId) {
         return typeof status === "number" && status >= 400
