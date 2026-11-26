@@ -38,6 +38,13 @@ let caPem: string;
 let agentToken: string;
 let agentId: string;
 
+/**
+ * Approval links delivered to the owner's notify webhook, by approval id. The
+ * agent's 403 never carries the link (see approval-self-redeem.test.ts), so
+ * the owner's side of these tests reads it from here.
+ */
+const ownerLinks = new Map<string, string>();
+
 /** Every request the stub vendor received, in order. */
 let seen: Array<{ method?: string; path?: string; auth?: string; body: string }> = [];
 
@@ -75,6 +82,7 @@ beforeAll(async () => {
   const created = store.createAgent("gated-bot", { defaultPolicy: "deny-unmatched" });
   agentToken = created.token;
   agentId = created.agent.id;
+  store.setAgentNotify(agentId, "https://owner-hook.example.test/notify");
   store.createRule({
     scope: "agent",
     subjectId: agentId,
@@ -102,6 +110,12 @@ beforeAll(async () => {
     upstreamLookup: () => ({ host: "127.0.0.1", port: stubPort }),
     // The owner link is built on this base (see public-url.test.ts).
     publicBaseUrl: "https://gate.example.test/og",
+    agentRelaysOwnerLinks: false,
+    notifyFetch: (async (_url: string, init: { body: string }) => {
+      const payload = JSON.parse(init.body);
+      if (payload.approvalId) ownerLinks.set(payload.approvalId, payload.connectUrl);
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch,
   });
   proxyPort = await proxy.listen(0, "127.0.0.1");
 
@@ -178,7 +192,9 @@ function viaProxy(method: string, path: string, body?: string): Promise<ProxyRep
 }
 
 /** The owner's one-tap decision on the public /approve/:token page. */
-async function ownerDecides(approvalUrl: string, decision: "approve" | "reject"): Promise<number> {
+async function ownerDecides(approvalId: string, decision: "approve" | "reject"): Promise<number> {
+  const approvalUrl = ownerLinks.get(approvalId);
+  if (!approvalUrl) throw new Error(`owner was never sent a link for ${approvalId}`);
   const token = new URL(approvalUrl).pathname.split("/").pop()!;
   const r = await fetch(`http://127.0.0.1:${adminPort}/approve/${token}`, {
     method: "POST",
@@ -210,16 +226,18 @@ describe("require_approval through the proxy", () => {
     seen = [];
     const body = JSON.stringify({ title: "ship it" });
     const held = await hold("POST", "/repos/alpha/issues", body);
-    expect(held.json.approval_url).toMatch(/^https:\/\/gate\.example\.test\/og\/approve\/[0-9a-f]{48}$/);
+    expect(held.json.approval_url).toBeUndefined();
+    expect(ownerLinks.get(held.json.approval_id)).toMatch(/^https:\/\/gate\.example\.test\/og\/approve\/[0-9a-f]{48}$/);
     expect(held.json.message).toContain("retry the identical request");
     expect(seen).toHaveLength(0);
 
     // A retry before the owner decides reuses the same approval (no new link).
+    const linksBefore = ownerLinks.size;
     const again = await hold("POST", "/repos/alpha/issues", body);
     expect(again.json.approval_id).toBe(held.json.approval_id);
-    expect(again.json.approval_url).toBeUndefined();
+    expect(ownerLinks.size).toBe(linksBefore);
 
-    expect(await ownerDecides(held.json.approval_url, "approve")).toBe(200);
+    expect(await ownerDecides(held.json.approval_id, "approve")).toBe(200);
 
     const ok = await viaProxy("POST", "/repos/alpha/issues", body);
     expect(ok.status).toBe(201);
@@ -241,14 +259,14 @@ describe("require_approval through the proxy", () => {
     // The approval is spent: the next identical call is held again, fresh.
     const next = await hold("POST", "/repos/alpha/issues", body);
     expect(next.json.approval_id).not.toBe(held.json.approval_id);
-    expect(next.json.approval_url).toBeDefined();
+    expect(ownerLinks.has(next.json.approval_id)).toBe(true);
     expect(seen).toHaveLength(1);
   });
 
   it("a rejected approval stays blocked", async () => {
     seen = [];
     const held = await hold("DELETE", "/repos/beta/issues");
-    expect(await ownerDecides(held.json.approval_url, "reject")).toBe(200);
+    expect(await ownerDecides(held.json.approval_id, "reject")).toBe(200);
 
     const retry = await hold("DELETE", "/repos/beta/issues");
     expect(retry.json.approval_id).not.toBe(held.json.approval_id);
@@ -294,12 +312,12 @@ describe("require_approval through the proxy", () => {
     const approved = JSON.stringify({ title: "harmless" });
     const swapped = JSON.stringify({ title: "something else entirely" });
     const held = await hold("POST", "/repos/epsilon/issues", approved);
-    expect(await ownerDecides(held.json.approval_url, "approve")).toBe(200);
+    expect(await ownerDecides(held.json.approval_id, "approve")).toBe(200);
 
     // The swapped body is a different decision: held under a NEW approval.
     const other = await hold("POST", "/repos/epsilon/issues", swapped);
     expect(other.json.approval_id).not.toBe(held.json.approval_id);
-    expect(other.json.approval_url).toBeDefined();
+    expect(ownerLinks.has(other.json.approval_id)).toBe(true);
     expect(seen).toHaveLength(0);
 
     const ok = await viaProxy("POST", "/repos/epsilon/issues", approved);
@@ -310,7 +328,7 @@ describe("require_approval through the proxy", () => {
   it("two concurrent retries: only one goes through", async () => {
     seen = [];
     const held = await hold("POST", "/repos/zeta/issues", "{}");
-    expect(await ownerDecides(held.json.approval_url, "approve")).toBe(200);
+    expect(await ownerDecides(held.json.approval_id, "approve")).toBe(200);
 
     const replies = await Promise.all([
       viaProxy("POST", "/repos/zeta/issues", "{}"),

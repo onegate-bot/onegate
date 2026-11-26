@@ -156,6 +156,21 @@ onegate rules rm <ruleId>
 
 `--effect` is `allow` or `deny`. `--methods` is a comma list (omit for all). `--path` is a glob (defaults to `/**`).
 
+## Approvals
+
+```bash
+onegate approvals list [--agent <agentId>]
+onegate approvals approve <approvalId>
+onegate approvals reject <approvalId>
+printf %s "$PIN" | onegate approvals pin set   # owner PIN for relay mode (stdin only)
+onegate approvals pin status
+onegate approvals pin clear
+```
+
+A call held by a `require_approval` rule shows up here. The agent's `403 onegate_approval_pending` carries the `approval_id` (never the decision link), and the owner's notify webhook gets the one-time `/approve/` link. `approve` lets the agent's identical retry (same host, method, path and body) through once.
+
+The owner PIN only matters when the gateway runs with `ONEGATE_AGENT_RELAYS_OWNER_LINKS=1`, where approve and renew links are handed to the agent so a bot can relay them: every decision on those links then asks for the PIN (or the admin token) and a link locks after 5 wrong answers. See [SECURITY.md](SECURITY.md#legacy-relay-mode-onegate_agent_relays_owner_links).
+
 ## Credentials and integrations
 
 ```bash

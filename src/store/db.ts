@@ -215,7 +215,8 @@ CREATE TABLE IF NOT EXISTS onboarding_links (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   used_at TEXT,
-  rule_id TEXT
+  rule_id TEXT,
+  pin_failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id);
 CREATE TABLE IF NOT EXISTS agent_notify (
@@ -247,6 +248,10 @@ CREATE INDEX IF NOT EXISTS idx_owner_notifications_pair ON owner_notifications(a
 -- be redeemed by a retry carrying the same body. used_at is set when the
 -- agent's retry redeems an 'approved' row; it is a column rather than a new
 -- status because SQLite cannot widen the status CHECK in place.
+-- host is the upstream host the held call was made to; redemption requires the
+-- retry to target the same host (NULL on legacy rows, which never redeem).
+-- pin_failures counts wrong owner-PIN answers on the /approve page (only
+-- consulted under ONEGATE_AGENT_RELAYS_OWNER_LINKS); the link locks at 5.
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
@@ -260,7 +265,9 @@ CREATE TABLE IF NOT EXISTS approvals (
   expires_at TEXT NOT NULL,
   decided_at TEXT,
   body_hash TEXT,
-  used_at TEXT
+  used_at TEXT,
+  host TEXT,
+  pin_failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_agent ON approvals(agent_id, integration_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
@@ -429,6 +436,7 @@ function rowToApproval(r: Row): Approval {
     decidedAt: r.decided_at ?? null,
     bodyHash: r.body_hash ?? null,
     usedAt: r.used_at ?? null,
+    host: r.host ?? null,
   };
 }
 
@@ -779,6 +787,8 @@ export class Store {
       (this.db.prepare("PRAGMA table_info(onboarding_links)").all() as Row[]).map((r) => String(r.name)),
     );
     if (!linkCols.has("rule_id")) this.db.exec("ALTER TABLE onboarding_links ADD COLUMN rule_id TEXT");
+    if (!linkCols.has("pin_failures"))
+      this.db.exec("ALTER TABLE onboarding_links ADD COLUMN pin_failures INTEGER NOT NULL DEFAULT 0");
     // Approval redemption columns. A pre-existing row gets NULL for both, and
     // redemption compares body_hash with `=`, so an approval minted before this
     // migration (no recorded body) can never be redeemed. Fails closed.
@@ -787,6 +797,12 @@ export class Store {
     );
     if (!approvalCols.has("body_hash")) this.db.exec("ALTER TABLE approvals ADD COLUMN body_hash TEXT");
     if (!approvalCols.has("used_at")) this.db.exec("ALTER TABLE approvals ADD COLUMN used_at TEXT");
+    // Host binding. Pre-existing rows get NULL and redemption compares host
+    // with `=`, so a legacy approval can never be spent (fail closed). Pending
+    // approvals live 24h at most, so the only cost is one re-approval.
+    if (!approvalCols.has("host")) this.db.exec("ALTER TABLE approvals ADD COLUMN host TEXT");
+    if (!approvalCols.has("pin_failures"))
+      this.db.exec("ALTER TABLE approvals ADD COLUMN pin_failures INTEGER NOT NULL DEFAULT 0");
     const notifyCols = new Set(
       (this.db.prepare("PRAGMA table_info(owner_notifications)").all() as Row[]).map((r) =>
         String(r.name),
@@ -909,7 +925,8 @@ export class Store {
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         used_at TEXT,
-        rule_id TEXT
+        rule_id TEXT,
+        pin_failures INTEGER NOT NULL DEFAULT 0
       )`);
         this.db.exec(
           "CREATE INDEX IF NOT EXISTS idx_onboarding_links_agent ON onboarding_links(agent_id)",
@@ -2467,6 +2484,13 @@ export class Store {
      * authorizes a different one sent on the same method and path.
      */
     bodyHash?: string | null;
+    /**
+     * Upstream host the held call targeted. Redemption requires the retry to
+     * hit the same host, so an approval for one host of a multi-host
+     * integration never lets a call through to another. Omitted (null), the
+     * approval can be decided but never redeemed.
+     */
+    host?: string | null;
     /** How long the owner has to decide. Defaults to 24h; clamped to > 0. */
     ttlSeconds?: number;
   }): Approval {
@@ -2490,10 +2514,11 @@ export class Store {
       decidedAt: null,
       bodyHash: input.bodyHash ?? null,
       usedAt: null,
+      host: input.host ? input.host.toLowerCase() : null,
     };
     this.db
       .prepare(
-        "INSERT INTO approvals (id, agent_id, integration_id, rule_id, method, path, token_hash, status, created_at, expires_at, decided_at, body_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approvals (id, agent_id, integration_id, rule_id, method, path, token_hash, status, created_at, expires_at, decided_at, body_hash, host) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         approval.id,
@@ -2508,6 +2533,7 @@ export class Store {
         approval.expiresAt,
         null,
         approval.bodyHash,
+        approval.host,
       );
     return approval;
   }
@@ -2600,6 +2626,7 @@ export class Store {
     path: string,
     nowMs: number = Date.now(),
     bodyHash?: string,
+    host?: string,
   ): Approval | null {
     const params: Array<string> = [agentId, integrationId, method.toUpperCase(), path, new Date(nowMs).toISOString()];
     let sql =
@@ -2607,6 +2634,10 @@ export class Store {
     if (bodyHash !== undefined) {
       sql += " AND body_hash = ?";
       params.push(bodyHash);
+    }
+    if (host !== undefined) {
+      sql += " AND host = ?";
+      params.push(host.toLowerCase());
     }
     const r = this.db.prepare(`${sql} ORDER BY created_at DESC LIMIT 1`).get(...params) as Row | undefined;
     return r ? rowToApproval(r) : null;
@@ -2618,9 +2649,10 @@ export class Store {
    *
    * The match is on everything the owner was shown plus what they could not
    * see: agent, integration, the require_approval rule that held the call,
-   * method, canonical path (query included, as stored at hold time) and the
-   * body hash. A rejected, expired, still-pending or already-used approval
-   * never matches, and neither does a row with no recorded body hash.
+   * upstream host, method, canonical path (query included, as stored at hold
+   * time) and the body hash. A rejected, expired, still-pending or
+   * already-used approval never matches, and neither does a row with no
+   * recorded body hash or host (legacy rows: fail closed).
    *
    * EXACTLY ONCE: the UPDATE itself re-checks `status = 'approved' AND
    * used_at IS NULL`, so of two concurrent retries (or two gateway processes
@@ -2632,6 +2664,7 @@ export class Store {
       agentId: string;
       integrationId: string;
       ruleId: string;
+      host: string;
       method: string;
       path: string;
       bodyHash: string;
@@ -2641,12 +2674,13 @@ export class Store {
     const iso = new Date(nowMs).toISOString();
     const candidates = this.db
       .prepare(
-        "SELECT id FROM approvals WHERE agent_id = ? AND integration_id = ? AND rule_id = ? AND method = ? AND path = ? AND body_hash = ? AND status = 'approved' AND used_at IS NULL AND expires_at > ? ORDER BY created_at ASC",
+        "SELECT id FROM approvals WHERE agent_id = ? AND integration_id = ? AND rule_id = ? AND host = ? AND method = ? AND path = ? AND body_hash = ? AND status = 'approved' AND used_at IS NULL AND expires_at > ? ORDER BY created_at ASC",
       )
       .all(
         input.agentId,
         input.integrationId,
         input.ruleId,
+        input.host.toLowerCase(),
         input.method.toUpperCase(),
         input.path,
         input.bodyHash,
@@ -2659,6 +2693,55 @@ export class Store {
       if (Number(claim.run(iso, c.id, iso).changes) === 1) return this.getApproval(String(c.id));
     }
     return null;
+  }
+
+  /**
+   * Reserves one owner-PIN attempt on an approval link, BEFORE the PIN is
+   * checked. Returns false when the link is already locked (max failures
+   * reached). Reserving first, in one conditional UPDATE, means concurrent
+   * guesses (or several gateway processes on one database) can never exceed
+   * the limit. A correct answer gives the attempt back with
+   * refundApprovalPinAttempt.
+   */
+  reserveApprovalPinAttempt(id: string, maxFailures: number): boolean {
+    const res = this.db
+      .prepare("UPDATE approvals SET pin_failures = pin_failures + 1 WHERE id = ? AND pin_failures < ?")
+      .run(id, maxFailures);
+    return Number(res.changes) === 1;
+  }
+
+  refundApprovalPinAttempt(id: string): void {
+    this.db
+      .prepare("UPDATE approvals SET pin_failures = pin_failures - 1 WHERE id = ? AND pin_failures > 0")
+      .run(id);
+  }
+
+  /** Wrong owner-PIN attempts recorded on an approval link. */
+  approvalPinFailures(id: string): number {
+    const r = this.db.prepare("SELECT pin_failures FROM approvals WHERE id = ?").get(id) as Row | undefined;
+    return r ? Number(r.pin_failures) : 0;
+  }
+
+  /** reserveApprovalPinAttempt for an onboarding (renewal) link, by plaintext token. */
+  reserveLinkPinAttempt(token: string, maxFailures: number): boolean {
+    const res = this.db
+      .prepare("UPDATE onboarding_links SET pin_failures = pin_failures + 1 WHERE token_hash = ? AND pin_failures < ?")
+      .run(hashToken(token), maxFailures);
+    return Number(res.changes) === 1;
+  }
+
+  refundLinkPinAttempt(token: string): void {
+    this.db
+      .prepare("UPDATE onboarding_links SET pin_failures = pin_failures - 1 WHERE token_hash = ? AND pin_failures > 0")
+      .run(hashToken(token));
+  }
+
+  /** Wrong owner-PIN attempts recorded on an onboarding (renewal) link. */
+  linkPinFailures(token: string): number {
+    const r = this.db
+      .prepare("SELECT pin_failures FROM onboarding_links WHERE token_hash = ?")
+      .get(hashToken(token)) as Row | undefined;
+    return r ? Number(r.pin_failures) : 0;
   }
 
   /**
