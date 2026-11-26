@@ -22,6 +22,7 @@ const ONEGATE_BLOCKS: ReadonlySet<Decision> = new Set<Decision>([
   "unknown_connection",
   "connection_not_granted",
   "body_too_large",
+  "invalid_path",
 ]);
 
 /** True when OneGate (not the upstream service) ended the request. */
@@ -63,6 +64,8 @@ export function auditReason(
       return "Blocked by OneGate: the selected connection is not granted to this agent.";
     case "body_too_large":
       return "Blocked by OneGate: the request body exceeded the size OneGate will buffer.";
+    case "invalid_path":
+      return "Blocked by OneGate: the request target was not a plain absolute path, or contained a ';', a '\\' or an encoded '?', which upstream servers can route differently than policy matched.";
     case "allow":
       if (approvalId) {
         return typeof status === "number" && status >= 400
