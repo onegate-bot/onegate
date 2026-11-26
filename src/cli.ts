@@ -35,6 +35,7 @@ import { connectionsCommand, agentsLlmCommand, agentsAppsCommand, agentsNotifyCo
 import { agentsCommand } from "./cli/commands/agents.js";
 import { rulesCommand } from "./cli/commands/rules.js";
 import { approvalsCommand } from "./cli/commands/approvals.js";
+import { OWNER_PIN_SETTING, agentRelaysOwnerLinksFromEnv, agentRelaysOwnerLinksWarning } from "./util/owner-links.js";
 import { credentialsCommand, integrationsCommand } from "./cli/commands/integrations.js";
 import { auditCommand, usageCommand } from "./cli/commands/observe.js";
 import { projectsCommand } from "./cli/commands/projects.js";
@@ -145,6 +146,9 @@ async function cmdStart(): Promise<void> {
       `onegate: ONEGATE_PUBLIC_URL is not set, so owner links use ${publicBase.url} and will only work locally. ` +
         "Set ONEGATE_PUBLIC_URL to the URL owners reach this gateway's admin listener on.",
     );
+  }
+  if (agentRelaysOwnerLinksFromEnv()) {
+    console.error(agentRelaysOwnerLinksWarning(store.getSetting(OWNER_PIN_SETTING) !== null));
   }
   console.log(`  integrations: ${registry.list().map((i) => i.id).join(", ")}`);
 
@@ -257,7 +261,7 @@ Admin API commands (talk to a running gateway over --host + admin token):
   onegate agents apps get <agentId>|set <agentId> <integrationId> --connection <id>|clear <agentId> <integrationId>
   onegate agents notify get <agentId>|set <agentId> --url <webhookUrl>|clear <agentId>
   onegate rules list|add|rm
-  onegate approvals list [--agent <id>]|approve <id>|reject <id>
+  onegate approvals list [--agent <id>]|approve <id>|reject <id>|pin set|pin clear|pin status
   onegate integrations list
   onegate integrations connect <id> --client-id X --client-secret-stdin --redirect-base URL
   onegate credentials set <integrationId> --name N (--data-stdin [key] | --data k=v...)

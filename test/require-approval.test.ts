@@ -301,6 +301,7 @@ describe("approval redemption", () => {
     agentId,
     integrationId: "github",
     ruleId: "rl_gate",
+    host: "api.github.com",
     method: "POST",
     path: "/repos/x/issues",
     bodyHash: "h1",
@@ -323,7 +324,7 @@ describe("approval redemption", () => {
     expect(store.redeemApproval(req(a.id))).toBeNull();
   });
 
-  it("is bound to agent, integration, rule, method, path and body", () => {
+  it("is bound to agent, integration, rule, host, method, path and body", () => {
     const store = newStore();
     const { agent: a } = store.createAgent("bot");
     const { agent: b } = store.createAgent("other");
@@ -332,6 +333,7 @@ describe("approval redemption", () => {
       { agentId: b.id },
       { integrationId: "gitlab" },
       { ruleId: "rl_other" },
+      { host: "uploads.github.com" },
       { method: "PUT" },
       { path: "/repos/y/issues" },
       { path: "/repos/x/issues?force=1" },
@@ -339,8 +341,8 @@ describe("approval redemption", () => {
     ]) {
       expect(store.redeemApproval(req(a.id, over))).toBeNull();
     }
-    // Lowercase method still matches: methods are stored uppercase.
-    expect(store.redeemApproval(req(a.id, { method: "post" }))).not.toBeNull();
+    // Lowercase method and host still match: both are stored normalized.
+    expect(store.redeemApproval(req(a.id, { method: "post", host: "API.GitHub.com" }))).not.toBeNull();
   });
 
   it("never redeems a pending, rejected or expired approval", () => {
@@ -404,9 +406,10 @@ describe("approval redemption", () => {
     const old = store.getApproval("apr_old")!;
     expect(old.bodyHash).toBeNull();
     expect(old.usedAt).toBeNull();
-    // No recorded body hash: fails closed, whatever the retry sends.
+    expect(old.host).toBeNull();
+    // No recorded body hash or host: fails closed, whatever the retry sends.
     expect(
-      store.redeemApproval({ agentId: "ag_1", integrationId: "github", ruleId: "rl_gate", method: "POST", path: "/x", bodyHash: "" }),
+      store.redeemApproval({ agentId: "ag_1", integrationId: "github", ruleId: "rl_gate", host: "api.github.com", method: "POST", path: "/x", bodyHash: "" }),
     ).toBeNull();
     store.close();
   });

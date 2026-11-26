@@ -361,12 +361,14 @@ describe("approvals across nodes (#115 body binding and single use)", () => {
       scope: "agent", subjectId: agent.id, integrationId: "github", methods: ["POST"], pathGlob: "/**", effect: "deny",
     });
     const held = a.store.createApproval({
-      agentId: agent.id, integrationId: "github", ruleId: rule.id, method: "POST", path: "/repos/x/issues", bodyHash: "h1",
+      agentId: agent.id, integrationId: "github", ruleId: rule.id, host: "api.github.com", method: "POST", path: "/repos/x/issues", bodyHash: "h1",
     });
     a.store.decideApproval(held.id, "approved");
     await syncAll(nodes);
 
-    const req = { agentId: agent.id, integrationId: "github", ruleId: rule.id, method: "POST", path: "/repos/x/issues" };
+    const req = { agentId: agent.id, integrationId: "github", ruleId: rule.id, host: "api.github.com", method: "POST", path: "/repos/x/issues" };
+    // The host binding replicates: B will not spend it for another host.
+    expect(b.store.redeemApproval({ ...req, host: "uploads.github.com", bodyHash: "h1" })).toBeNull();
     // A different body never matches, on any node.
     expect(b.store.redeemApproval({ ...req, bodyHash: "other" })).toBeNull();
     // The agent's retry lands on B and is let through once.
