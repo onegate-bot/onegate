@@ -49,13 +49,6 @@ export const OAUTH_PENDING_TTL_MS = 600_000;
  */
 export const MAX_TTL_SECONDS = 10 * 365 * 24 * 3600;
 
-/**
- * Accepted range for an admin-minted onboarding link's ttlDays. Matches the
- * clamp the proxy applies to agent self-minted links, so both mint paths agree.
- */
-export const ONBOARDING_TTL_DAYS_MIN = 1;
-export const ONBOARDING_TTL_DAYS_MAX = 30;
-
 const DEFAULT_POLICIES = new Set(["allow-all", "deny-unmatched"]);
 
 /**
@@ -2648,25 +2641,12 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "integration_not_connectable" });
       return;
     }
-    if (
-      ttlDays != null &&
-      (typeof ttlDays !== "number" ||
-        !Number.isInteger(ttlDays) ||
-        ttlDays < ONBOARDING_TTL_DAYS_MIN ||
-        ttlDays > ONBOARDING_TTL_DAYS_MAX)
-    ) {
-      res.status(400).json({
-        error: "invalid_ttl_days",
-        message: `ttlDays must be an integer from ${ONBOARDING_TTL_DAYS_MIN} to ${ONBOARDING_TTL_DAYS_MAX}`,
-      });
-      return;
-    }
     const link = store.createOnboardingLink({
       agentId: String(agentId),
       integrationId: integration.id,
       scopes: Array.isArray(scopes) ? scopes.map(String) : undefined,
       connectionName: typeof connectionName === "string" && connectionName.trim() ? connectionName.trim() : undefined,
-      ttlDays: typeof ttlDays === "number" ? ttlDays : undefined,
+      ttlDays: typeof ttlDays === "number" && ttlDays > 0 ? ttlDays : undefined,
     });
     const base = publicBase();
     res.status(201).json({

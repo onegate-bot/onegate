@@ -165,7 +165,6 @@ The admin API validates every field before storing a rule, so a typo fails with 
 Related limits on other admin routes:
 
 - An integration's default lease (`PUT /api/integration-leases/:id`) must be a JSON integer from 1 to 315360000. 0 or `null` clears it.
-- An admin-minted connect link's `ttlDays` (`POST /api/onboarding-links`) must be an integer from 1 to 30. If you omit it, the link lasts 7 days. That's the same range the gateway allows for links an agent mints for itself.
 
 ## Credentials and integrations
 

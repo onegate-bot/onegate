@@ -1909,7 +1909,7 @@ async function connectLinkModal(agent) {
       <wa-input id="cl-name" label="Connection name (optional)" placeholder="e.g. Slack for ${esc(agent.name)}"></wa-input>
     </div>
     <div class="field">
-      <wa-input id="cl-ttl" type="number" min="1" max="30" value="7" label="Link valid for (days)"></wa-input>
+      <wa-input id="cl-ttl" type="number" min="1" max="90" value="7" label="Link valid for (days)"></wa-input>
     </div>
     <div class="modal-actions">
       <wa-button type="button" appearance="outlined" data-close>Cancel</wa-button>

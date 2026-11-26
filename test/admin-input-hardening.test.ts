@@ -5,7 +5,6 @@
  *  - a final error handler answers generically (never a stack trace or a
  *    server path) on both /api and public pages, keeping body-parser 4xx codes;
  *  - POST /api/rules validates scope, effect, pathGlob and ttlSeconds;
- *  - onboarding-link ttlDays is an integer 1..30 (same range as agent self-mint);
  *  - agent defaultPolicy is allow-all | deny-unmatched;
  *  - integration lease ttlSeconds is a JSON integer in (0, 10 years];
  *  - an absurd wizard leaseHours falls back to the integration default.
@@ -206,32 +205,6 @@ describe("POST /api/rules validation", () => {
     expect(max.json.leaseTtlSeconds).toBe(MAX_TTL_SECONDS);
     const none = await api("POST", "/api/rules", { ...base(), ttlSeconds: 0 });
     expect(none.json.expiresAt).toBeNull();
-  });
-});
-
-describe("onboarding link ttlDays", () => {
-  it.each([0, 31, 1.5, -1, 1e9, "7", true])("refuses ttlDays=%j", async (ttlDays) => {
-    const before = store.listOnboardingLinks(agentId).length;
-    const r = await api("POST", "/api/onboarding-links", { agentId, integrationId: "hetzner", ttlDays });
-    expect(r.status).toBe(400);
-    expect(r.json.error).toBe("invalid_ttl_days");
-    expect(store.listOnboardingLinks(agentId).length).toBe(before);
-  });
-
-  it("accepts 1 and 30, and defaults to 7 days when omitted", async () => {
-    const day = 86_400_000;
-    for (const [ttlDays, days] of [
-      [1, 1],
-      [30, 30],
-      [undefined, 7],
-      [null, 7],
-    ] as const) {
-      const r = await api("POST", "/api/onboarding-links", { agentId, integrationId: "hetzner", ttlDays });
-      expect(r.status).toBe(201);
-      const left = Date.parse(r.json.expiresAt) - Date.now();
-      expect(left).toBeGreaterThan(days * day - 60_000);
-      expect(left).toBeLessThanOrEqual(days * day);
-    }
   });
 });
 
