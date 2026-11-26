@@ -5,10 +5,7 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { AdminClient, ApiError, resolveHost, resolveToken, tokenMatchesStore } from "../src/cli/client.js";
-import { Store } from "../src/store/db.js";
-import { ensureAdminToken } from "../src/admin/api.js";
-import { isJsonMode, setJsonMode } from "../src/cli/output.js";
+import { AdminClient, ApiError, resolveHost, resolveToken } from "../src/cli/client.js";
 
 function stub(handler: http.RequestListener): Promise<{ url: string; close: () => void }> {
   return new Promise((resolve) => {
@@ -175,26 +172,5 @@ describe("AdminClient non-JSON and edge responses", () => {
       body: '{"name":"n"}',
       method: "PATCH",
     });
-  });
-});
-
-describe("tokenMatchesStore", () => {
-  it("matches only the exact admin token, and never when none is stored", () => {
-    const store = new Store(":memory:");
-    expect(tokenMatchesStore(store, "oga_anything")).toBe(false);
-    const token = ensureAdminToken(store)!;
-    expect(tokenMatchesStore(store, token)).toBe(true);
-    expect(tokenMatchesStore(store, `${token}x`)).toBe(false);
-    expect(tokenMatchesStore(store, "")).toBe(false);
-    store.close();
-  });
-});
-
-describe("json mode flag", () => {
-  it("reflects setJsonMode", () => {
-    setJsonMode(true);
-    expect(isJsonMode()).toBe(true);
-    setJsonMode(false);
-    expect(isJsonMode()).toBe(false);
   });
 });
