@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Registry } from "../src/integrations/types.js";
 import { github } from "../src/integrations/github.js";
 import { google, googleAccessToken } from "../src/integrations/google.js";
+import { youtube, YOUTUBE_DATA_API_PATH } from "../src/integrations/youtube.js";
 import { buildRegistry, loadCommunity, disabledIntegrations } from "../src/integrations/index.js";
 import { composeLlmHelpPrompt } from "../src/integrations/llm-help.js";
 import type { Integration } from "../src/integrations/types.js";
@@ -1230,6 +1231,21 @@ describe("batch 7 integrations (mongodb-atlas, docker, jfrog, github-app)", () =
     expect(jwtExpiryMs(fakeJwt({}))).toBeNull();
   });
 
+  it("jfrog refuses a credential missing its token or bound host, without touching headers", () => {
+    for (const data of [{ host: "acme.jfrog.io" }, { token: "eyJart" }, { token: "", host: "acme.jfrog.io" }]) {
+      const ctx = ctxFor("acme.jfrog.io", cred(data, "jfrog-artifactory"), store);
+      expect(() => jfrogArtifactory.inject(ctx)).toThrow(/needs "token" and "host"/);
+      expect(ctx.headers.authorization).toBeUndefined();
+    }
+  });
+
+  it("jfrog compares the bound host case-insensitively (self-managed domain)", () => {
+    const c = cred({ token: "eyJself", host: "Artifacts.Acme.Example" }, "jfrog-artifactory");
+    const ctx = ctxFor("artifacts.acme.example", c, store);
+    jfrogArtifactory.inject(ctx);
+    expect(ctx.headers.authorization).toBe("Bearer eyJself");
+  });
+
   it("jfrog injects Bearer only on the bound host", () => {
     const c = cred({ token: "eyJart", host: "acme.jfrog.io" }, "jfrog-artifactory");
     const ctx = ctxFor("acme.jfrog.io", c, store);
@@ -1829,5 +1845,45 @@ describe("registration-time exact-host collision guard", () => {
     expect(() =>
       registry.register({ ...claim("rogue", ["api.anthropic.com"]), community: true }),
     ).toThrow(/already owned by "anthropic"/);
+  });
+});
+
+describe("youtube data api integration (key rides in the query string)", () => {
+  const store = new Store(":memory:");
+  const ytCtx = (path: string, data: Record<string, string> = { apiKey: "AIzaREAL" }) => ({
+    ...ctxFor("www.googleapis.com", cred(data, "youtube"), store),
+    path,
+  });
+
+  it("appends the real key to a request that carries none, leaving headers alone", () => {
+    const ctx = ytCtx(`${YOUTUBE_DATA_API_PATH}/videos?part=snippet&id=abc`);
+    youtube.inject(ctx);
+    const url = new URL(ctx.path, "https://www.googleapis.com");
+    expect(url.pathname).toBe("/youtube/v3/videos");
+    expect(url.searchParams.get("part")).toBe("snippet");
+    expect(url.searchParams.get("id")).toBe("abc");
+    expect(url.searchParams.getAll("key")).toEqual(["AIzaREAL"]);
+    expect(ctx.headers.authorization).toBeUndefined();
+  });
+
+  it("replaces a placeholder key instead of sending two", () => {
+    const ctx = ytCtx("/youtube/v3/search?key=PLACEHOLDER&q=cats&key=again");
+    youtube.inject(ctx);
+    const url = new URL(ctx.path, "https://www.googleapis.com");
+    expect(url.searchParams.getAll("key")).toEqual(["AIzaREAL"]);
+    expect(url.searchParams.get("q")).toBe("cats");
+  });
+
+  it("adds a query string to a bare path and URL-encodes the key", () => {
+    const ctx = ytCtx("/youtube/v3/channels", { apiKey: "AIza+/=&x" });
+    youtube.inject(ctx);
+    expect(ctx.path).toBe("/youtube/v3/channels?key=AIza%2B%2F%3D%26x");
+    expect(new URL(ctx.path, "https://x").searchParams.get("key")).toBe("AIza+/=&x");
+  });
+
+  it("throws on a credential with no apiKey and leaves the path untouched", () => {
+    const ctx = ytCtx("/youtube/v3/videos?id=1", {});
+    expect(() => youtube.inject(ctx)).toThrow(/no "apiKey" field/);
+    expect(ctx.path).toBe("/youtube/v3/videos?id=1");
   });
 });
