@@ -319,7 +319,7 @@ export type Decision =
   | "unknown_connection"
   | "connection_not_granted"
   | "body_too_large"
-  /** The request path contained a character OneGate refuses (semicolon, backslash, encoded question mark). */
+  /** The request target was not origin-form (absolute-form `http://...` or `*`). */
   | "invalid_path"
   /** Every usable connection for the request is inactive (see Connection.inactiveAt). */
   | "connection_inactive"

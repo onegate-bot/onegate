@@ -139,51 +139,45 @@ export function normalizeRequestPath(target: string): string {
 /** The two views of one request target, plus a rejection verdict. */
 export interface CanonicalTarget {
   /**
-   * The canonical DECODED path plus the original query (verbatim). This is what
-   * policy, path-scoped host claims, approvals and audit see. Identical to
-   * normalizeRequestPath(target).
+   * The policy view: the canonical DECODED path plus the original query
+   * (verbatim). This is what policy, path-scoped host claims, approvals and
+   * audit see. Identical to normalizeRequestPath(target).
+   *
+   * One escape: a decoded `?` inside the path (only reachable as `%3F`) is
+   * written back as `%3F`, so the first literal `?` in this string is always
+   * the real query separator. Without that, the matcher (which strips the
+   * query at the first `?`) would match `/v1/x%3F/admin/users` as `/v1/x`.
    */
   path: string;
   /**
    * The wire form forwarded upstream: the same canonical path percent-encoded
-   * by encodePathForUpstream (so the vendor's single decode yields exactly
-   * `path`'s path part), plus the original query made wire-safe by
+   * by encodePathForUpstream (so the vendor's single decode yields exactly the
+   * decoded path policy matched), plus the original query made wire-safe by
    * sanitizeQueryForUpstream. Only meaningful when `rejectReason` is null.
    */
   forward: string;
   /**
-   * Non-null when the decoded path contains a character OneGate refuses to
-   * forward because vendors disagree on what it means (see PATH_REJECTS). The
-   * proxy answers 400 and audits `invalid_path`; it never forwards.
+   * Non-null when the target is not origin-form (absolute-form `http://...`,
+   * asterisk-form `*`): it does not canonicalize to a path starting with `/`.
+   * The proxy answers 400 and audits `invalid_path`; it never forwards.
    */
   rejectReason: string | null;
 }
 
 /**
- * Characters that are refused (400) when they appear in the DECODED path,
- * whether sent raw or percent-encoded. Each one makes the path mean different
- * things to OneGate's glob matcher and to some upstream server, which is how a
- * deny glob gets bypassed:
- *
- *  - `;` starts a path parameter (RFC 3986 §3.3, Java/Spring/Tomcat strip
- *    `;params` per segment), so `/v1/admin;x/users` is `/v1/admin/users` to
- *    those servers but not to the matcher. No built-in integration uses `;` in a
- *    path, so it is rejected rather than stripped.
- *  - `\` is treated as `/` by several servers (IIS, some Node/Go routers).
- *  - `?` inside the path (only reachable as `%3F`) would be read by the matcher
- *    as the start of the query, truncating the path it matches against.
- */
-const PATH_REJECTS: ReadonlyArray<[string, string]> = [
-  [";", "a ';' (path parameter), which some servers strip before routing"],
-  ["\\", "a '\\' (backslash), which some servers treat as '/'"],
-  ["?", "an encoded '?' (%3F) inside the path"],
-];
-
-/**
  * True for a code unit that may appear unencoded in a forwarded path segment:
  * RFC 3986 `pchar` minus `%` (always encoded, so a literal `%` the policy saw
- * stays literal) and minus `;` (rejected before forwarding anyway).
- * pchar = unreserved / sub-delims / ":" / "@".
+ * stays literal) and minus `;`. pchar = unreserved / sub-delims / ":" / "@".
+ *
+ * `;` is a sub-delim, but servers treat a LITERAL `;` as the start of a path
+ * parameter and strip `;params` before routing (Tomcat/Spring/Jetty), so
+ * `/v1/admin;x/users` would be `/v1/admin/users` upstream. Encoded as `%3B` it
+ * is plain data to every server (path-param parsing runs on the undecoded
+ * path), which is what lets S3 keys and other ids carry a `;`. `?`, `#` and
+ * `\` are not pchar, so they are always encoded too (`%3F`, `%23`, `%5C`).
+ * The remaining sub-delims plus `:`/`@` stay raw: they have no routing meaning
+ * inside a path and some APIs expect them literally (Google `name:method`
+ * custom methods, Telegram `/bot<id>:<token>/`).
  */
 function isSafePathChar(c: number): boolean {
   return (
@@ -260,21 +254,14 @@ export function canonicalizeRequestTarget(target: string): CanonicalTarget {
   const query = qIdx === -1 ? "" : target.slice(qIdx); // includes leading "?"
   const decoded = decodeOnce(rawPath);
   const canonical = collapsePath(decoded);
-  let rejectReason: string | null = null;
-  if (!canonical.startsWith("/")) {
-    // Absolute-form (`http://host/...`) and asterisk-form (`*`) targets have
-    // no place inside a terminated tunnel, and collapsing them yields a path
-    // with no leading slash that no glob was written for.
-    rejectReason = "The request target must be an absolute path starting with '/'.";
-  }
-  for (const [ch, why] of rejectReason ? [] : PATH_REJECTS) {
-    if (canonical.includes(ch)) {
-      rejectReason = `The request path contains ${why}. OneGate refuses such paths because they can mean a different resource upstream than the one policy checked.`;
-      break;
-    }
-  }
+  // Absolute-form (`http://host/...`) and asterisk-form (`*`) targets have no
+  // place inside a terminated tunnel, and collapsing them yields a path with no
+  // leading slash that no glob was written for.
+  const rejectReason = canonical.startsWith("/")
+    ? null
+    : "The request target must be an absolute path starting with '/'.";
   return {
-    path: canonical + query,
+    path: canonical.replace(/\?/g, "%3F") + query,
     forward: encodePathForUpstream(canonical) + sanitizeQueryForUpstream(query),
     rejectReason,
   };
@@ -358,7 +345,37 @@ export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   // path segments (S3 object keys, Drive file ids, base64 identifiers), where
   // an allow of `/files/AbC` matching `/files/abc` would grant access to a
   // DIFFERENT object. Widening an allow is fail-OPEN, so it is not done.
-  return globToRegExp(rule.pathGlob, rule.effect === "deny").test(path);
+  //
+  // DENY also matches the path-confusion reading of the path (see
+  // confusionVariant). The forwarded path encodes `;` and `\`, so a
+  // spec-following vendor treats them as data, but a deny only ever refuses
+  // more, so it is also checked against how a lenient server could route it.
+  if (rule.effect === "deny") {
+    const re = globToRegExp(rule.pathGlob, true);
+    if (re.test(path)) return true;
+    const variant = confusionVariant(path);
+    return variant !== path && re.test(variant);
+  }
+  return globToRegExp(rule.pathGlob, false).test(path);
+}
+
+/**
+ * The path as a lenient upstream might route it: `\` read as `/` (IIS-style
+ * servers) and `;params` stripped from each segment (Tomcat-style servers),
+ * then dot-segments and duplicate slashes collapsed again. Used ONLY to widen
+ * deny matching; never forwarded and never used for allow (fail-safe only).
+ */
+function confusionVariant(path: string): string {
+  if (!path.includes(";") && !path.includes("\\")) return path;
+  const swapped = path.replace(/\\/g, "/");
+  const stripped = swapped
+    .split("/")
+    .map((seg) => {
+      const semi = seg.indexOf(";");
+      return semi === -1 ? seg : seg.slice(0, semi);
+    })
+    .join("/");
+  return collapsePath(stripped);
 }
 
 /**
