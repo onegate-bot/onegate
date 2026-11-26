@@ -14,6 +14,12 @@
 - **Malicious allowed requests.** Policy bounds *which* calls an agent may make, not whether an allowed call is wise. An agent allowed `POST /repos/**` can still open a bad PR.
 - **Traffic to non-integrated hosts.** Passthrough tunnels are opaque by design. OneGate neither inspects nor restricts them (it audits the CONNECT). If you need egress control, do it at the firewall.
 
+## Request paths and gateway robustness
+
+- **One path for policy and upstream.** The request path is decoded once and collapsed for matching, then re-encoded for the vendor so the vendor's single decode equals what policy matched. Encoded slashes (`%2F`), `//` and `..` cannot slip past a deny glob, and double-encoded text (`%252F`, `%23`) stays literal end to end. See [ARCHITECTURE.md](ARCHITECTURE.md#request-path-canonicalization).
+- **Ambiguous paths are refused.** A path containing `;`, `\` or an encoded `?` after decoding, or a non-absolute request target, gets `400 onegate_invalid_path` and an `invalid_path` audit row; it is never forwarded. These are the characters upstream servers route differently than a glob matcher (`/v1/admin;x/users` is `/v1/admin/users` to a Tomcat-style server).
+- **One bad request fails alone.** An internal error while handling a request answers `500 onegate_internal_error` (or drops that connection when the response has started); it never takes the gateway down for other agents. The same holds for agent-supplied input on the self-service endpoint: `ttlDays` on `POST /connect-links` (and on the admin `POST /api/onboarding-links`) must be an integer from 1 to 90, otherwise `400 invalid_ttl_days`. CONNECT sockets have their error handler attached before any byte is written, so a client that resets mid-response cannot crash the process.
+
 ## Owner approvals (`require_approval`)
 
 A rule with the `require_approval` action holds a matching call instead of forwarding it. The agent gets `403 onegate_approval_pending`, and the owner gets a one-time `/approve/<token>` link (only the token's SHA-256 is stored). Once the owner approves, the agent's retry of the **identical** request goes through **exactly once**:

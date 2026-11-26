@@ -11,7 +11,7 @@ import express from "express";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Store, hashToken } from "../store/db.js";
+import { MAX_ONBOARDING_LINK_TTL_DAYS, Store, hashToken, parseOnboardingTtlDays } from "../store/db.js";
 import type { Connection, OnboardingLink, LlmStrategy } from "../types.js";
 import { connectFlowKind, type Integration, type OAuthDescriptor, type Registry } from "../integrations/types.js";
 import type { Ca } from "../ca.js";
@@ -2560,12 +2560,19 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "integration_not_connectable" });
       return;
     }
+    const ttl = parseOnboardingTtlDays(ttlDays);
+    if (ttl === null) {
+      res
+        .status(400)
+        .json({ error: "invalid_ttl_days", message: `ttlDays must be an integer from 1 to ${MAX_ONBOARDING_LINK_TTL_DAYS}.` });
+      return;
+    }
     const link = store.createOnboardingLink({
       agentId: String(agentId),
       integrationId: integration.id,
       scopes: Array.isArray(scopes) ? scopes.map(String) : undefined,
       connectionName: typeof connectionName === "string" && connectionName.trim() ? connectionName.trim() : undefined,
-      ttlDays: typeof ttlDays === "number" && ttlDays > 0 ? ttlDays : undefined,
+      ttlDays: ttl,
     });
     const base = publicBase();
     res.status(201).json({
