@@ -41,6 +41,14 @@ The gateway prints a warning at startup when this is set. Residual risk: the age
 
 Limitations: the owner's page shows the method and path, not the body (the body itself is never stored, only its hash), so the owner is approving "this exact call the agent made", not a payload they reviewed. An approval is spent when the gateway admits the retry, so a retry that then fails for another reason (no credential connected, upstream error) needs a new approval.
 
+## Self-service connect links
+
+A connect link (`/connect/<integration>/<token>`) is a single-use bearer capability: whoever opens it can submit a credential that is then granted to the link's agent. An agent can mint one for itself (`POST https://onegate.internal/connect-links`), so OneGate treats a credential arriving through the wizard as untrusted:
+
+- **The wizard grants only what it creates.** The allow rule it wires is pinned to the connection the wizard just created (`connectionScope: "only"`, enforced even with `ONEGATE_CONNECTION_SCOPED_RULES` off). Redeeming a link, self-minted or owner-minted, never widens what the agent can do with any other connection, and never modifies an existing rule or its lease. Explicit deny rules still win on the new connection too.
+- **Self-mint is bounded.** At most 10 self-mints per agent per rolling hour (in memory, per node) and at most 5 unused, unexpired self-minted links outstanding per agent (persisted). Either limit answers `429` with `Retry-After`. Owner-minted links are recorded as `minted_by = 'owner'` and do not count toward the cap.
+- **Vendor error bodies stay server-side.** When a vendor token endpoint fails (OAuth refresh/exchange, GCP, Docker Hub, GitHub App), the agent's `502 onegate_inject_failed` carries only what failed, the HTTP status and a standard OAuth error code. The vendor's response text (first 300 chars) goes to the server log only; the owner sees it on the connect wizard's result page for their own consent exchange.
+
 ## Trust and the root CA
 
 At install time you mint a root CA and explicitly trust it on each agent machine. That trust is exactly what lets the gateway terminate TLS for integration hosts. Understand the consequences:

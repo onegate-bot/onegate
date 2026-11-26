@@ -6,6 +6,7 @@ import {
   pickTokenFields,
   oauthBearerToken,
   clientCredentialsToken,
+  TokenEndpointError,
 } from "../src/integrations/oauth.js";
 import type { OAuthDescriptor } from "../src/integrations/types.js";
 import { Store } from "../src/store/db.js";
@@ -199,7 +200,13 @@ describe("token endpoint flows", () => {
 
   it("rejects 200 responses without an access token", async () => {
     respond = () => ({ status: 200, body: { error_description: "nope" } });
-    await expect(exchangeCode("testx", descriptor(), exchangeParams)).rejects.toThrow(/nope/);
+    // The vendor's free text is kept out of the message (which reaches agents)
+    // and carried only on `detail` (server log / owner wizard page).
+    const err = await exchangeCode("testx", descriptor(), exchangeParams).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TokenEndpointError);
+    expect((err as Error).message).toMatch(/no access_token/);
+    expect((err as Error).message).not.toMatch(/nope/);
+    expect((err as TokenEndpointError).detail).toBe("nope");
   });
 
   describe("oauthBearerToken", () => {

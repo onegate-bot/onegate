@@ -81,6 +81,17 @@ function isAuthFailureStatus(status: number | undefined): boolean {
 /** Dedup window for proactive owner deny-notifications: 24 hours in ms. */
 export const OWNER_NOTIFY_DEDUP_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Agent self-mint limits for POST https://onegate.internal/connect-links. A
+ * connect link is a bearer capability the bot can hand to anyone, so a bot may
+ * mint at most SELF_MINT_PER_HOUR per rolling hour (in-memory, per node) and
+ * hold at most SELF_MINT_MAX_OUTSTANDING unused, unexpired self-minted links at
+ * once (persisted, so it survives restarts). Over either limit: 429.
+ */
+export const SELF_MINT_PER_HOUR = 10;
+export const SELF_MINT_MAX_OUTSTANDING = 5;
+const SELF_MINT_WINDOW_MS = 60 * 60 * 1000;
+
 export interface ProxyOptions {
   ca: Ca;
   store: Store;
@@ -377,6 +388,8 @@ export class GatewayProxy {
   /** Inner HTTP parser for MITM'd TLS sockets. */
   private inner: http.Server;
   private ctxBySocket = new WeakMap<Duplex, InnerCtx>();
+  /** Per-agent timestamps (ms) of recent connect-link self-mints. */
+  private selfMintLog = new Map<string, number[]>();
   private opts: ProxyOptions;
   private log: (line: string) => void;
   /**
@@ -773,6 +786,38 @@ export class GatewayProxy {
   }
 
   /**
+   * Enforces the self-mint limits (see SELF_MINT_PER_HOUR). Returns null and
+   * records the mint when allowed, else the 429 reason.
+   */
+  private selfMintLimited(
+    agentId: string,
+  ): { error: string; message: string; retryAfterSeconds: number } | null {
+    const nowMs = Date.now();
+    const recent = (this.selfMintLog.get(agentId) ?? []).filter(
+      (t) => nowMs - t < SELF_MINT_WINDOW_MS,
+    );
+    if (recent.length >= SELF_MINT_PER_HOUR) {
+      this.selfMintLog.set(agentId, recent);
+      return {
+        error: "rate_limited",
+        message: `At most ${SELF_MINT_PER_HOUR} connect links per hour can be self-minted. Retry later.`,
+        retryAfterSeconds: Math.max(1, Math.ceil((recent[0] + SELF_MINT_WINDOW_MS - nowMs) / 1000)),
+      };
+    }
+    if (this.opts.store.countOutstandingSelfMintedLinks(agentId) >= SELF_MINT_MAX_OUTSTANDING) {
+      this.selfMintLog.set(agentId, recent);
+      return {
+        error: "too_many_outstanding_links",
+        message: `At most ${SELF_MINT_MAX_OUTSTANDING} unused self-minted connect links may be outstanding. Use or let one expire first.`,
+        retryAfterSeconds: 60,
+      };
+    }
+    recent.push(nowMs);
+    this.selfMintLog.set(agentId, recent);
+    return null;
+  }
+
+  /**
    * Mints an onboarding link for the CALLING agent only. The agent is taken
    * from the authenticated proxy token (ctx.agent), never from the request
    * body, so a bot can only ever mint a link scoped to itself. Secret-free:
@@ -865,7 +910,18 @@ export class GatewayProxy {
       );
       return;
     }
+    const limited = this.selfMintLimited(ctx.agent.id);
+    if (limited) {
+      this.log(`connect-link self-mint ${ctx.agent.name} refused: ${limited.error}`);
+      res.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": String(limited.retryAfterSeconds),
+      });
+      res.end(JSON.stringify({ error: limited.error, message: limited.message }));
+      return;
+    }
     const link = this.opts.store.createOnboardingLink({
+      mintedBy: "agent",
       agentId: ctx.agent.id,
       integrationId: integration.id,
       scopes: Array.isArray(body.scopes) ? body.scopes.map(String) : undefined,
@@ -1453,9 +1509,10 @@ export class GatewayProxy {
     // re-run the policy (phase-2). Only if phase-2 STILL denies do we fall into
     // the deny handler below. This is fail-safe: any resolution error emits its
     // own deny response, and a phase-2 deny is honoured. When the flag is off,
-    // needsConnection is never set, so this block is inert and behaviour is
-    // unchanged. `preResolved` is threaded to the allow path so the connection
-    // is resolved exactly once.
+    // needsConnection is set only by a connect-wizard rule (connectionScope
+    // "only" + connectionScopeEnforced), which this block then resolves; with
+    // no such rule it is inert and behaviour is unchanged. `preResolved` is
+    // threaded to the allow path so the connection is resolved exactly once.
     let effectiveVerdict = verdict;
     let preResolved: { resolved: true; connection: Connection | null } | null = null;
     if (verdict.effect === "deny" && verdict.needsConnection) {

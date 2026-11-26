@@ -66,6 +66,8 @@ Rules have: scope (`agent` or `project`), subject id, integration id (or `*`), H
 
 Evaluation for a request: collect the agent's own rules plus its project's rules, check deny rules first (any match wins), then allow rules, otherwise fall back to the agent's default policy (`allow-all` or `deny-unmatched`).
 
+Connection-scoped rules (`connectionId` + `connectionScope` `only`/`except`) participate only when the request resolved to (or away from) that connection; the proxy re-evaluates after resolving the connection (phase 2). They are inert unless `ONEGATE_CONNECTION_SCOPED_RULES` is on, except for rules with `connectionScopeEnforced`, which the connect wizard creates for the connection it just made: those are always bound to their connection, so a wizard redeem authorizes exactly that connection and nothing else. The wizard never edits existing rules or their leases. Agent self-minted connect links (`minted_by = 'agent'`) are rate-limited (10/hour/agent) and capped (5 outstanding/agent).
+
 Path globs: `*` matches one path segment, `**` matches anything (including a decoded newline). Query strings are excluded from matching. Globs are compiled to anchored regexes and cached.
 
 ### Request path canonicalization
@@ -86,7 +88,7 @@ SQLite via the built-in `node:sqlite` (Node >= 22.13, zero native dependencies),
 - `projects` (id, name)
 - `agents` (id, name, project_id, token_hash unique, default_policy)
 - `credentials` (id, integration_id unique, name, data JSON)
-- `rules` (id, scope, subject_id, integration_id, methods JSON, path_glob, effect)
+- `rules` (id, scope, subject_id, integration_id, methods JSON, path_glob, effect, connection_id, connection_scope, connection_scope_enforced, lease columns, created_by, action)
 - `audit` (ts, agent_id, integration_id, method, host, path, decision, status, rule_id)
 - `settings` (key, value) for the admin token hash and cached Google access tokens
 - `connections` (id, kind, vendor, name, data JSON, is_default) for multi-credential LLM vendors

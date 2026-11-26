@@ -18,6 +18,7 @@ import { createHash, createSign } from "node:crypto";
 import type { Integration, InjectionContext } from "./types.js";
 import type { Store } from "../store/db.js";
 import type { Credential } from "../types.js";
+import { TokenEndpointError } from "./oauth.js";
 import { postForm } from "../util/http.js";
 
 export const GCP_DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
@@ -97,7 +98,12 @@ async function exchangeAssertion(cred: Credential): Promise<CachedToken> {
     }),
   );
   if (res.status !== 200) {
-    throw new Error(`GCP token exchange failed (${res.status}): ${res.body.slice(0, 300)}`);
+    // The vendor body stays in the server log; the agent only sees the status.
+    throw new TokenEndpointError(
+      `GCP token exchange failed (${res.status})`,
+      res.status,
+      res.body.slice(0, 300),
+    );
   }
   const json = JSON.parse(res.body) as { access_token: string; expires_in: number };
   return { token: json.access_token, exp: Date.now() + json.expires_in * 1000 };
