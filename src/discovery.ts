@@ -152,11 +152,29 @@ export function buildDiscovery(
       defaultId = accounts[0].id;
     }
 
-    const verdict = evaluate(agent, rules, {
+    let verdict = evaluate(agent, rules, {
       integrationId: integration.id,
       method: "GET",
       path: "/",
     });
+    // A connection-scoped rule (e.g. the one the connect wizard creates for the
+    // connection it made) is held pending until a connection is known. Mirror
+    // the proxy's phase-2: the integration is reachable when it is for at least
+    // one of the agent's named connections.
+    if (verdict.effect === "deny" && verdict.needsConnection) {
+      for (const c of conns) {
+        const v = evaluate(agent, rules, {
+          integrationId: integration.id,
+          method: "GET",
+          path: "/",
+          connectionId: c.id,
+        });
+        if (v.effect === "allow") {
+          verdict = v;
+          break;
+        }
+      }
+    }
 
     integrations.push({
       id: integration.id,

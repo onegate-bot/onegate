@@ -432,19 +432,25 @@ describe("M4 wizard callback auto-wire", () => {
     expect(reuse.status).toBe(410);
   });
 
-  it("does not create a duplicate allow rule when the agent already has one", async () => {
-    // Pre-seed an allow rule, then run a wizard connect and confirm no dupe.
-    store.createRule({
+  it("leaves an existing allow rule untouched and binds a new rule to the new connection", async () => {
+    // Pre-seed an allow rule, then run a wizard connect. The redeem must not
+    // re-stamp, widen or delete it, and must add exactly one rule pinned to the
+    // connection the wizard created.
+    const pre = store.createRule({
       scope: "agent",
       subjectId: agentId,
       integrationId: "gitlab",
-      methods: ["*"],
-      pathGlob: "/**",
+      methods: ["GET"],
+      pathGlob: "/api/v4/projects/**",
       effect: "allow",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      leaseTtlSeconds: 3600,
     });
-    const before = store
+    const beforeRules = store
       .rulesForAgent(store.getAgent(agentId)!)
-      .filter((r) => r.integrationId === "gitlab" && r.effect === "allow").length;
+      .filter((r) => r.integrationId === "gitlab" && r.effect === "allow");
+    const before = beforeRules.length;
+    const beforeIds = new Set(beforeRules.map((r) => r.id));
 
     tokenRespond = () => ({
       status: 200,
@@ -463,10 +469,15 @@ describe("M4 wizard callback auto-wire", () => {
     const cb = await get(`/oauth/gitlab/callback?state=${state}&code=auth_code_dup`);
     expect(cb.status).toBe(200);
 
-    const after = store
+    const allows = store
       .rulesForAgent(store.getAgent(agentId)!)
-      .filter((r) => r.integrationId === "gitlab" && r.effect === "allow").length;
-    expect(after).toBe(before);
+      .filter((r) => r.integrationId === "gitlab" && r.effect === "allow");
+    expect(allows.length).toBe(before + 1);
+    expect(store.getRule(pre.id)).toEqual(pre);
+    const added = allows.find((r) => !beforeIds.has(r.id))!;
+    expect(store.getConnection(added.connectionId!)?.name).toBe("GitLab dup");
+    expect(added.connectionScope).toBe("only");
+    expect(added.connectionScopeEnforced).toBe(true);
   });
 });
 

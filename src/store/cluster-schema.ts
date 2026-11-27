@@ -87,6 +87,7 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "connection_scope",
       "created_by",
       "action",
+      "connection_scope_enforced",
     ],
   },
   {
@@ -152,6 +153,7 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       // Wrong owner-PIN answers on a renewal link. Replicated so a guesser
       // cannot get a fresh allowance on every node of a cluster.
       "pin_failures",
+      "minted_by",
     ],
   },
   {

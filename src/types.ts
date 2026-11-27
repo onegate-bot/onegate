@@ -106,6 +106,15 @@ export interface Rule {
   connectionId?: string | null;
   connectionScope?: ConnectionScope;
   /**
+   * When true, this rule's connection scope is enforced even while the
+   * ONEGATE_CONNECTION_SCOPED_RULES flag is off (where connection-scoped rules
+   * are otherwise inert). Set only on the allow rule the connect wizard creates
+   * for the connection it just made, so a wizard redeem authorizes exactly that
+   * connection and never widens access to the agent's other connections.
+   * Absent/false on every operator-written rule (legacy behaviour unchanged).
+   */
+  connectionScopeEnforced?: boolean;
+  /**
    * Provenance: how this rule came to exist. Null/absent = written explicitly by
    * an operator (the default, and what every pre-existing rule reads as).
    * "grant" = auto-created alongside a connection grant, so that granting a
@@ -274,6 +283,9 @@ export interface LlmUsageEvent {
   status: number | null;
 }
 
+/** Who minted an onboarding link. See OnboardingLink.mintedBy. */
+export type OnboardingLinkMinter = "owner" | "agent";
+
 /**
  * A self-service connect-wizard link. An operator (or a bot) mints one of these
  * scoped to a single agent and a single integration. The bot owner opens the
@@ -308,6 +320,14 @@ export interface OnboardingLink {
    * of the connect wizard. Null = a normal connect link.
    */
   ruleId?: string | null;
+  /**
+   * Who minted the link: "owner" = the admin API / operator, "agent" = the bot
+   * itself via POST https://onegate.internal/connect-links. Null for links the
+   * proxy mints on its own (not-connected bodies, owner notifications, renewal
+   * links) and for rows that predate the column. Used to rate-limit and cap
+   * agent self-minted links.
+   */
+  mintedBy?: OnboardingLinkMinter | null;
 }
 
 export type Decision =

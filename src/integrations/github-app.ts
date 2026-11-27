@@ -15,6 +15,7 @@ import type { Integration, InjectionContext } from "./types.js";
 import type { Credential } from "../types.js";
 import type { Store } from "../store/db.js";
 import { postJson } from "../util/http.js";
+import { TokenEndpointError } from "./oauth.js";
 
 /** Refresh the installation token when within a minute of expiry. */
 const EXPIRY_MARGIN_MS = 60_000;
@@ -88,8 +89,11 @@ export async function githubAppToken(cred: Credential, store: Store): Promise<st
     } catch {
       // Non-JSON error body.
     }
-    throw new Error(
-      `GitHub App installation token exchange failed (${res.status})${message ? `: ${message}` : ""}`,
+    // Vendor text stays in the server log; the agent only sees the status.
+    throw new TokenEndpointError(
+      `GitHub App installation token exchange failed (${res.status})`,
+      res.status,
+      message.slice(0, 300),
     );
   }
   const json = JSON.parse(res.body) as { token?: string; expires_at?: string };
