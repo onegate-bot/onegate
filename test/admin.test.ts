@@ -295,6 +295,55 @@ describe("rule referential validation on create", () => {
     expect(r.json.integrationId).toBe("*");
   });
 
+  // A pathGlob that is neither a path nor a host-qualified glob would be stored
+  // and never match: for a deny rule, a silently inert guard.
+  it("rejects a pathGlob that is neither /... nor a valid host-qualified glob", async () => {
+    for (const pathGlob of ["**", "api/v1/**", "*.*", "**.**/**", "bad_host.com/**", "a**b.example.com"]) {
+      const r = await api("POST", "/api/rules", {
+        scope: "agent",
+        subjectId: agentId,
+        integrationId: "*",
+        effect: "deny",
+        pathGlob,
+      });
+      expect(r.status, pathGlob).toBe(400);
+      expect(r.json.error).toBe("invalid_path_glob");
+      expect(r.json.message).toContain("host-qualified");
+    }
+  });
+
+  it("rejects a non-string pathGlob", async () => {
+    const r = await api("POST", "/api/rules", {
+      scope: "agent",
+      subjectId: agentId,
+      integrationId: "*",
+      effect: "deny",
+      pathGlob: 42,
+    });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toBe("invalid_path_glob");
+  });
+
+  it("accepts host-qualified globs and plain path globs", async () => {
+    for (const pathGlob of [
+      "http-intake.logs.us5.datadoghq.com/**",
+      "*.datadoghq.com",
+      "**.datadoghq.com/**",
+      "/v1/**",
+    ]) {
+      const r = await api("POST", "/api/rules", {
+        scope: "agent",
+        subjectId: agentId,
+        integrationId: "*",
+        effect: "deny",
+        pathGlob,
+      });
+      expect(r.status, pathGlob).toBe(201);
+      expect(r.json.pathGlob).toBe(pathGlob);
+      await api("DELETE", `/api/rules/${r.json.id}`);
+    }
+  });
+
   // The dangerous case: a typo'd connection on a deny/except pin silently
   // becomes a blanket deny, because the exception can never match.
   it("rejects a connection-scoped rule whose connection does not exist", async () => {
