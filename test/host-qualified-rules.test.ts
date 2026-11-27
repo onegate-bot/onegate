@@ -80,8 +80,12 @@ describe("validatePathGlob", () => {
     }
   });
 
+  it("accepts a path glob opening with a bare ** (it spans the leading slash)", () => {
+    for (const g of ["**", "**/repos/**", "**/admin"]) expect(() => validatePathGlob(g), g).not.toThrow();
+  });
+
   it("rejects anything else with a message naming both accepted forms", () => {
-    for (const g of ["**", "logs/**", "*.*", "", "foo"]) {
+    for (const g of ["logs/**", "*.*", "", "foo", "**.**/**", "**x"]) {
       expect(() => validatePathGlob(g), g).toThrow(InvalidPathGlobError);
     }
     expect(() => validatePathGlob("logs/**")).toThrow(/starting with "\/".*host-qualified/);
