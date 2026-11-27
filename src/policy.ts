@@ -256,13 +256,15 @@ export class InvalidPathGlobError extends Error {}
 
 /**
  * Validates a pathGlob at rule-creation time. Accepted: a path glob starting
- * with `/`, or a valid host-qualified glob. Anything else (`**`, `api/v1/**`,
- * `*.*`, `bad_host.com/**`) is rejected: it would either match nothing or not
- * mean what it reads as, and a silently inert deny rule is the failure mode
- * this guards against.
+ * with `/`, a path glob that is a bare `**` or opens with `**` followed by a
+ * slash (the `**` spans the leading slash), or a valid host-qualified glob. Anything else
+ * (`api/v1/**`, `*.*`, `bad_host.com/**`) is rejected: it would either match
+ * nothing or not mean what it reads as, and a silently inert deny rule is the
+ * failure mode this guards against.
  */
 export function validatePathGlob(glob: string): void {
   if (glob.startsWith("/")) return;
+  if (glob === "**" || glob.startsWith("**/")) return;
   if (isHostQualifiedGlob(glob)) return;
   throw new InvalidPathGlobError(
     `invalid path glob "${glob}": use a path starting with "/" (e.g. "/v1/**"), or a host-qualified glob ` +

@@ -154,7 +154,7 @@ onegate rules add --scope agent --subject <agentId> --integration github --effec
 onegate rules rm <ruleId>
 ```
 
-`--effect` is `allow` or `deny`. `--methods` is a comma list (omit for all). `--path` is a glob (defaults to `/**`): either a path starting with `/` (`*` = one segment, `**` = anything), or a host-qualified glob `<host>[/<path>]` such as `api.example.com/**`, `*.example.com` (one label) or `**.example.com/v1/**` (any number of labels). Anything else is rejected. A host-qualified deny also blocks opaque passthrough tunnels to that host, for the whole host regardless of the path part, e.g.:
+`--effect` is `allow` or `deny`. `--methods` is a comma list (omit for all). `--path` is a glob (defaults to `/**`): either a path starting with `/` (`*` = one segment, `**` = anything), or a host-qualified glob `<host>[/<path>]` such as `api.example.com/**`, `*.example.com` (one label) or `**.example.com/v1/**` (any number of labels). A bare `**` (or `**` followed by a slash) is also accepted as a path glob. Anything else is rejected. A host-qualified deny also blocks opaque passthrough tunnels to that host, for the whole host regardless of the path part, e.g.:
 
 ```bash
 onegate rules add --scope agent --subject <agentId> --integration '*' --effect deny --path 'http-intake.logs.us5.datadoghq.com/**'

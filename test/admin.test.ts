@@ -298,7 +298,7 @@ describe("rule referential validation on create", () => {
   // A pathGlob that is neither a path nor a host-qualified glob would be stored
   // and never match: for a deny rule, a silently inert guard.
   it("rejects a pathGlob that is neither /... nor a valid host-qualified glob", async () => {
-    for (const pathGlob of ["**", "api/v1/**", "*.*", "**.**/**", "bad_host.com/**", "a**b.example.com"]) {
+    for (const pathGlob of ["api/v1/**", "*.*", "**.**/**", "bad_host.com/**", "a**b.example.com"]) {
       const r = await api("POST", "/api/rules", {
         scope: "agent",
         subjectId: agentId,
