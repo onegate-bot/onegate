@@ -27,6 +27,7 @@ import { onSelectionError, selectConnection } from "../llm/strategy.js";
 import { createUsageScanner, extractRequestModel, type TokenUsage } from "../llm/usage.js";
 import { DISCOVERY_HOST, buildDiscovery } from "../discovery.js";
 import { publicBaseUrlFromEnv } from "../util/public-url.js";
+import { agentRelaysOwnerLinksFromEnv } from "../util/owner-links.js";
 
 interface SocketCtx {
   kind?: "integration";
@@ -102,6 +103,15 @@ export interface ProxyOptions {
    * environment on each use.
    */
   publicBaseUrl?: string;
+  /**
+   * Legacy relay mode (ONEGATE_AGENT_RELAYS_OWNER_LINKS): put approve and
+   * renew links back into the agent's 403 so a chat bot can forward them to
+   * its owner. The admin app must then require the owner PIN on those links
+   * (see src/util/owner-links.ts). When omitted it is read from the
+   * environment. Off by default: an agent must never hold a link that
+   * approves its own held call or renews its own lease.
+   */
+  agentRelaysOwnerLinks?: boolean;
 }
 
 const HOP_BY_HOP = new Set([
@@ -695,6 +705,8 @@ export class GatewayProxy {
    *  - POST /connect-links -> mint a single-use OAuth connect link scoped to
    *    the authenticated agent, so the bot can hand it straight to its owner
    *    without the operator having to mint it.
+   *  - GET  /approvals/:id -> status of one of the agent's own held calls
+   *    (pending/approved/rejected/expired). Never carries the decision token.
    */
   private handleDiscovery(
     req: http.IncomingMessage,
@@ -709,6 +721,40 @@ export class GatewayProxy {
       this.log(`discovery ${ctx.agent.name} -> ${result.integrations.length} integration(s)`);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // Token-free status of one of the calling agent's held calls, so a bot can
+    // poll for its owner's decision without ever holding the decision link.
+    const statusMatch = /^\/approvals\/([A-Za-z0-9_-]+)$/.exec(path);
+    if (statusMatch) {
+      if (method !== "GET") {
+        res.writeHead(405, { "content-type": "application/json", allow: "GET" });
+        res.end(JSON.stringify({ error: "method_not_allowed" }));
+        return;
+      }
+      const approval = this.opts.store.getApproval(statusMatch[1]);
+      // Another agent's approval is reported exactly like a missing one.
+      if (!approval || approval.agentId !== ctx.agent.id) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "unknown_approval" }));
+        return;
+      }
+      const expired = approval.status === "pending" && Date.parse(approval.expiresAt) <= Date.now();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: approval.id,
+          status: expired ? "expired" : approval.status,
+          used: approval.usedAt !== null,
+          integrationId: approval.integrationId,
+          method: approval.method,
+          host: approval.host,
+          path: approval.path,
+          expiresAt: approval.expiresAt,
+          decidedAt: approval.decidedAt,
+        }),
+      );
       return;
     }
 
@@ -846,6 +892,11 @@ export class GatewayProxy {
     return this.opts.publicBaseUrl ?? publicBaseUrlFromEnv().url;
   }
 
+  /** Whether approve/renew links may be returned to the agent (legacy relay mode). */
+  private agentRelaysOwnerLinks(): boolean {
+    return this.opts.agentRelaysOwnerLinks ?? agentRelaysOwnerLinksFromEnv();
+  }
+
   /**
    * Fire-and-forget: dispatches an owner notification webhook POST.
    * Marks the row delivered on 2xx or failed otherwise. Never throws.
@@ -860,6 +911,8 @@ export class GatewayProxy {
       connectUrl: string | null;
       connectExpiresAt: string | null;
       reason: string;
+      /** Set for approval_required: the held call's id (the link's subject). */
+      approvalId?: string;
     },
     webhookUrl: string,
   ): void {
@@ -873,6 +926,7 @@ export class GatewayProxy {
       connectUrl: payload.connectUrl,
       connectExpiresAt: payload.connectExpiresAt,
       reason: payload.reason,
+      ...(payload.approvalId ? { approvalId: payload.approvalId } : {}),
       ts: new Date().toISOString(),
     });
     const controller = new AbortController();
@@ -1055,17 +1109,27 @@ export class GatewayProxy {
     agent: Agent,
     integration: Integration,
     ruleId: string,
+    host: string,
     method: string,
     path: string,
     bodyHash: string,
   ): { id: string; expiresAt: string; url: string | null } | null {
     try {
-      const existing = this.opts.store.activeApprovalFor(agent.id, integration.id, method, path, Date.now(), bodyHash);
+      const existing = this.opts.store.activeApprovalFor(
+        agent.id,
+        integration.id,
+        method,
+        path,
+        Date.now(),
+        bodyHash,
+        host,
+      );
       if (existing) return { id: existing.id, expiresAt: existing.expiresAt, url: null };
       const approval = this.opts.store.createApproval({
         agentId: agent.id,
         integrationId: integration.id,
         ruleId,
+        host,
         method,
         path,
         bodyHash,
@@ -1115,6 +1179,7 @@ export class GatewayProxy {
           connectUrl: url,
           connectExpiresAt: expiresAt,
           reason: "approval_required",
+          approvalId,
         },
         webhookUrl,
       );
@@ -1429,6 +1494,7 @@ export class GatewayProxy {
           agentId: agent.id,
           integrationId: integration.id,
           ruleId: effectiveVerdict.ruleId,
+          host,
           method,
           path,
           bodyHash: heldBodyHash,
@@ -1461,7 +1527,10 @@ export class GatewayProxy {
       // (one-tap, no credential re-entry) and notify the owner, deduped per
       // lapse so each new expiry always reaches them.
       if (verdict.lapsed && verdict.lapsedRuleId) {
-        const renew = this.renewalUrlFor(agent, integration, verdict.lapsedRuleId);
+        // The renewal link re-opens access, so by default it goes ONLY to the
+        // owner (notify webhook). An agent holding it could renew its own lease.
+        const relay = this.agentRelaysOwnerLinks();
+        const renew = relay ? this.renewalUrlFor(agent, integration, verdict.lapsedRuleId) : null;
         this.maybeNotifyOwner(agent, integration, "lease_expired", {
           lease: {
             ruleId: verdict.lapsedRuleId,
@@ -1472,14 +1541,19 @@ export class GatewayProxy {
         res.end(
           JSON.stringify({
             error: "onegate_lease_expired",
-            message: `Access to "${integration.id}" for agent "${agent.name}" has expired (time-boxed connection). Open the connect_url to re-allow it for another period, then retry.`,
+            message: renew
+              ? `Access to "${integration.id}" for agent "${agent.name}" has expired (time-boxed connection). Open the connect_url to re-allow it for another period, then retry.`
+              : `Access to "${integration.id}" for agent "${agent.name}" has expired (time-boxed connection). Your owner has to re-allow it; retry after they do.`,
             ...(renew
               ? {
                   connect_url: renew.url,
                   connect_expires_at: renew.expiresAt,
-                  hint: "Show connect_url to your owner as a bare link. Opening it re-allows this connection for another period (no credential re-entry), then retry the request.",
+                  hint: "Show connect_url to your owner as a bare link. Opening it re-allows this connection for another period (no credential re-entry; the owner confirms with their OneGate PIN), then retry the request.",
                 }
-              : {}),
+              : {
+                  rule_id: verdict.lapsedRuleId,
+                  hint: "Your owner has been sent a renewal link if a notify webhook is configured. They can also re-allow it from the OneGate admin (`onegate rules renew <rule_id>`). Do not ask them for the link; retry the request after they renew.",
+                }),
           }),
         );
         return;
@@ -1494,7 +1568,10 @@ export class GatewayProxy {
       // agent's retry of the identical request (same method, path and body)
       // is redeemed above and goes through once.
       if (verdict.requiresApproval && verdict.ruleId) {
-        const pending = this.pendingApprovalFor(agent, integration, verdict.ruleId, method, path, heldBodyHash);
+        const pending = this.pendingApprovalFor(agent, integration, verdict.ruleId, host, method, path, heldBodyHash);
+        // The decision link approves this very call, so by default it goes
+        // ONLY to the owner (notify webhook) and the agent gets the id to poll.
+        const relayUrl = pending?.url && this.agentRelaysOwnerLinks() ? pending.url : null;
         res.writeHead(403, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -1504,13 +1581,14 @@ export class GatewayProxy {
               ? {
                   approval_id: pending.id,
                   approval_expires_at: pending.expiresAt,
-                  ...(pending.url
+                  approval_status_url: `https://${DISCOVERY_HOST}/approvals/${pending.id}`,
+                  ...(relayUrl
                     ? {
-                        approval_url: pending.url,
-                        hint: "Show approval_url to your owner as a bare link. Opening it lets them approve or reject this call. After they approve, retry the identical request once, before approval_expires_at.",
+                        approval_url: relayUrl,
+                        hint: "Show approval_url to your owner as a bare link. Opening it lets them approve or reject this call (they confirm with their OneGate PIN). After they approve, retry the identical request once, before approval_expires_at.",
                       }
                     : {
-                        hint: "Ask your owner to approve this call in OneGate. After they approve, retry the identical request once, before approval_expires_at.",
+                        hint: "Your owner has been notified if a notify webhook is configured, and can approve this call from the OneGate admin (`onegate approvals approve <approval_id>`). Do not ask them for a link. Poll approval_status_url (through the proxy) or just retry the identical request after they approve, once, before approval_expires_at.",
                       }),
                 }
               : {}),

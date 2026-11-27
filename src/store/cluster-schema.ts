@@ -48,7 +48,7 @@ export interface SharedTableSpec {
  * stays on its node until someone decides it should be shared, which is the
  * failure mode that cannot leak node identity into a peer.
  */
-export const SHARED_SETTING_KEYS: readonly string[] = ["admin_token_hash"];
+export const SHARED_SETTING_KEYS: readonly string[] = ["admin_token_hash", "owner_link_pin_hash"];
 
 /** Prefix of the node-local settings that hold this node's cluster state. */
 export const CLUSTER_SETTING_PREFIX = "cluster.";
@@ -149,6 +149,9 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       "expires_at",
       "used_at",
       "rule_id",
+      // Wrong owner-PIN answers on a renewal link. Replicated so a guesser
+      // cannot get a fresh allowance on every node of a cluster.
+      "pin_failures",
     ],
   },
   {
@@ -172,6 +175,11 @@ export const SHARED_TABLES: readonly SharedTableSpec[] = [
       // the replication window, see docs/CLUSTER.md).
       "body_hash",
       "used_at",
+      // The upstream host the held call targeted: redemption is bound to it on
+      // every node.
+      "host",
+      // Wrong owner-PIN answers on the approve link (lockout replicates).
+      "pin_failures",
     ],
   },
   { table: "settings", pk: ["key"], columns: ["key", "value"], filter: settingsFilter },

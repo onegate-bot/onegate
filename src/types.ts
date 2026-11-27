@@ -435,4 +435,9 @@ export interface Approval {
   bodyHash: string | null;
   /** When an approved row was redeemed by the agent's retry, null until then. */
   usedAt: string | null;
+  /**
+   * Upstream host of the held call (lowercase). Redemption requires the same
+   * host; null on rows minted before host binding, which never redeem.
+   */
+  host: string | null;
 }

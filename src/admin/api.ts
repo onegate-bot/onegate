@@ -21,6 +21,14 @@ import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
 import { publicBaseUrlFromEnv } from "../util/public-url.js";
+import {
+  OWNER_LINK_MAX_PIN_FAILURES,
+  OWNER_PIN_SETTING,
+  agentRelaysOwnerLinksFromEnv,
+  hashOwnerPin,
+  ownerPinProblem,
+  verifyOwnerPin,
+} from "../util/owner-links.js";
 import { normalizeInstanceOrigin } from "../util/instance-origin.js";
 import { brandLogoTile } from "./logo-render.js";
 import { deriveLlmMode, type LlmMode } from "../llm/mode.js";
@@ -151,6 +159,13 @@ export interface AdminApiOptions {
    * replicates until a runtime is started (tests, embedded use).
    */
   cluster?: ClusterRuntime;
+  /**
+   * Legacy relay mode (ONEGATE_AGENT_RELAYS_OWNER_LINKS): the proxy hands
+   * approve/renew links to agents, so every decision on those links requires
+   * the owner PIN (or the admin token), with a per-link lockout. When omitted
+   * it is read from the environment.
+   */
+  agentRelaysOwnerLinks?: boolean;
 }
 
 /** Minimal HTML escaping for the OAuth result pages. */
@@ -641,6 +656,65 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
   }
 
   /** Friendly page for an invalid, expired, or already-used wizard link. */
+  const relayMode = (): boolean => opts.agentRelaysOwnerLinks ?? agentRelaysOwnerLinksFromEnv();
+
+  /** The PIN field on approve/renew pages, present only in relay mode. */
+  function secondFactorField(): string {
+    if (!relayMode()) return "";
+    const label = store.getSetting(OWNER_PIN_SETTING) ? "Your OneGate PIN" : "Your OneGate admin token";
+    return (
+      `<label>${label}<input type="password" name="pin" autocomplete="off" required></label>` +
+      `<p class="og-muted">This link may have passed through your bot, so OneGate asks for something only you know.</p>`
+    );
+  }
+
+  /**
+   * Relay mode only: checks the owner's second factor on a decision. The
+   * answer is the owner PIN when one is set, else the admin token (the admin
+   * token is accepted in both cases). One attempt is reserved BEFORE checking,
+   * so a link locks after OWNER_LINK_MAX_PIN_FAILURES wrong answers no matter
+   * how many guesses race; a right answer gives its attempt back. Responds and
+   * returns false when the decision must not proceed.
+   */
+  function secondFactorOk(
+    req: express.Request,
+    res: express.Response,
+    attempt: { reserve: () => boolean; refund: () => void; failures: () => number },
+  ): boolean {
+    if (!relayMode()) return true;
+    if (!attempt.reserve()) {
+      res
+        .status(429)
+        .send(
+          resultPage(
+            "This link is locked",
+            `Too many wrong answers were entered on this link. Decide from the OneGate admin instead (onegate approvals / onegate rules renew).`,
+          ),
+        );
+      return false;
+    }
+    const given = typeof req.body?.pin === "string" ? req.body.pin : "";
+    const ok =
+      given.length > 0 &&
+      (verifyOwnerPin(given, store.getSetting(OWNER_PIN_SETTING)) || checkAdminToken(store, `Bearer ${given}`));
+    if (ok) {
+      attempt.refund();
+      return true;
+    }
+    const left = Math.max(0, OWNER_LINK_MAX_PIN_FAILURES - attempt.failures());
+    res
+      .status(403)
+      .send(
+        resultPage(
+          "Wrong PIN",
+          left > 0
+            ? `Nothing was changed. Go back and try again (${left} attempt${left === 1 ? "" : "s"} left before this link locks).`
+            : "Nothing was changed, and this link is now locked. Decide from the OneGate admin instead.",
+        ),
+      );
+    return false;
+  }
+
   function invalidLinkPage(res: express.Response): void {
     res
       .status(410)
@@ -1025,6 +1099,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
           `<p class="og-muted">${who}'s time-boxed access to your ${title} account has expired. ` +
           `Re-allowing grants ${who} access${forPeriod}. Your credential is never re-entered and ${who} never sees it.</p>` +
           `<form method="post" action="${publicBase()}/renew/${esc(link!.token)}">` +
+          secondFactorField() +
           `<button class="og-btn" type="submit">Re-allow${forPeriod}</button>` +
           `</form>`,
       }),
@@ -1037,6 +1112,15 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       invalidLinkPage(res);
       return;
     }
+    const token = link!.token;
+    if (
+      !secondFactorOk(req, res, {
+        reserve: () => store.reserveLinkPinAttempt(token, OWNER_LINK_MAX_PIN_FAILURES),
+        refund: () => store.refundLinkPinAttempt(token),
+        failures: () => store.linkPinFailures(token),
+      })
+    )
+      return;
     // Claim before renewing: a replayed renewal link must not stack a second
     // lease period onto the rule.
     if (!store.claimOnboardingLink(link!.token)) {
@@ -1091,10 +1175,11 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
         docTitle: "OneGate",
         body:
           `<h1>Allow ${who} to run this ${title} request?</h1>` +
-          `<p class="og-muted">${who} tried to call <code>${esc(approval.method)} ${esc(approval.path)}</code> ` +
+          `<p class="og-muted">${who} tried to call <code>${esc(approval.method)} ${esc(approval.host ?? "")}${esc(approval.path)}</code> ` +
           `on your ${title} account. The request was <strong>not</strong> sent. It is waiting for your decision. ` +
           `Approving lets ${who} retry this exact request once. Your credential is never shown to ${who}.</p>` +
           `<form method="post" action="${publicBase()}/approve/${esc(req.params.token)}">` +
+          secondFactorField() +
           `<button class="og-btn" type="submit" name="decision" value="approve">Approve</button> ` +
           `<button class="og-btn secondary" type="submit" name="decision" value="reject">Reject</button>` +
           `</form>`,
@@ -1104,10 +1189,18 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   app.post("/approve/:token", express.urlencoded({ extended: false }), (req, res) => {
     const approval = store.getApprovalByToken(req.params.token);
-    if (!approval) {
+    if (!approval || approval.status !== "pending") {
       invalidLinkPage(res);
       return;
     }
+    if (
+      !secondFactorOk(req, res, {
+        reserve: () => store.reserveApprovalPinAttempt(approval.id, OWNER_LINK_MAX_PIN_FAILURES),
+        refund: () => store.refundApprovalPinAttempt(approval.id),
+        failures: () => store.approvalPinFailures(approval.id),
+      })
+    )
+      return;
     // Anything that is not an explicit "approve" is a rejection: a malformed or
     // missing decision must never be read as consent.
     const status = req.body?.decision === "approve" ? "approved" : "rejected";
@@ -2623,6 +2716,29 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.json(decided);
     });
   }
+
+  // ---- owner PIN (second factor on approve/renew links in relay mode) ----
+
+  /** Whether a PIN is set and whether links currently require it. Never the PIN. */
+  app.get("/api/settings/owner-pin", (_req, res) => {
+    res.json({ set: store.getSetting(OWNER_PIN_SETTING) !== null, required: relayMode() });
+  });
+
+  app.put("/api/settings/owner-pin", (req, res) => {
+    const pin = req.body?.pin;
+    const problem = ownerPinProblem(pin);
+    if (problem) {
+      res.status(400).json({ error: problem });
+      return;
+    }
+    store.setSetting(OWNER_PIN_SETTING, hashOwnerPin(pin as string));
+    res.json({ set: true, required: relayMode() });
+  });
+
+  app.delete("/api/settings/owner-pin", (_req, res) => {
+    store.deleteSetting(OWNER_PIN_SETTING);
+    res.json({ set: false, required: relayMode() });
+  });
 
   // ---- connect-wizard onboarding links (admin mint) ----
 
