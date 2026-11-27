@@ -19,8 +19,8 @@ import net from "node:net";
 import tls from "node:tls";
 import type { Duplex } from "node:stream";
 import type { Ca, LeafCert } from "../ca.js";
-import type { Store } from "../store/db.js";
-import { evaluate, normalizeRequestPath } from "../policy.js";
+import { MAX_ONBOARDING_LINK_TTL_DAYS, parseOnboardingTtlDays, type Store } from "../store/db.js";
+import { canonicalizeRequestTarget, evaluate } from "../policy.js";
 import type { Agent, Approval, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
 import { connectFlowKind, type Integration, type Registry } from "../integrations/types.js";
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
@@ -400,7 +400,13 @@ export class GatewayProxy {
       res.end(JSON.stringify({ error: "OneGate only proxies HTTPS (CONNECT)" }));
     });
     this.server.on("connect", (req, socket, head) => this.onConnect(req, socket, head));
-    this.inner = http.createServer((req, res) => this.onInnerRequest(req, res));
+    this.inner = http.createServer((req, res) => {
+      // onInnerRequest is async: anything that throws inside it (a bug, a
+      // store error, Node rejecting a request option) becomes a rejected
+      // promise. Unhandled, that terminates the whole gateway for every agent,
+      // so it is caught here and fails ONLY this request.
+      this.onInnerRequest(req, res).catch((err: unknown) => this.failInnerRequest(req, res, err));
+    });
     this.inner.on("clientError", (_err, socket) => socket.destroy());
   }
 
@@ -433,6 +439,11 @@ export class GatewayProxy {
   }
 
   private onConnect(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
+    // Attach the error listener BEFORE any write. A hijacked CONNECT socket has
+    // no other 'error' listener, so a write that races a client reset (EPIPE,
+    // ECONNRESET) on, e.g., the 400 below would be an unhandled 'error' event
+    // and crash the whole gateway, pre-authentication.
+    socket.on("error", () => socket.destroy());
     const [host, portStr] = (req.url ?? "").split(":");
     const port = Number(portStr) || 443;
     // Reject an empty or malformed host up front. Without a strict charset guard
@@ -442,7 +453,6 @@ export class GatewayProxy {
       socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
       return;
     }
-    socket.on("error", () => socket.destroy());
     // Track the tunnel so close() can tear it down deterministically.
     this.tunnels.add(socket);
     socket.once("close", () => this.tunnels.delete(socket));
@@ -605,12 +615,18 @@ export class GatewayProxy {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     const leaf = await this.leafOrDestroy(host, socket);
     if (!leaf) return;
+    // Bytes the client pipelined after the CONNECT head (typically its TLS
+    // ClientHello) are CIPHERTEXT: they belong on the raw socket, ahead of
+    // whatever arrives next, so the TLS layer reads them first. Unshifting them
+    // onto the TLSSocket would inject them on the decrypted side and break the
+    // handshake.
+    if (head.length) socket.unshift(head);
     const tlsSocket = new tls.TLSSocket(socket as net.Socket, {
       isServer: true,
       key: leaf.key,
       cert: leaf.cert,
     });
-    if (head.length) tlsSocket.unshift(head);
+
     tlsSocket.on("error", () => tlsSocket.destroy());
     this.ctxBySocket.set(tlsSocket, { kind: "integration", agent, host, port, integration });
     this.inner.emit("connection", tlsSocket);
@@ -654,12 +670,18 @@ export class GatewayProxy {
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     const leaf = await this.leafOrDestroy(host, socket);
     if (!leaf) return;
+    // Bytes the client pipelined after the CONNECT head (typically its TLS
+    // ClientHello) are CIPHERTEXT: they belong on the raw socket, ahead of
+    // whatever arrives next, so the TLS layer reads them first. Unshifting them
+    // onto the TLSSocket would inject them on the decrypted side and break the
+    // handshake.
+    if (head.length) socket.unshift(head);
     const tlsSocket = new tls.TLSSocket(socket as net.Socket, {
       isServer: true,
       key: leaf.key,
       cert: leaf.cert,
     });
-    if (head.length) tlsSocket.unshift(head);
+
     tlsSocket.on("error", () => tlsSocket.destroy());
     this.ctxBySocket.set(tlsSocket, { kind: "discovery", agent, host });
     this.inner.emit("connection", tlsSocket);
@@ -729,60 +751,94 @@ export class GatewayProxy {
     });
     req.on("end", () => {
       if (tooBig) return;
-      let body: {
-        integrationId?: unknown;
-        scopes?: unknown;
-        connectionName?: unknown;
-        ttlDays?: unknown;
-      } = {};
-      const raw = Buffer.concat(chunks).toString("utf8").trim();
-      if (raw) {
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "invalid_json" }));
-          return;
+      // This runs in an event listener: an uncaught throw here would be an
+      // uncaughtException and take the whole gateway down. Fail this request.
+      try {
+        this.finishSelfMintConnectLink(chunks, res, ctx);
+      } catch (err) {
+        this.log(`connect-link self-mint failed for ${ctx.agent.name}: ${(err as Error)?.message ?? String(err)}`);
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "internal_error" }));
+        } else {
+          res.destroy();
         }
       }
-      const integrationId = body.integrationId;
-      if (!integrationId || typeof integrationId !== "string") {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "integrationId is required" }));
-        return;
-      }
-      const integration = this.opts.registry.get(integrationId);
-      if (!integration || !connectFlowKind(integration)) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "integration_not_connectable" }));
-        return;
-      }
-      const link = this.opts.store.createOnboardingLink({
-        agentId: ctx.agent.id,
-        integrationId: integration.id,
-        scopes: Array.isArray(body.scopes) ? body.scopes.map(String) : undefined,
-        connectionName:
-          typeof body.connectionName === "string" && body.connectionName.trim()
-            ? body.connectionName.trim()
-            : undefined,
-        ttlDays: typeof body.ttlDays === "number" && body.ttlDays > 0 ? body.ttlDays : undefined,
-      });
-      const base = this.publicBase();
-      this.log(`connect-link self-mint ${ctx.agent.name} -> ${integration.id}`);
-      res.writeHead(201, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          token: link.token,
-          url: `${base}/connect/${integration.id}/${link.token}`,
-          expiresAt: link.expiresAt,
-        }),
-      );
     });
     req.on("error", () => {
       if (tooBig) return;
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "bad_request" }));
     });
+  }
+
+  /** Parses, validates and answers a self-mint request body. May throw. */
+  private finishSelfMintConnectLink(chunks: Buffer[], res: http.ServerResponse, ctx: DiscoveryCtx): void {
+    let body: {
+      integrationId?: unknown;
+      scopes?: unknown;
+      connectionName?: unknown;
+      ttlDays?: unknown;
+    } = {};
+    const raw = Buffer.concat(chunks).toString("utf8").trim();
+    if (raw) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = undefined;
+      }
+      // `null`, arrays and scalars are valid JSON but not a request body.
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_json" }));
+        return;
+      }
+      body = parsed as typeof body;
+    }
+    const integrationId = body.integrationId;
+    if (!integrationId || typeof integrationId !== "string") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "integrationId is required" }));
+      return;
+    }
+    const integration = this.opts.registry.get(integrationId);
+    if (!integration || !connectFlowKind(integration)) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "integration_not_connectable" }));
+      return;
+    }
+    const ttlDays = parseOnboardingTtlDays(body.ttlDays);
+    if (ttlDays === null) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "invalid_ttl_days",
+          message: `ttlDays must be an integer from 1 to ${MAX_ONBOARDING_LINK_TTL_DAYS}.`,
+        }),
+      );
+      return;
+    }
+    const link = this.opts.store.createOnboardingLink({
+      agentId: ctx.agent.id,
+      integrationId: integration.id,
+      scopes: Array.isArray(body.scopes) ? body.scopes.map(String) : undefined,
+      connectionName:
+        typeof body.connectionName === "string" && body.connectionName.trim()
+          ? body.connectionName.trim()
+          : undefined,
+      ttlDays,
+    });
+    const base = this.publicBase();
+    this.log(`connect-link self-mint ${ctx.agent.name} -> ${integration.id}`);
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        token: link.token,
+        url: `${base}/connect/${integration.id}/${link.token}`,
+        expiresAt: link.expiresAt,
+      }),
+    );
   }
 
   /** Base URL for owner-facing links. */
@@ -1248,6 +1304,25 @@ export class GatewayProxy {
     res.end(JSON.stringify({ error: "onegate_body_too_large", message: err.message }));
   }
 
+  /**
+   * Last-resort handler for an inner request whose handler threw. Logs, then
+   * answers 500 if nothing was sent yet, otherwise destroys the socket (a
+   * half-written response cannot be completed honestly). Never throws.
+   */
+  private failInnerRequest(req: http.IncomingMessage, res: http.ServerResponse, err: unknown): void {
+    try {
+      this.log(`internal error handling ${req.method ?? "?"} ${req.url ?? "?"}: ${(err as Error)?.message ?? String(err)}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "onegate_internal_error", message: "OneGate failed to handle this request." }));
+      } else {
+        res.destroy();
+      }
+    } catch {
+      res.destroy();
+    }
+  }
+
   private async onInnerRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const ctx = this.ctxBySocket.get(req.socket);
     if (!ctx) {
@@ -1265,7 +1340,29 @@ export class GatewayProxy {
     // upstream forward all use this single canonical form, so a deny glob cannot
     // be evaded with an equivalent-but-encoded path (%2F, //, /../) that the
     // vendor would still honor. See normalizeRequestPath.
-    const path = normalizeRequestPath(req.url ?? "/");
+    //
+    // `path` is the decoded canonical form (policy/audit); `forwardPath` is the
+    // same path re-encoded for the wire, so the vendor's single decode yields
+    // exactly what policy matched and https.request never sees a raw space or
+    // control character. See canonicalizeRequestTarget.
+    const canon = canonicalizeRequestTarget(req.url ?? "/");
+    const { path, forward: forwardPath } = canon;
+    if (canon.rejectReason) {
+      this.opts.store.audit({
+        agentId: agent.id,
+        agentName: agent.name,
+        integrationId: ctx.integration.id,
+        host,
+        method,
+        path: req.url ?? "/",
+        decision: "invalid_path",
+        status: 400,
+      });
+      this.log(`invalid path from ${agent.name}: ${method} ${host}${req.url ?? "/"}`);
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "onegate_invalid_path", message: canon.rejectReason }));
+      return;
+    }
 
     // Re-resolve the integration now that the path is known, so a path-scoped
     // host claim can win over a bare claim on the same host (one hostname
@@ -1608,7 +1705,9 @@ export class GatewayProxy {
     const injectCtx = {
       headers,
       method,
-      path,
+      // The WIRE form: what integrations sign (SigV4) or rewrite is exactly
+      // what is sent.
+      path: forwardPath,
       host,
       credential,
       store: this.opts.store,
@@ -1801,7 +1900,8 @@ export class GatewayProxy {
     const method = (req.method ?? "GET").toUpperCase();
     // Forward the canonical path (matching the one policy evaluated in
     // onInnerRequest) so the executed LLM request equals the matched request.
-    const path = normalizeRequestPath(req.url ?? "/");
+    // onInnerRequest already rejected any target with a rejectReason.
+    const { path, forward: forwardPath } = canonicalizeRequestTarget(req.url ?? "/");
     const llm = integration.llm!;
     if (route.connections.length === 0) {
       this.respondAllInactive(res, agent, integration, host, method, path, route.inactive);
@@ -1930,7 +2030,7 @@ export class GatewayProxy {
         const injectCtx = {
           headers,
           method,
-          path,
+          path: forwardPath,
           host,
           // Synthetic credential carrying the SELECTED connection's data.
           credential: {

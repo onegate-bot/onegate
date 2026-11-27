@@ -608,6 +608,23 @@ function ensureDataDir(dir: string): void {
   }
 }
 
+
+/** Upper bound for an onboarding (connect) link lifetime, matching the admin UI. */
+export const MAX_ONBOARDING_LINK_TTL_DAYS = 90;
+
+/**
+ * Validates an untrusted `ttlDays` value for an onboarding link. Returns
+ * `undefined` when absent (use the default), the number when it is an integer
+ * from 1 to MAX_ONBOARDING_LINK_TTL_DAYS, and `null` when it is anything else
+ * (callers answer 400).
+ */
+export function parseOnboardingTtlDays(value: unknown): number | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  if (value < 1 || value > MAX_ONBOARDING_LINK_TTL_DAYS) return null;
+  return value;
+}
+
 export class Store {
   private db: DatabaseSync;
   private secrets: SecretBox;
@@ -2410,7 +2427,13 @@ export class Store {
     /** Set for a RENEWAL link: the allow rule whose lease it re-stamps. */
     ruleId?: string | null;
   }): OnboardingLink {
-    const ttlDays = input.ttlDays && input.ttlDays > 0 ? input.ttlDays : 7;
+    // Callers validate untrusted input with parseOnboardingTtlDays first; this
+    // guard keeps an out-of-range value from reaching toISOString (which throws
+    // RangeError past year 275760) with a clear message instead.
+    if (input.ttlDays !== undefined && parseOnboardingTtlDays(input.ttlDays) === null) {
+      throw new Error(`ttlDays must be an integer from 1 to ${MAX_ONBOARDING_LINK_TTL_DAYS}`);
+    }
+    const ttlDays = input.ttlDays ?? 7;
     const createdAt = now();
     const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString();
     const scopes = input.scopes && input.scopes.length ? input.scopes : null;

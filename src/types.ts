@@ -319,6 +319,8 @@ export type Decision =
   | "unknown_connection"
   | "connection_not_granted"
   | "body_too_large"
+  /** The request target was not origin-form (absolute-form `http://...` or `*`). */
+  | "invalid_path"
   /** Every usable connection for the request is inactive (see Connection.inactiveAt). */
   | "connection_inactive"
   /** Not a request outcome: a connection was just taken out of rotation. */

@@ -57,6 +57,51 @@ function rfc3986(s: string): string {
   );
 }
 
+/** Bytes of a wire path: `%XX` is one byte, anything else its UTF-8 bytes. */
+function pathBytes(path: string, decode: boolean): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < path.length; i++) {
+    const ch = path[i];
+    if (decode && ch === "%" && /^[0-9a-fA-F]{2}$/.test(path.slice(i + 1, i + 3))) {
+      out.push(parseInt(path.slice(i + 1, i + 3), 16));
+      i += 2;
+      continue;
+    }
+    const cp = path.codePointAt(i)!;
+    if (cp > 0xffff) i++; // surrogate pair consumed
+    for (const b of Buffer.from(String.fromCodePoint(cp), "utf8")) out.push(b);
+  }
+  return out;
+}
+
+/** AWS UriEncode over bytes: unreserved and `/` stay, every other byte is `%XX`. */
+function awsUriEncodeBytes(bytes: number[]): string {
+  let out = "";
+  for (const b of bytes) {
+    const unreserved =
+      (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || (b >= 0x30 && b <= 0x39) ||
+      b === 0x2d || b === 0x2e || b === 0x5f || b === 0x7e || b === 0x2f;
+    out += unreserved ? String.fromCharCode(b) : "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+/**
+ * The SigV4 CanonicalURI for the path as it goes on the wire. AWS servers
+ * derive it from the received path, not from however the client happened to
+ * escape it, so it must be computed, not copied:
+ *  - S3 encodes the DECODED object key once with UriEncode, so a key holding
+ *    `;`, `?`, `:` or a space signs as `%3B`, `%3F`, `%3A`, `%20` whether the
+ *    wire carried it raw (sub-delims) or escaped.
+ *  - Every other service UriEncodes the wire path again ("encoded twice"), so
+ *    `%20` on the wire signs as `%2520`.
+ * For paths of only unreserved characters both reduce to the path itself.
+ */
+export function canonicalUri(wirePath: string, service: string): string {
+  if (!wirePath) return "/";
+  return awsUriEncodeBytes(pathBytes(wirePath, service === "s3"));
+}
+
 function canonicalQuery(rawQuery: string): string {
   if (!rawQuery) return "";
   const pairs: Array<[string, string]> = [];
@@ -86,7 +131,7 @@ export function deriveSigningKey(
 
 export interface SignV4Params {
   method: string;
-  /** Path as sent by the agent, query string included. */
+  /** Path as sent on the wire (percent-encoded), query string included. */
   path: string;
   /** Mutated in place: x-amz-date, authorization (and friends) are set. */
   headers: IncomingHttpHeaders;
@@ -140,7 +185,7 @@ export function signV4(p: SignV4Params): void {
 
   const canonicalRequest = [
     p.method.toUpperCase(),
-    rawPath || "/",
+    canonicalUri(rawPath, p.service),
     canonicalQuery(rawQuery),
     canonicalHeaders,
     signedHeaders,

@@ -46,7 +46,7 @@ OneGate is a single Node.js process with two listeners and one SQLite database
 2. The token's sha256 is looked up. Unknown token: `407` and an `auth_failed` audit row.
 3. The target host is resolved against integration host lists (exact match, or dot-prefix suffix match like `.googleapis.com`). No match, or port other than 443: raw TCP passthrough, audited as `passthrough`, never decrypted.
 4. On a match the gateway replies `200 Connection Established` and wraps the socket in server-side TLS using a leaf certificate for that host minted from the install-time root CA (this is why agents must trust the root).
-5. Each HTTP request inside the tunnel is evaluated by the policy engine. Deny: `403 onegate_policy_denied`, audited.
+5. Each HTTP request inside the tunnel is canonicalized (see "Request path canonicalization" below) and evaluated by the policy engine. A target that is not an absolute path (absolute-form `http://...`, `*`): `400 onegate_invalid_path`, audited as `invalid_path`. Deny: `403 onegate_policy_denied`, audited.
 6. The integration's `inject()` rewrites headers (replacing the agent's placeholder credential with the real one). No stored credential: `502 onegate_no_credential`.
 7. The gateway opens a **direct** TLS connection to the real vendor (dedicated keep-alive agent, never an ambient proxy), forwards the request, streams the response back, and writes an `allow` audit row with the upstream status.
 
@@ -64,7 +64,17 @@ Rules have: scope (`agent` or `project`), subject id, integration id (or `*`), H
 
 Evaluation for a request: collect the agent's own rules plus its project's rules, check deny rules first (any match wins), then allow rules, otherwise fall back to the agent's default policy (`allow-all` or `deny-unmatched`).
 
-Path globs: `*` matches one path segment, `**` matches anything. Query strings are excluded from matching. Globs are compiled to anchored regexes and cached.
+Path globs: `*` matches one path segment, `**` matches anything (including a decoded newline). Query strings are excluded from matching. Globs are compiled to anchored regexes and cached.
+
+### Request path canonicalization
+
+`canonicalizeRequestTarget` (`src/policy.ts`) turns the request target into two views of ONE path, so the request policy matched is the request the vendor serves:
+
+- **Policy view** (`normalizeRequestPath`): the path part (before the first raw `?`) is percent-decoded exactly once, then `.`/`..` segments and duplicate slashes are collapsed. The query string is kept verbatim and never decoded. Policy, path-scoped host claims, approvals and audit all use this view. One escape: a decoded `?` (only reachable as `%3F`) is written back as `%3F`, so the matcher's query split always lands on the real query separator. A literal `%3F` text (sent as `%253F`) therefore reads the same to policy; only a glob containing `%3F` could tell them apart.
+- **Wire view**: the same canonical path re-encoded by `encodePathForUpstream`. Every byte outside RFC 3986 `pchar` is percent-encoded, including `%`, `?`, `#`, `\`, space and control characters, and so is `;`. `/` stays the separator, and the other sub-delims plus `:` and `@` stay raw (Google `name:method`, Telegram `/bot<id>:<token>/`). The vendor's single decode therefore yields exactly the policy view, and a decoded space can never reach `https.request` raw (it used to throw there and crash the process). Encoding the delimiters is what closes path confusion: `/v1/admin;x/users` goes out as `/v1/admin%3Bx/users`, which Tomcat-style servers do not split into a path parameter (they parse `;` on the undecoded path), and `%5C` and `%23` are plain data too. S3 keys and other ids that contain `;` or `?` work unchanged. The query gets only wire-safety encoding (space, controls, non-ASCII). `inject()` sees the wire view in `ctx.path`. The AWS signer derives the SigV4 canonical URI from it the way AWS does (S3: decoded key UriEncoded once; other services: wire path UriEncoded again), so the signature matches what is sent.
+- **Deny also matches the lenient reading.** A deny rule additionally matches the path with `\` read as `/` and `;params` stripped from each segment, which is how an IIS- or Tomcat-style server could route it after decoding. This only refuses more, in the same way deny already matches case-insensitively. Allow rules never use it.
+- **`%2F` is a separator.** It decodes to `/` and is forwarded as `/` (this is what makes `/repos%2Fowner%2Frepo` hit a `/repos/owner/repo/**` deny). A vendor that needs a literal `%2F` inside one segment (GitLab `projects/group%2Fproject`) must be addressed by an alternative form (GitLab's numeric project id) or double-encoded (`%252F`, which policy sees as the literal text `%2F` and the vendor receives as `%252F`).
+- **Refused (400, audited `invalid_path`)**: any target that does not canonicalize to an absolute path (absolute-form `http://...`, asterisk-form `*`).
 
 Google's products share hosts (Calendar and Drive both live on `www.googleapis.com`), so per-product permission is expressed with path globs, e.g. allow `/calendar/**` but not `/drive/**`.
 
@@ -108,7 +118,7 @@ Token accounting is best effort (`src/llm/usage.ts`): on the success path the pr
 
 Every audit row records a raw `decision` and upstream `status`, but those alone do not tell an operator (or the agent's owner) who actually blocked a request. A `403` could be OneGate refusing on policy, or the vendor itself rejecting the call. To make that legible, `GET /api/audit` derives two extra fields at read time from the existing columns (`src/audit-meta.ts`), so no migration is needed and historical rows are labelled retroactively:
 
-- **`source`** is `onegate` when the row is one of OneGate's own blocks (`deny`, `auth_failed`, `no_credential`, `unknown_connection`, `connection_not_granted`, `body_too_large`), and `upstream` for `allow` and `passthrough` rows where the request reached the vendor.
+- **`source`** is `onegate` when the row is one of OneGate's own blocks (`deny`, `auth_failed`, `no_credential`, `unknown_connection`, `connection_not_granted`, `body_too_large`, `invalid_path`), and `upstream` for `allow` and `passthrough` rows where the request reached the vendor.
 - **`reason`** is a short plain-words explanation for any non-clean outcome (for example "Blocked by OneGate: no allow rule matches this agent and integration. Add an allow rule to permit it."), and `null` for a clean success.
 
 An `allow` row for a call that a `require_approval` rule held also carries the `approvalId` that let it through (stored, in a column added by the idempotent audit migration), and its `reason` reads "Allowed by OneGate after owner approval <id>". See [SECURITY.md](SECURITY.md) for how approvals are bound to the request and redeemed once.

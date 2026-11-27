@@ -133,12 +133,138 @@ function collapsePath(path: string): string {
  * ensuring the matched request equals the request forwarded upstream.
  */
 export function normalizeRequestPath(target: string): string {
+  return canonicalizeRequestTarget(target).path;
+}
+
+/** The two views of one request target, plus a rejection verdict. */
+export interface CanonicalTarget {
+  /**
+   * The policy view: the canonical DECODED path plus the original query
+   * (verbatim). This is what policy, path-scoped host claims, approvals and
+   * audit see. Identical to normalizeRequestPath(target).
+   *
+   * One escape: a decoded `?` inside the path (only reachable as `%3F`) is
+   * written back as `%3F`, so the first literal `?` in this string is always
+   * the real query separator. Without that, the matcher (which strips the
+   * query at the first `?`) would match `/v1/x%3F/admin/users` as `/v1/x`.
+   */
+  path: string;
+  /**
+   * The wire form forwarded upstream: the same canonical path percent-encoded
+   * by encodePathForUpstream (so the vendor's single decode yields exactly the
+   * decoded path policy matched), plus the original query made wire-safe by
+   * sanitizeQueryForUpstream. Only meaningful when `rejectReason` is null.
+   */
+  forward: string;
+  /**
+   * Non-null when the target is not origin-form (absolute-form `http://...`,
+   * asterisk-form `*`): it does not canonicalize to a path starting with `/`.
+   * The proxy answers 400 and audits `invalid_path`; it never forwards.
+   */
+  rejectReason: string | null;
+}
+
+/**
+ * True for a code unit that may appear unencoded in a forwarded path segment:
+ * RFC 3986 `pchar` minus `%` (always encoded, so a literal `%` the policy saw
+ * stays literal) and minus `;`. pchar = unreserved / sub-delims / ":" / "@".
+ *
+ * `;` is a sub-delim, but servers treat a LITERAL `;` as the start of a path
+ * parameter and strip `;params` before routing (Tomcat/Spring/Jetty), so
+ * `/v1/admin;x/users` would be `/v1/admin/users` upstream. Encoded as `%3B` it
+ * is plain data to every server (path-param parsing runs on the undecoded
+ * path), which is what lets S3 keys and other ids carry a `;`. `?`, `#` and
+ * `\` are not pchar, so they are always encoded too (`%3F`, `%23`, `%5C`).
+ * The remaining sub-delims plus `:`/`@` stay raw: they have no routing meaning
+ * inside a path and some APIs expect them literally (Google `name:method`
+ * custom methods, Telegram `/bot<id>:<token>/`).
+ */
+function isSafePathChar(c: number): boolean {
+  return (
+    (c >= 0x61 && c <= 0x7a) || // a-z
+    (c >= 0x41 && c <= 0x5a) || // A-Z
+    (c >= 0x30 && c <= 0x39) || // 0-9
+    c === 0x2d || c === 0x2e || c === 0x5f || c === 0x7e || // - . _ ~
+    c === 0x21 || c === 0x24 || c === 0x26 || c === 0x27 || // ! $ & '
+    c === 0x28 || c === 0x29 || c === 0x2a || c === 0x2b || // ( ) * +
+    c === 0x2c || c === 0x3d || // , =
+    c === 0x3a || c === 0x40 // : @
+  );
+}
+
+function pctByte(b: number): string {
+  return "%" + b.toString(16).toUpperCase().padStart(2, "0");
+}
+
+/**
+ * Percent-encodes every code point of `s` that `keep` rejects. Code units up to
+ * 0xFF are bytes (decodeOnce emits one code unit per decoded byte, and Node
+ * hands us the request line as latin1), so they encode as a single `%XX` and the
+ * original bytes are preserved exactly. Anything above 0xFF is UTF-8 encoded.
+ */
+function encodeCodeUnits(s: string, keep: (c: number) => boolean): string {
+  let out = "";
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (c <= 0xff) {
+      out += keep(c) ? ch : pctByte(c);
+    } else {
+      for (const b of Buffer.from(ch, "utf8")) out += pctByte(b);
+    }
+  }
+  return out;
+}
+
+/**
+ * Encodes an already-canonical DECODED path for the wire. Every code unit
+ * outside RFC 3986 `pchar` is percent-encoded, INCLUDING `%`, `?`, `#`, space
+ * and control characters; `/` is preserved as the segment separator. The
+ * result always passes Node's request-path validation (so https.request can
+ * never throw ERR_UNESCAPED_CHARACTERS on it), and a vendor that decodes the
+ * path once sees exactly the decoded path policy matched.
+ *
+ * Note on `%2F`: normalizeRequestPath decodes `%2F` to `/` and treats it as a
+ * real separator (that is what closes `/repos%2Fowner%2Frepo` deny evasion), so
+ * it is forwarded as `/`, never re-encoded. A literal `%2F` inside a segment
+ * can only be expressed by double-encoding (`%252F`), which policy sees as the
+ * literal text `%2F` and the vendor receives as `%252F`.
+ */
+export function encodePathForUpstream(decodedPath: string): string {
+  return encodeCodeUnits(decodedPath, (c) => c === 0x2f || isSafePathChar(c));
+}
+
+/**
+ * Makes the (never decoded, never matched) query string wire-safe without
+ * changing its meaning: existing `%XX` escapes and all printable ASCII are kept
+ * verbatim; only space, control characters and non-ASCII are encoded. Normally
+ * a no-op, since Node's HTTP parser rejects such bytes in the request line.
+ */
+export function sanitizeQueryForUpstream(query: string): string {
+  return encodeCodeUnits(query, (c) => c > 0x20 && c < 0x7f);
+}
+
+/**
+ * Canonicalizes a request target into the policy view and the upstream wire
+ * view (see CanonicalTarget). The path portion (everything before the first
+ * raw `?`) is decoded once and collapsed; the query is kept verbatim.
+ */
+export function canonicalizeRequestTarget(target: string): CanonicalTarget {
   const qIdx = target.indexOf("?");
   const rawPath = qIdx === -1 ? target : target.slice(0, qIdx);
   const query = qIdx === -1 ? "" : target.slice(qIdx); // includes leading "?"
   const decoded = decodeOnce(rawPath);
   const canonical = collapsePath(decoded);
-  return canonical + query;
+  // Absolute-form (`http://host/...`) and asterisk-form (`*`) targets have no
+  // place inside a terminated tunnel, and collapsing them yields a path with no
+  // leading slash that no glob was written for.
+  const rejectReason = canonical.startsWith("/")
+    ? null
+    : "The request target must be an absolute path starting with '/'.";
+  return {
+    path: canonical.replace(/\?/g, "%3F") + query,
+    forward: encodePathForUpstream(canonical) + sanitizeQueryForUpstream(query),
+    rejectReason,
+  };
 }
 
 /**
@@ -173,8 +299,12 @@ export function globToRegExp(glob: string, caseInsensitive = false): RegExp {
     .replace(/[.+^${}()|[\]\\?]/g, "\\$&")
     .replace(/\*\*/g, "\0")
     .replace(/\*/g, "[^/]*")
-    .replace(/\0/g, ".*");
-  const escaped = trailing ? `${escapedBase}(/.*)?` : escapedBase;
+    .replace(/\0/g, "[\\s\\S]*");
+  // `**` must match EVERY character, including a decoded CR/LF (`%0a`), so it
+  // compiles to `[\s\S]*`, not `.*`: `.` stops at a newline while `[^/]*` (from
+  // `*`) does not, so a deny `/x/**` would miss `/x/y%0a` that an allow `/x/*`
+  // matches.
+  const escaped = trailing ? `${escapedBase}(/[\\s\\S]*)?` : escapedBase;
   re = new RegExp(`^${escaped}$`, caseInsensitive ? "i" : "");
   globCache.set(cacheKey, re);
   return re;
@@ -215,7 +345,37 @@ export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   // path segments (S3 object keys, Drive file ids, base64 identifiers), where
   // an allow of `/files/AbC` matching `/files/abc` would grant access to a
   // DIFFERENT object. Widening an allow is fail-OPEN, so it is not done.
-  return globToRegExp(rule.pathGlob, rule.effect === "deny").test(path);
+  //
+  // DENY also matches the path-confusion reading of the path (see
+  // confusionVariant). The forwarded path encodes `;` and `\`, so a
+  // spec-following vendor treats them as data, but a deny only ever refuses
+  // more, so it is also checked against how a lenient server could route it.
+  if (rule.effect === "deny") {
+    const re = globToRegExp(rule.pathGlob, true);
+    if (re.test(path)) return true;
+    const variant = confusionVariant(path);
+    return variant !== path && re.test(variant);
+  }
+  return globToRegExp(rule.pathGlob, false).test(path);
+}
+
+/**
+ * The path as a lenient upstream might route it: `\` read as `/` (IIS-style
+ * servers) and `;params` stripped from each segment (Tomcat-style servers),
+ * then dot-segments and duplicate slashes collapsed again. Used ONLY to widen
+ * deny matching; never forwarded and never used for allow (fail-safe only).
+ */
+function confusionVariant(path: string): string {
+  if (!path.includes(";") && !path.includes("\\")) return path;
+  const swapped = path.replace(/\\/g, "/");
+  const stripped = swapped
+    .split("/")
+    .map((seg) => {
+      const semi = seg.indexOf(";");
+      return semi === -1 ? seg : seg.slice(0, semi);
+    })
+    .join("/");
+  return collapsePath(stripped);
 }
 
 /**
