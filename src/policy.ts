@@ -31,6 +31,12 @@ export interface PolicyRequest {
    *   - a string: the resolved connection id.
    */
   connectionId?: string | null;
+  /**
+   * The destination host (the CONNECT authority, without port), when known.
+   * Only host-qualified globs (see parseHostQualifiedGlob) consult it; a
+   * host-qualified rule never matches a request that carries no host.
+   */
+  host?: string;
 }
 
 export interface PolicyResult {
@@ -180,6 +186,164 @@ export function globToRegExp(glob: string, caseInsensitive = false): RegExp {
   return re;
 }
 
+/**
+ * Host-qualified globs.
+ *
+ * A rule's `pathGlob` normally starts with `/` and is matched against the
+ * request path only. A pathGlob that does NOT start with `/` and whose first
+ * segment (everything before the first `/`) looks like a DNS name with at least
+ * two labels is HOST-QUALIFIED:
+ *
+ *     <hostGlob>[/<pathGlob>]
+ *
+ *   `http-intake.logs.us5.datadoghq.com/**`  that host, every path
+ *   `*.datadoghq.com`                         any ONE label under datadoghq.com
+ *   `**.datadoghq.com/**`                     datadoghq.com and every subdomain
+ *   `api.example.com/v1/admin/**`             that host, only under /v1/admin
+ *
+ * Host part, matched label by label against the lowercased host (a single
+ * trailing dot on the host is ignored, so `example.com.` cannot dodge a rule):
+ *   - case-insensitive, always (DNS names are case-insensitive);
+ *   - a label `*` matches exactly one label; `*` inside a label
+ *     (`api-*.example.com`) matches any run of characters within that label;
+ *   - a label `**` matches ZERO or more labels, so `**.example.com` also matches
+ *     the apex `example.com` (mirrors the path rule that `/x/**` matches `/x`);
+ *   - it must contain at least one literal label (no wildcard), so a catch-all
+ *     like `*.*` or `**.**` is rejected rather than silently matching the world.
+ *
+ * Path part: an absent path part means `/**`. When present it is an ordinary
+ * path glob (with the leading `/` restored) and keeps the exact path semantics,
+ * including the deny-case-insensitive / allow-case-sensitive asymmetry.
+ *
+ * Backward compatibility: a legacy pathGlob without a leading `/` and without a
+ * dot in its first segment (e.g. `**`) is NOT host-qualified and keeps its old
+ * regex behaviour, so no stored rule changes meaning. New rules can no longer
+ * be created that way (see validatePathGlob).
+ */
+export interface HostQualifiedGlob {
+  hostGlob: string;
+  pathGlob: string;
+}
+
+const HOST_GLOB_LABEL = /^(\*\*|[a-z0-9*-]+)$/;
+
+/**
+ * Parses a host-qualified glob, or returns null when `glob` is a plain path glob
+ * (starts with `/`) or is not a well-formed host-qualified glob.
+ */
+export function parseHostQualifiedGlob(glob: string): HostQualifiedGlob | null {
+  if (glob.startsWith("/")) return null;
+  const slash = glob.indexOf("/");
+  const hostGlob = (slash === -1 ? glob : glob.slice(0, slash)).toLowerCase();
+  const pathGlob = slash === -1 ? "/**" : glob.slice(slash);
+  const labels = hostGlob.split(".");
+  if (labels.length < 2) return null;
+  if (!labels.every((l) => HOST_GLOB_LABEL.test(l))) return null;
+  // `**` must be a whole label (rejects `a**b`), and at least one label must be
+  // literal so the host part always pins something.
+  if (labels.some((l) => l !== "**" && l.includes("**"))) return null;
+  if (!labels.some((l) => !l.includes("*"))) return null;
+  return { hostGlob, pathGlob };
+}
+
+/** True when `glob` is a valid host-qualified glob. */
+export function isHostQualifiedGlob(glob: string): boolean {
+  return parseHostQualifiedGlob(glob) !== null;
+}
+
+/** Thrown by validatePathGlob for a glob that can never be what was meant. */
+export class InvalidPathGlobError extends Error {}
+
+/**
+ * Validates a pathGlob at rule-creation time. Accepted: a path glob starting
+ * with `/`, or a valid host-qualified glob. Anything else (`**`, `api/v1/**`,
+ * `*.*`, `bad_host.com/**`) is rejected: it would either match nothing or not
+ * mean what it reads as, and a silently inert deny rule is the failure mode
+ * this guards against.
+ */
+export function validatePathGlob(glob: string): void {
+  if (glob.startsWith("/")) return;
+  if (isHostQualifiedGlob(glob)) return;
+  throw new InvalidPathGlobError(
+    `invalid path glob "${glob}": use a path starting with "/" (e.g. "/v1/**"), or a host-qualified glob ` +
+      `"<host>[/<path>]" (e.g. "api.example.com/**", "*.example.com", "**.example.com/v1/**"); ` +
+      `host labels may be "*" (one label) or "**" (any number of labels) and at least one label must be literal`,
+  );
+}
+
+/** Lowercases a host and drops a single trailing root dot. */
+function canonicalHost(host: string): string {
+  const h = host.toLowerCase();
+  return h.endsWith(".") ? h.slice(0, -1) : h;
+}
+
+const labelCache = new Map<string, RegExp>();
+function labelMatches(pattern: string, label: string): boolean {
+  if (pattern === "*") return label.length > 0;
+  if (!pattern.includes("*")) return pattern === label;
+  let re = labelCache.get(pattern);
+  if (!re) {
+    // Labels are validated to [a-z0-9*-], so `*` is the only regex-significant
+    // character and needs no further escaping.
+    re = new RegExp(`^${pattern.replace(/\*/g, "[^.]*")}$`);
+    labelCache.set(pattern, re);
+  }
+  return re.test(label);
+}
+
+/**
+ * Matches a host against the host part of a host-qualified glob (see
+ * parseHostQualifiedGlob for the semantics). Always case-insensitive.
+ */
+export function hostGlobMatches(hostGlob: string, host: string): boolean {
+  const pat = hostGlob.toLowerCase().split(".");
+  const labels = canonicalHost(host).split(".");
+  // Memoised (pattern index, label index) walk; `**` is the only branching
+  // label, so this is O(pat * labels) at worst.
+  const memo = new Map<number, boolean>();
+  const walk = (i: number, j: number): boolean => {
+    const key = i * (labels.length + 1) + j;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    let ok: boolean;
+    if (i === pat.length) ok = j === labels.length;
+    else if (pat[i] === "**") ok = walk(i + 1, j) || (j < labels.length && walk(i, j + 1));
+    else ok = j < labels.length && labelMatches(pat[i], labels[j]) && walk(i + 1, j + 1);
+    memo.set(key, ok);
+    return ok;
+  };
+  return walk(0, 0);
+}
+
+/**
+ * Passthrough (opaque tunnel) enforcement: returns the first live DENY rule
+ * whose host-qualified glob's HOST part matches `host`, or null.
+ *
+ * A passthrough is a raw byte pipe, so neither the method nor the path is ever
+ * visible. The rule's method list and path part are therefore IGNORED here and
+ * a matching deny blocks the whole host (fail-closed): a deny on
+ * `api.example.com/v1/admin/**` refuses every tunnel to api.example.com. The
+ * integration id is ignored too, for the same reason: a passthrough host is by
+ * definition not owned by an integration, and the host in the glob names the
+ * destination explicitly. A require_approval rule (persisted as effect "deny")
+ * cannot be held on an opaque tunnel, so it blocks as well.
+ *
+ * Connection-scoped rules never apply (a passthrough has no app connection),
+ * lapsed rules are skipped, and ALLOW rules are not consulted: passthrough
+ * stays default-open, exactly as before.
+ */
+export function passthroughDenyRule(rules: Rule[], host: string, nowMs: number = Date.now()): Rule | null {
+  for (const rule of rules) {
+    if (rule.effect !== "deny") continue;
+    if (rule.connectionScope) continue;
+    if (ruleLapsed(rule, nowMs)) continue;
+    const hq = parseHostQualifiedGlob(rule.pathGlob);
+    if (!hq) continue;
+    if (hostGlobMatches(hq.hostGlob, host)) return rule;
+  }
+  return null;
+}
+
 export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   if (rule.integrationId !== "*" && rule.integrationId !== req.integrationId) return false;
   if (!rule.methods.includes("*") && !rule.methods.includes(req.method.toUpperCase())) return false;
@@ -215,7 +379,17 @@ export function ruleMatches(rule: Rule, req: PolicyRequest): boolean {
   // path segments (S3 object keys, Drive file ids, base64 identifiers), where
   // an allow of `/files/AbC` matching `/files/abc` would grant access to a
   // DIFFERENT object. Widening an allow is fail-OPEN, so it is not done.
-  return globToRegExp(rule.pathGlob, rule.effect === "deny").test(path);
+  //
+  // A host-qualified glob (`<host>[/<path>]`, see parseHostQualifiedGlob)
+  // matches only when the request carries a host and that host matches; the
+  // path part then follows exactly the same rules as a plain path glob.
+  let pathGlob = rule.pathGlob;
+  const hq = parseHostQualifiedGlob(pathGlob);
+  if (hq) {
+    if (req.host === undefined || !hostGlobMatches(hq.hostGlob, req.host)) return false;
+    pathGlob = hq.pathGlob;
+  }
+  return globToRegExp(pathGlob, rule.effect === "deny").test(path);
 }
 
 /**

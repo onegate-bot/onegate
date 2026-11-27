@@ -8,7 +8,9 @@
  *  - host owned by an integration → TLS-terminate with a minted leaf cert,
  *    parse the inner HTTP, enforce policy, inject credentials, bridge to the
  *    real vendor over fresh TLS, stream the response back.
- *  - any other host → opaque passthrough tunnel (no MITM, no inspection).
+ *  - any other host → opaque passthrough tunnel (no MITM, no inspection). The
+ *    only rules that bite there are host-qualified DENY rules (see
+ *    passthroughDenyRule in policy.ts), which refuse the whole host.
  */
 
 import { createHash } from "node:crypto";
@@ -20,7 +22,7 @@ import tls from "node:tls";
 import type { Duplex } from "node:stream";
 import type { Ca, LeafCert } from "../ca.js";
 import type { Store } from "../store/db.js";
-import { evaluate, normalizeRequestPath } from "../policy.js";
+import { evaluate, normalizeRequestPath, passthroughDenyRule } from "../policy.js";
 import type { Agent, Approval, Connection, LlmStrategy, OwnerNotification, Rule } from "../types.js";
 import { connectFlowKind, type Integration, type Registry } from "../integrations/types.js";
 import { onSelectionError, selectConnection } from "../llm/strategy.js";
@@ -513,6 +515,27 @@ export class GatewayProxy {
    * and the connect cannot land us on a blocked address (DNS rebinding).
    */
   private passthrough(agent: Agent, host: string, port: number, socket: Duplex, head: Buffer): void {
+    // Host-qualified DENY rules (`<host>[/<path>]` globs) are the one piece of
+    // policy that can apply to an opaque tunnel: the CONNECT host is the only
+    // thing visible. Checked before the upstreamLookup override and before DNS
+    // resolution, so a denied host is never resolved or dialled. The path part
+    // and methods of the rule cannot be seen through the tunnel, so a match
+    // refuses the whole host (fail-closed). Allow rules are not consulted:
+    // passthrough stays default-open for hosts no deny names.
+    const denyRule = passthroughDenyRule(this.opts.store.rulesForAgent(agent), host);
+    if (denyRule) {
+      this.opts.store.audit({
+        agentId: agent.id,
+        agentName: agent.name,
+        host,
+        decision: "deny",
+        ruleId: denyRule.id,
+        status: 403,
+      });
+      this.log(`passthrough denied ${agent.name} -> ${host}:${port} (rule ${denyRule.id})`);
+      socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+      return;
+    }
     const override = this.opts.upstreamLookup?.(host, port);
     if (override) {
       // An upstreamLookup target is operator-sanctioned (it is how tests and
@@ -1282,7 +1305,7 @@ export class GatewayProxy {
       ctx.integration;
 
     const rules = this.opts.store.rulesForAgent(agent);
-    const verdict = evaluate(agent, rules, { integrationId: integration.id, method, path });
+    const verdict = evaluate(agent, rules, { integrationId: integration.id, method, path, host });
 
     // When phase-1 evaluated to DENY but a connection-scoped rule was held
     // pending (verdict.needsConnection), the deny is not final: a
@@ -1304,6 +1327,7 @@ export class GatewayProxy {
         integrationId: integration.id,
         method,
         path,
+        host,
         connectionId: r.connection?.id ?? null,
       });
     }
@@ -1514,6 +1538,7 @@ export class GatewayProxy {
           integrationId: integration.id,
           method,
           path,
+          host,
           connectionId: selectedConnection?.id ?? null,
         });
         if (finalVerdict.effect === "deny") {
@@ -1824,6 +1849,7 @@ export class GatewayProxy {
         integrationId: integration.id,
         method,
         path,
+        host,
         connectionId: conn.id,
       });
       if (finalVerdict.effect !== "deny") return false;

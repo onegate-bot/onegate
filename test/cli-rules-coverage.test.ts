@@ -213,6 +213,41 @@ describe("cli rules: add defaults and human output", () => {
 describe("cli rules: required-flag validation", () => {
   const usage = "usage: onegate rules add --scope agent|project";
 
+  it("rejects a --path that is neither /... nor host-qualified, before calling the API", async () => {
+    const { err, exit } = await run(
+      "rules",
+      "add",
+      "--scope",
+      "agent",
+      "--subject",
+      agentId,
+      "--integration",
+      "*",
+      "--effect",
+      "deny",
+      "--path",
+      "logs/**",
+    );
+    expect(exit).toBe(1);
+    expect(err).toContain('invalid --path: invalid path glob "logs/**"');
+  });
+
+  it("accepts a host-qualified --path", async () => {
+    const rule = await addRule(
+      "--scope",
+      "agent",
+      "--subject",
+      agentId,
+      "--integration",
+      "*",
+      "--effect",
+      "deny",
+      "--path",
+      "http-intake.logs.us5.datadoghq.com/**",
+    );
+    expect(rule.pathGlob).toBe("http-intake.logs.us5.datadoghq.com/**");
+  });
+
   it("rejects a missing --scope", async () => {
     const { err, exit } = await run(
       "rules",
