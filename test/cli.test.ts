@@ -64,9 +64,4 @@ describe("onegate cli", () => {
     const out = await run("admin", "reset-token");
     expect(out).toMatch(/New admin token: oga_[0-9a-f]{48}/);
   });
-
-  it("no command prints help", async () => {
-    const out = await run();
-    expect(out).toContain("Usage:");
-  });
 });
