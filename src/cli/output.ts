@@ -9,10 +9,6 @@ export function setJsonMode(on: boolean): void {
   jsonMode = on;
 }
 
-export function isJsonMode(): boolean {
-  return jsonMode;
-}
-
 /**
  * Emits a result. In --json mode the value is printed as pretty JSON and the
  * human lines are skipped. Otherwise `human` is called to print friendly text.

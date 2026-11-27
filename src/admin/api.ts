@@ -41,6 +41,40 @@ const ADMIN_TOKEN_KEY = "admin_token_hash";
  */
 export const OAUTH_PENDING_TTL_MS = 600_000;
 
+/**
+ * Upper bound for any lease / TTL expressed in seconds (rules, integration
+ * lease defaults, wizard lease overrides): 10 years. Anything larger cannot be
+ * turned into a Date (`new Date(Date.now() + ttl * 1000)` throws a RangeError)
+ * and is never a meaningful time box anyway.
+ */
+export const MAX_TTL_SECONDS = 10 * 365 * 24 * 3600;
+
+const DEFAULT_POLICIES = new Set(["allow-all", "deny-unmatched"]);
+
+/**
+ * Collapses an Express query value to a single string. Repeated keys
+ * (`?error=a&error=b`) parse to arrays and bracketed keys to objects; public
+ * routes must never pass either into string handling. The first string wins.
+ */
+function queryString(v: unknown): string | undefined {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.find((x): x is string => typeof x === "string");
+  return undefined;
+}
+
+/**
+ * Parses a seconds TTL from a JSON body: a finite number (or numeric string)
+ * in [0, MAX_TTL_SECONDS]. Booleans, objects, NaN and out-of-range values are
+ * null (the caller answers 400).
+ */
+function parseTtlSeconds(raw: unknown): number | null {
+  if (typeof raw !== "number" && typeof raw !== "string") return null;
+  if (typeof raw === "string" && raw.trim() === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > MAX_TTL_SECONDS) return null;
+  return n;
+}
+
 export function ensureAdminToken(store: Store): string | null {
   if (store.getSetting(ADMIN_TOKEN_KEY)) return null;
   const token = `oga_${randomBytes(24).toString("hex")}`;
@@ -479,7 +513,10 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(404).send(resultPage("Unknown integration", "This OneGate has no such OAuth integration."));
       return;
     }
-    const q = req.query as Record<string, string | undefined>;
+    // Coerce every query value to one string: a repeated key arrives as an
+    // array and would otherwise crash the HTML escaping below.
+    const q: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(req.query)) q[k] = queryString(v);
     if (q.error) {
       res
         .status(400)
@@ -651,7 +688,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     if (mode === "always") return 0;
     if (mode === "custom") {
       const h = Number(body.leaseHours);
-      return Number.isFinite(h) && h > 0 ? Math.round(h * 3600) : null;
+      const secs = Math.round(h * 3600);
+      return Number.isFinite(h) && h > 0 && secs <= MAX_TTL_SECONDS ? secs : null;
     }
     return null;
   }
@@ -1143,6 +1181,13 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "name_required" });
       return;
     }
+    if (defaultPolicy !== undefined && !DEFAULT_POLICIES.has(defaultPolicy)) {
+      res.status(400).json({
+        error: "invalid_default_policy",
+        message: 'defaultPolicy must be "allow-all" or "deny-unmatched"',
+      });
+      return;
+    }
     try {
       const { agent, token } = store.createAgent(name, { projectId, defaultPolicy });
       res.status(201).json({ ...publicAgent(agent), token });
@@ -1153,6 +1198,13 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   app.patch("/api/agents/:id", (req, res) => {
     const { name, projectId, defaultPolicy } = req.body ?? {};
+    if (defaultPolicy !== undefined && !DEFAULT_POLICIES.has(defaultPolicy)) {
+      res.status(400).json({
+        error: "invalid_default_policy",
+        message: 'defaultPolicy must be "allow-all" or "deny-unmatched"',
+      });
+      return;
+    }
     const updated = store.updateAgent(req.params.id, { name, projectId, defaultPolicy });
     if (!updated) {
       res.status(404).json({ error: "not_found" });
@@ -1321,9 +1373,13 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.json({ integrationId, ttlSeconds: null });
       return;
     }
-    const ttl = Number(raw);
-    if (!Number.isFinite(ttl) || ttl <= 0 || !Number.isInteger(ttl)) {
-      res.status(400).json({ error: "ttl_seconds_positive_integer_required" });
+    // A JSON number only: Number(true) would otherwise read as a 1s lease.
+    const ttl = typeof raw === "number" ? raw : NaN;
+    if (!Number.isInteger(ttl) || ttl <= 0 || ttl > MAX_TTL_SECONDS) {
+      res.status(400).json({
+        error: "ttl_seconds_positive_integer_required",
+        message: `ttlSeconds must be a positive integer up to ${MAX_TTL_SECONDS} (10 years), or 0/null to clear`,
+      });
       return;
     }
     store.setIntegrationLease(integrationId, ttl);
@@ -2404,6 +2460,33 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "scope, subjectId, integrationId and effect are required" });
       return;
     }
+    // Enum and type checks up front: an unknown value would otherwise reach the
+    // store's CHECK constraint and surface as a 500.
+    if (scope !== "agent" && scope !== "project") {
+      res.status(400).json({ error: "invalid_scope", message: 'scope must be "agent" or "project"' });
+      return;
+    }
+    if (effect !== "allow" && effect !== "deny") {
+      res.status(400).json({ error: "invalid_effect", message: 'effect must be "allow" or "deny"' });
+      return;
+    }
+    // Request paths always start with "/", so a glob must too (or open with a
+    // wildcard); anything else can never match and is an operator typo.
+    if (pathGlob != null && pathGlob !== "" && (typeof pathGlob !== "string" || !/^[/*]/.test(pathGlob))) {
+      res.status(400).json({ error: "invalid_path_glob", message: 'pathGlob must be a string starting with "/" or "*"' });
+      return;
+    }
+    let ttl: number | null = null;
+    if (ttlSeconds != null) {
+      ttl = parseTtlSeconds(ttlSeconds);
+      if (ttl === null) {
+        res.status(400).json({
+          error: "invalid_ttl_seconds",
+          message: `ttlSeconds must be a number between 0 and ${MAX_TTL_SECONDS} (10 years)`,
+        });
+        return;
+      }
+    }
     // Optional action layered on the effect. Only "require_approval" exists; an
     // unrecognised value is rejected rather than dropped, so a typo can never
     // silently degrade a gate into whatever `effect` happened to say.
@@ -2451,8 +2534,8 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     // A require_approval rule is stored with effect "deny", so a lease on it
     // would be a leased deny: meaningless, and on lapse it would read as a
     // lapsed grant. Leases stay an allow-only concept.
-    if (action == null && effect === "allow" && ttlSeconds != null && Number(ttlSeconds) > 0) {
-      leaseTtl = Math.floor(Number(ttlSeconds));
+    if (action == null && effect === "allow" && ttl !== null && Math.floor(ttl) > 0) {
+      leaseTtl = Math.floor(ttl);
       expiresAt = new Date(Date.now() + leaseTtl * 1000).toISOString();
     }
     // Canonicalize the verbs before persisting. An un-normalized method can
@@ -2462,11 +2545,9 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
     try {
       normalizedMethods = normalizeMethods(methods == null ? null : (methods as string[]));
     } catch (err) {
-      if (err instanceof InvalidMethodError) {
-        res.status(400).json({ error: "invalid_methods", message: err.message });
-        return;
-      }
-      throw err;
+      // normalizeMethods throws only InvalidMethodError.
+      res.status(400).json({ error: "invalid_methods", message: (err as InvalidMethodError).message });
+      return;
     }
     res.status(201).json(
       store.createRule({
@@ -2724,6 +2805,37 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
 
   const uiDir = join(dirname(fileURLToPath(import.meta.url)), "ui");
   app.use(express.static(uiDir));
+
+  // ---- final error handler ----
+  //
+  // Express's default handler renders the error's stack trace (with absolute
+  // server paths) whenever NODE_ENV is not "production", and the public routes
+  // are reachable unauthenticated. Log server-side, answer generically.
+  // Body-parser errors (malformed JSON, oversized form) keep their 4xx status.
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const e = err as { status?: unknown; statusCode?: unknown; type?: unknown; stack?: string; message?: string };
+    const s = typeof e?.status === "number" ? e.status : typeof e?.statusCode === "number" ? e.statusCode : 500;
+    const status = s >= 400 && s < 500 ? s : 500;
+    if (status === 500) console.error(`[admin] ${req.method} ${req.path} failed: ${e?.stack ?? String(err)}`);
+    const code =
+      status === 500 ? "internal_error" : status === 413 ? "payload_too_large" : e?.type === "entity.parse.failed" ? "invalid_json" : "bad_request";
+    if (req.path === "/api" || req.path.startsWith("/api/")) {
+      res.status(status).json({ error: code });
+      return;
+    }
+    res
+      .status(status)
+      .type("html")
+      .send(
+        status === 500
+          ? resultPage("Something went wrong", "OneGate could not complete this request. Try again, or restart the flow.")
+          : resultPage("Bad request", "OneGate could not read this request."),
+      );
+  });
 
   return app;
 }
