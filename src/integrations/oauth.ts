@@ -112,10 +112,31 @@ export class TokenEndpointError extends Error {
     super(message);
     this.name = "TokenEndpointError";
     this.status = status;
-    this.detail = detail;
+    this.detail = redactTokenBody(detail);
     // Server log only. The proxy echoes `message` to the agent, never `detail`.
-    if (detail) console.warn(`onegate: ${message}: ${detail}`);
+    if (this.detail) console.warn(`onegate: ${message}: ${this.detail}`);
   }
+}
+
+/**
+ * Key names whose values are credentials. Matched as a substring of the key,
+ * case-insensitively, so `access_token`, `refresh_token`, `id_token`,
+ * `client_secret`, `device_code`, `api_key` and friends are all covered.
+ */
+const SECRET_KEY = "[A-Za-z0-9_.-]*(?:token|secret|password|passwd|assertion|code|key)[A-Za-z0-9_.-]*";
+const JSON_SECRET_FIELD = new RegExp(`("${SECRET_KEY}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"?`, "gi");
+const FORM_SECRET_FIELD = new RegExp(`((?:^|[&?;,\\s])${SECRET_KEY}=)[^&\\s;,]*`, "gi");
+
+/**
+ * Blanks credential values in a (possibly truncated) token-endpoint body before
+ * it is logged or shown. A vendor that answers a token call with a 2xx body we
+ * cannot parse as JSON (GitHub answers form-encoded `access_token=...&scope=...`
+ * unless JSON is negotiated) would otherwise put a live token into the server
+ * log and onto the wizard result page. Both JSON and form/query encodings are
+ * covered; a value cut off by the 300-char truncation is still blanked.
+ */
+export function redactTokenBody(body: string): string {
+  return body.replace(JSON_SECRET_FIELD, '$1"[redacted]"').replace(FORM_SECRET_FIELD, "$1[redacted]");
 }
 
 /** A standard OAuth error code (`invalid_grant`, ...), or null for anything else. */
