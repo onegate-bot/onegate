@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Store } from "../src/store/db.js";
 import { buildRegistry } from "../src/integrations/index.js";
 import { buildDiscovery, DISCOVERY_HOST } from "../src/discovery.js";
@@ -10,6 +10,10 @@ let registry: Registry;
 beforeEach(async () => {
   store = new Store(":memory:");
   registry = await buildRegistry();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 function allowAll(agentId: string, integrationId: string): void {
@@ -205,5 +209,40 @@ describe("buildDiscovery", () => {
     expect(result.agent).toEqual({ id: agent.id, name: "hermi" });
     const ids = result.integrations.map((i) => i.id);
     expect(ids).toEqual([...ids].sort((a, b) => a.localeCompare(b)));
+  });
+
+  it("still lists an account whose accountSummary throws, with a null summary", () => {
+    const { agent } = store.createAgent("a");
+    allowAll(agent.id, "jira");
+    const conn = store.createConnection({
+      kind: "app",
+      vendor: "jira",
+      name: "broken",
+      data: { email: "x@y.com", apiToken: "tok-secret", siteUrl: "x.atlassian.net" },
+    });
+    store.grantConnection(conn.id, "agent", agent.id);
+    const jira = registry.get("jira")!;
+    vi.spyOn(jira, "accountSummary").mockImplementation(() => {
+      throw new Error("bad siteUrl");
+    });
+
+    const result = buildDiscovery(store, registry, agent);
+    const entry = result.integrations.find((i) => i.id === "jira")!;
+    expect(entry.accounts).toEqual([{ id: conn.id, name: "broken", isDefault: true, summary: null }]);
+    expect(JSON.stringify(result)).not.toContain("tok-secret");
+  });
+
+  it("renders a path-scoped host claim as host/prefix, the base the agent should call", () => {
+    const { agent } = store.createAgent("a");
+    allowAll(agent.id, "youtube");
+    store.setCredential("youtube", "yt", { apiKey: "yt-secret" });
+
+    const result = buildDiscovery(store, registry, agent);
+    const yt = result.integrations.find((i) => i.id === "youtube")!;
+    expect(yt.hosts).toContain("www.googleapis.com/youtube/v3");
+    // Bare claims render unchanged.
+    expect(yt.hosts).toContain("youtube.googleapis.com");
+    expect(yt.accounts[0]).toMatchObject({ name: "yt", isDefault: true, summary: null });
+    expect(JSON.stringify(result)).not.toContain("yt-secret");
   });
 });
