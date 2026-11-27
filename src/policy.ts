@@ -283,9 +283,11 @@ function labelMatches(pattern: string, label: string): boolean {
   if (!pattern.includes("*")) return pattern === label;
   let re = labelCache.get(pattern);
   if (!re) {
-    // Labels are validated to [a-z0-9*-], so `*` is the only regex-significant
-    // character and needs no further escaping.
-    re = new RegExp(`^${pattern.replace(/\*/g, "[^.]*")}$`);
+    // Labels are validated to [a-z0-9*-], so `*` should be the only
+    // regex-significant character. Escape everything else anyway so a pattern
+    // that ever reaches here unvalidated can only match literally.
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^.]*");
+    re = new RegExp(`^${escaped}$`);
     labelCache.set(pattern, re);
   }
   return re.test(label);
