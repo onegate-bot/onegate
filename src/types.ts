@@ -67,7 +67,11 @@ export interface Rule {
   integrationId: string;
   /** Uppercase HTTP methods, or ["*"]. */
   methods: string[];
-  /** Glob over the URL path: `*` = one segment, `**` = anything. */
+  /**
+   * Glob over the URL path: `*` = one segment, `**` = anything. A glob not
+   * starting with `/` is host-qualified, `<hostGlob>[/<pathGlob>]` (see
+   * parseHostQualifiedGlob in policy.ts).
+   */
   pathGlob: string;
   effect: Effect;
   /**

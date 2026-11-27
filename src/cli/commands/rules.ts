@@ -5,12 +5,17 @@
  *   onegate rules add --scope agent|project --subject <id> --integration <id>
  *                     --effect allow|deny [--methods GET,POST] [--path /**]
  *                     [--action require_approval]
+ *
+ *   --path is a path glob starting with "/" (`*` = one segment, `**` = any),
+ *   or a host-qualified glob "<host>[/<path>]" such as "api.example.com/**",
+ *   "*.example.com" or "**.example.com/v1/**".
  *   onegate rules rm <id>
  */
 
 import { parseArgs } from "node:util";
 import { emit, table } from "../output.js";
 import { normalizeMethods } from "../../util/methods.js";
+import { validatePathGlob } from "../../policy.js";
 import type { CliContext } from "../context.js";
 
 interface Rule {
@@ -92,7 +97,7 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
   });
   if (!values.scope || !values.subject || !values.integration || !values.effect) {
     throw new Error(
-      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**] [--ttl <seconds|Nh>] [--connection <conn-id> --connection-scope only|except] [--action require_approval]",
+      "usage: onegate rules add --scope agent|project --subject <id> --integration <id> --effect allow|deny [--methods GET,POST] [--path /**|<host>[/<path>]] [--ttl <seconds|Nh>] [--connection <conn-id> --connection-scope only|except] [--action require_approval]",
     );
   }
   // Rejected here as well as server-side: a typo must never fall through and
@@ -121,6 +126,14 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
   } catch (err) {
     throw new Error(`invalid --methods "${values.methods as string}": ${(err as Error).message}`);
   }
+  // Checked locally too (the server does the same): a glob that is neither a
+  // path nor a host-qualified glob would be stored and never match.
+  const pathGlob = (values.path as string).trim() || "/**";
+  try {
+    validatePathGlob(pathGlob);
+  } catch (err) {
+    throw new Error(`invalid --path: ${(err as Error).message}`);
+  }
   const ttlSeconds = values.ttl != null ? parseTtl(values.ttl as string) : undefined;
   const rule = (await ctx.client().post("/api/rules", {
     scope: values.scope,
@@ -128,7 +141,7 @@ async function add(ctx: CliContext, args: string[]): Promise<void> {
     integrationId: values.integration,
     effect: values.effect,
     methods,
-    pathGlob: values.path,
+    pathGlob,
     ...(ttlSeconds != null ? { ttlSeconds } : {}),
     ...(values.connection ? { connectionId: values.connection, connectionScope } : {}),
     ...(action ? { action } : {}),
