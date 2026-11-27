@@ -2579,12 +2579,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "invalid_effect", message: 'effect must be "allow" or "deny"' });
       return;
     }
-    // Request paths always start with "/", so a glob must too (or open with a
-    // wildcard); anything else can never match and is an operator typo.
-    if (pathGlob != null && pathGlob !== "" && (typeof pathGlob !== "string" || !/^[/*]/.test(pathGlob))) {
-      res.status(400).json({ error: "invalid_path_glob", message: 'pathGlob must be a string starting with "/" or "*"' });
-      return;
-    }
+    // pathGlob is validated below (validatePathGlob): a path or a host-qualified glob.
     let ttl: number | null = null;
     if (ttlSeconds != null) {
       ttl = parseTtlSeconds(ttlSeconds);
