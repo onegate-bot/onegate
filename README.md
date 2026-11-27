@@ -21,7 +21,7 @@ Agents never see a real API key. They talk to vendors through OneGate with a pla
 1. **Install-time root CA.** `onegate init` mints a root certificate. You trust it on each agent machine (one file, `/ca.pem` from the admin server).
 2. **Standard proxy wiring.** Each agent gets `HTTPS_PROXY=http://agent:<token>@gateway:8443`. No SDK, no code changes. Anything that honors proxy env vars works (curl, Node, Python, CLIs).
 3. **TLS termination at the gateway.** For hosts that belong to a configured integration, OneGate terminates TLS using a leaf certificate minted from your root CA, applies policy, swaps the placeholder credential for the real one, then opens a direct TLS connection to the vendor and bridges the request. Hosts that match no integration are passed through untouched (no decryption).
-4. **Policy and audit.** Allow/deny rules per agent or per project, scoped by integration, HTTP method, and path glob. Every decision is written to an audit log.
+4. **Policy and audit.** Allow/deny rules per agent or per project, scoped by integration, HTTP method, and path glob (optionally host-qualified, which also lets a deny block passthrough traffic to a host no integration owns). Every decision is written to an audit log.
 
 ## Quick start (Docker)
 

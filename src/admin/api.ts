@@ -25,6 +25,7 @@ import {
 import { anthropicSecretMismatch } from "../integrations/anthropic.js";
 import { previewPrimarySecret, llmPreferredSecretKeys } from "../util/mask.js";
 import { normalizeMethods, InvalidMethodError } from "../util/methods.js";
+import { validatePathGlob } from "../policy.js";
 import { publicBaseUrlFromEnv } from "../util/public-url.js";
 import {
   OWNER_LINK_MAX_PIN_FAILURES,
@@ -2578,12 +2579,7 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "invalid_effect", message: 'effect must be "allow" or "deny"' });
       return;
     }
-    // Request paths always start with "/", so a glob must too (or open with a
-    // wildcard); anything else can never match and is an operator typo.
-    if (pathGlob != null && pathGlob !== "" && (typeof pathGlob !== "string" || !/^[/*]/.test(pathGlob))) {
-      res.status(400).json({ error: "invalid_path_glob", message: 'pathGlob must be a string starting with "/" or "*"' });
-      return;
-    }
+    // pathGlob is validated below (validatePathGlob): a path or a host-qualified glob.
     let ttl: number | null = null;
     if (ttlSeconds != null) {
       ttl = parseTtlSeconds(ttlSeconds);
@@ -2657,13 +2653,27 @@ export function createAdminApp(opts: AdminApiOptions): express.Express {
       res.status(400).json({ error: "invalid_methods", message: (err as InvalidMethodError).message });
       return;
     }
+    // A pathGlob must be a path (`/...`) or a host-qualified glob
+    // (`<host>[/<path>]`). Anything else would be stored and then never match,
+    // which for a deny rule is a silently inert guard.
+    if (pathGlob != null && typeof pathGlob !== "string") {
+      res.status(400).json({ error: "invalid_path_glob", message: "pathGlob must be a string" });
+      return;
+    }
+    const effectivePathGlob = (pathGlob as string | undefined)?.trim() || "/**";
+    try {
+      validatePathGlob(effectivePathGlob);
+    } catch (err) {
+      res.status(400).json({ error: "invalid_path_glob", message: (err as Error).message });
+      return;
+    }
     res.status(201).json(
       store.createRule({
         scope,
         subjectId,
         integrationId,
         methods: normalizedMethods,
-        pathGlob: pathGlob || "/**",
+        pathGlob: effectivePathGlob,
         effect,
         expiresAt,
         leaseTtlSeconds: leaseTtl,

@@ -147,6 +147,21 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Client-side mirror of validatePathGlob (src/policy.ts), so the rule form can
+ * say what is wrong instead of surfacing a bare error code. The server stays
+ * the authority.
+ */
+function isValidRuleGlob(glob) {
+  if (glob.startsWith("/")) return true;
+  const slash = glob.indexOf("/");
+  const labels = (slash === -1 ? glob : glob.slice(0, slash)).toLowerCase().split(".");
+  if (labels.length < 2) return false;
+  if (!labels.every((l) => /^(\*\*|[a-z0-9*-]+)$/.test(l))) return false;
+  if (labels.some((l) => l !== "**" && l.includes("**"))) return false;
+  return labels.some((l) => !l.includes("*"));
+}
+
 async function api(path, opts = {}) {
   let res;
   try {
@@ -3016,6 +3031,7 @@ async function renderRules(root) {
           </div>
         </div>
         <wa-input class="field" name="pathGlob" label="Path glob (* = one segment, ** = anything)"
+                  hint="A path like /v1/** or a host-qualified glob like api.example.com/** or *.example.com. A host-qualified deny also blocks opaque passthrough to that host."
                   class="mono" spellcheck="false" value="/**"></wa-input>
         <div class="field">
           <wa-radio-group name="effect" label="Effect" value="allow" orientation="horizontal">
@@ -3060,6 +3076,11 @@ async function renderRules(root) {
         toast("Pick at least one method, or check all (*).");
         return;
       }
+      const pathGlob = ($("wa-input[name=pathGlob]", form).value ?? "").trim() || "/**";
+      if (!isValidRuleGlob(pathGlob)) {
+        toast('Path glob must start with "/" (e.g. /v1/**) or be host-qualified (e.g. api.example.com/**, *.example.com).');
+        return;
+      }
       try {
         await api("/api/rules", {
           method: "POST",
@@ -3068,7 +3089,7 @@ async function renderRules(root) {
             subjectId: subjectSel.value,
             integrationId: $("wa-select[name=integrationId]", form).value,
             methods,
-            pathGlob: ($("wa-input[name=pathGlob]", form).value ?? "").trim() || "/**",
+            pathGlob,
             effect: new FormData(form).get("effect"),
           }),
         });
